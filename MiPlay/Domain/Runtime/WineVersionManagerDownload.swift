@@ -1,0 +1,328 @@
+// WineVersionManagerDownload.swift
+// MiPlay
+
+import Foundation
+
+// Source: Architecture Design -> WineVersionManager -> download and recovery orchestration
+extension WineVersionManager {
+    // MARK: - 版本下载编排
+
+    /// 下载并安装指定版本的 Wine（编排完整流程）
+    /// - Parameter version: 要下载的版本信息
+    /// - Returns: 进度流
+    internal func downloadAndInstall(
+        version: WineVersionInfo,
+        taskID: UUID = UUID()
+    ) -> AsyncStream<WineVersionDownloader.DownloadPhase> {
+        return AsyncStream { continuation in
+            let operation = Task { [weak self] in
+                guard let self else { return }
+                var stagingPath: String?
+                var installedPath: String?
+                do {
+                    await self.logWriter.record(.init(
+                        level: .info,
+                        module: "WineVersionManager",
+                        eventName: "wine.install",
+                        operationID: taskID,
+                        taskID: taskID.uuidString,
+                        wineTag: version.tagName,
+                        phase: "started",
+                        result: "inProgress",
+                        messageCode: "wine.install_started",
+                        fields: ["sourceID": version.sourceID, "policyRevision": version.policyRevision]
+                    ))
+                    await self.registerDownload(taskID: taskID, tagName: version.tagName)
+                    try await self.validateCatalogEntry(version)
+                    let versionsDir = await self.wineVersionsDirectory()
+                    let finalURL = versionsDir.appendingPathComponent(version.tagName, isDirectory: true)
+                    let wineBinary = finalURL.appendingPathComponent("bin/wine")
+                    if FileManager.default.fileExists(atPath: wineBinary.path) {
+                        try await self.markVersionInstalled(tagName: version.tagName)
+                        continuation.yield(.completed(versionPath: finalURL.path))
+                        continuation.finish()
+                        return
+                    }
+
+                    let stagingRoot = versionsDir.appendingPathComponent(".staging", isDirectory: true)
+                    let stageURL = stagingRoot
+                        .appendingPathComponent("\(taskID.uuidString)-\(version.tagName)", isDirectory: true)
+                    try FileManager.default.createDirectory(at: stageURL, withIntermediateDirectories: true)
+                    let staging = try WineVersionDownloader.ManagedStaging(
+                        rootURL: stagingRoot,
+                        directoryURL: stageURL
+                    )
+                    stagingPath = staging.directoryURL.path
+
+                    let approvedAsset = WineVersionDownloader.ApprovedAsset(
+                        sourceID: version.sourceID,
+                        tagName: version.tagName,
+                        url: version.downloadURL,
+                        assetName: version.assetName.isEmpty ? version.downloadURL.lastPathComponent : version.assetName,
+                        fileSize: version.fileSize
+                    )
+                    let downloadStream = await self.wineVersionDownloader.downloadAndExtract(
+                        asset: approvedAsset,
+                        staging: staging,
+                        sessionID: taskID
+                    )
+
+                    var receivedCompletion = false
+                    for await phase in downloadStream {
+                        if Task.isCancelled { throw CancellationError() }
+                        switch phase {
+                        case .completed:
+                            receivedCompletion = true
+                            continuation.yield(.extracting(progress: 1))
+                        case .failed(let detail):
+                            throw VersionManagerError.downloadFailed(detail)
+                        case .failedWithFailure(let failure):
+                            // Preserve the asset transport fact through the
+                            // manager stream. The scheduler/UI can project a
+                            // 403, 404, 429 or 5xx without string matching.
+                            continuation.yield(.failedWithFailure(failure))
+                            continuation.finish()
+                            return
+                        case .cancelled:
+                            throw CancellationError()
+                        case .recoveryRequired(let detail):
+                            throw VersionManagerError.recoveryRequired(detail)
+                        default:
+                            continuation.yield(phase)
+                        }
+                    }
+
+                    // A cancelled stream can end without yielding a terminal phase.
+                    // Never interpret the cleaned staging directory as an extraction failure.
+                    try Task.checkCancellation()
+                    guard receivedCompletion else {
+                        throw VersionManagerError.downloadFailed("Wine 下载未产生完成事实")
+                    }
+
+                    guard FileManager.default.fileExists(atPath: wineBinaryFor(staging.directoryURL).path) else {
+                        throw VersionManagerError.extractionFailed("解压后未找到 wine binary")
+                    }
+
+                    continuation.yield(.installing)
+                    if FileManager.default.fileExists(atPath: finalURL.path) {
+                        throw VersionManagerError.downloadFailed("目标 Wine 版本目录已存在，未覆盖已有文件")
+                    }
+                    try FileManager.default.moveItem(at: staging.directoryURL, to: finalURL)
+                    stagingPath = nil
+                    installedPath = finalURL.path
+
+                    do {
+                        try await self.markVersionInstalled(tagName: version.tagName)
+                    } catch let persistenceError {
+                        do {
+                            try FileManager.default.removeItem(at: finalURL)
+                            installedPath = nil
+                        } catch {
+                            let detail = "安装记录写入失败: \(persistenceError.localizedDescription); 最终目录清理失败: \(error.localizedDescription)"
+                            let record = RecoveryRecord(
+                                kind: "wineInstall",
+                                taskID: taskID.uuidString,
+                                target: version.tagName,
+                                phase: "installedRecord",
+                                detail: detail,
+                                payload: ["finalPath": finalURL.path]
+                            )
+                            let recoveryWriteError = await self.recordRecovery(record)
+                            continuation.yield(.recoveryRequired(recoveryWriteError.map { "\(detail); 恢复事实写入失败: \($0)" } ?? detail))
+                            continuation.finish()
+                            return
+                        }
+                        throw persistenceError
+                    }
+
+                    continuation.yield(.installed(versionPath: finalURL.path))
+                    continuation.yield(.completed(versionPath: finalURL.path))
+                    await self.logWriter.record(.init(
+                        level: .info,
+                        module: "WineVersionManager",
+                        eventName: "wine.install",
+                        operationID: taskID,
+                        taskID: taskID.uuidString,
+                        wineTag: version.tagName,
+                        phase: "completed",
+                        result: "completed",
+                        messageCode: "wine.install_completed",
+                        fields: ["persistence": "verified", "cleanupVerified": "true"]
+                    ))
+                    continuation.finish()
+                } catch is CancellationError {
+                    var cleanupVerified = true
+                    do {
+                        try await self.cleanup(paths: [stagingPath, installedPath].compactMap { $0 })
+                    } catch {
+                        cleanupVerified = false
+                        let detail = "取消后的 Wine 临时资源清理失败: \(error.localizedDescription)"
+                        let record = RecoveryRecord(
+                            kind: "wineInstall",
+                            taskID: taskID.uuidString,
+                            target: version.tagName,
+                            phase: "cancelCleanup",
+                            detail: detail,
+                            payload: ["stagingPath": stagingPath ?? "", "finalPath": installedPath ?? ""]
+                        )
+                        let recoveryWriteError = await self.recordRecovery(record)
+                        continuation.yield(.recoveryRequired(recoveryWriteError.map { "\(detail); 恢复事实写入失败: \($0)" } ?? detail))
+                    }
+                    if cleanupVerified {
+                        continuation.yield(.cancelled)
+                    }
+                    await self.logWriter.record(.init(
+                        level: .warning,
+                        module: "WineVersionManager",
+                        eventName: "wine.install",
+                        operationID: taskID,
+                        taskID: taskID.uuidString,
+                        wineTag: version.tagName,
+                        phase: "cancelCleanup",
+                        result: cleanupVerified ? "cancelled" : "recoveryRequired",
+                        errorCategory: cleanupVerified ? "userCancelled" : "cancellationUnconfirmed",
+                        messageCode: cleanupVerified ? "wine.install_cancelled" : "wine.install_cancel_cleanup_failed",
+                        fields: ["cleanupVerified": String(cleanupVerified)]
+                    ))
+                    continuation.finish()
+                } catch {
+                    let operationError = error.localizedDescription
+                    var cleanupVerified = true
+                    do {
+                        try await self.cleanup(paths: [stagingPath].compactMap { $0 })
+                        continuation.yield(.failed(operationError))
+                    } catch {
+                        cleanupVerified = false
+                        let detail = "\(operationError); 临时资源清理失败: \(error.localizedDescription)"
+                        let record = RecoveryRecord(
+                            kind: "wineInstall",
+                            taskID: taskID.uuidString,
+                            target: version.tagName,
+                            phase: "failureCleanup",
+                            detail: detail,
+                            payload: ["stagingPath": stagingPath ?? ""]
+                        )
+                        let recoveryWriteError = await self.recordRecovery(record)
+                        continuation.yield(.recoveryRequired(recoveryWriteError.map { "\(detail); 恢复事实写入失败: \($0)" } ?? detail))
+                    }
+                    await self.logWriter.record(.init(
+                        level: .error,
+                        module: "WineVersionManager",
+                        eventName: "wine.install",
+                        operationID: taskID,
+                        taskID: taskID.uuidString,
+                        wineTag: version.tagName,
+                        phase: "failed",
+                        result: cleanupVerified ? "failed" : "recoveryRequired",
+                        errorCategory: cleanupVerified ? "unknown" : "recoveryRequired",
+                        messageCode: cleanupVerified ? "wine.install_failed" : "wine.install_cleanup_failed",
+                        fields: ["cleanupVerified": String(cleanupVerified)]
+                    ))
+                    continuation.finish()
+                }
+                await self.removeDownloadTask(taskID: taskID)
+            }
+            activeDownloadTasks[taskID] = operation
+            continuation.onTermination = { @Sendable _ in
+                operation.cancel()
+                Task { await self.cancelDownload(taskID: taskID) }
+            }
+        }
+    }
+
+    internal func cancelDownload(taskID: UUID) async {
+        let operation = activeDownloadTasks.removeValue(forKey: taskID)
+        activeDownloadTags.removeValue(forKey: taskID)
+        operation?.cancel()
+        await wineVersionDownloader.cancel(sessionID: taskID)
+        await operation?.value
+    }
+
+    internal func removeDownloadTask(taskID: UUID) {
+        activeDownloadTasks.removeValue(forKey: taskID)
+        activeDownloadTags.removeValue(forKey: taskID)
+    }
+
+    internal func registerDownload(taskID: UUID, tagName: String) {
+        activeDownloadTags[taskID] = tagName
+    }
+
+    internal nonisolated func wineBinaryFor(_ root: URL) -> URL {
+        root.appendingPathComponent("bin/wine")
+    }
+
+    internal nonisolated static func isDirectory(atPath path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
+    /// A download is a side effect and must re-check the immutable catalog
+    /// identity. Callers cannot turn a managed tag into an arbitrary URL.
+    internal func validateCatalogEntry(_ version: WineVersionInfo) throws {
+        guard Self.managedWineTags.contains(version.tagName) else {
+            throw VersionManagerError.versionNotFound(version.tagName)
+        }
+        guard let source = BuiltInWineVersions.sourceDescriptor(for: version.sourceID),
+              version.policyRevision == source.policyRevision else {
+            throw VersionManagerError.sourceInvalid("Wine 目录来源或策略版本未通过验证")
+        }
+        let url = version.downloadURL
+        guard url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == source.allowedAssetHost.lowercased(),
+              url.path.hasPrefix(source.allowedAssetPathPrefix),
+              url.pathExtension.lowercased() == "xz",
+              source.supportsAssetName(url.lastPathComponent) else {
+            throw VersionManagerError.sourceInvalid("Wine asset URL 不在批准来源 allowlist 内")
+        }
+        if !version.assetName.isEmpty,
+           version.assetName != url.lastPathComponent {
+            throw VersionManagerError.sourceInvalid("Wine asset 身份与 URL 不一致")
+        }
+    }
+
+    internal func cleanup(paths: [String]) async throws {
+        let versionsRoot = (await wineVersionsDirectory()).resolvingSymlinksInPath().standardizedFileURL
+        let stagingRoot = versionsRoot.appendingPathComponent(".staging", isDirectory: true)
+        let versionsPrefix = versionsRoot.path + "/"
+        let stagingPrefix = stagingRoot.path + "/"
+
+        for path in paths where FileManager.default.fileExists(atPath: path) {
+            let url = URL(fileURLWithPath: path, isDirectory: true)
+            let canonical = url.resolvingSymlinksInPath().standardizedFileURL
+            let isStaging = canonical.path.hasPrefix(stagingPrefix) && canonical.path != stagingRoot.path
+            let isManagedVersion = canonical.deletingLastPathComponent().path == versionsRoot.path &&
+                Self.managedWineTags.contains(canonical.lastPathComponent)
+            guard isStaging || isManagedVersion else {
+                throw VersionManagerError.recoveryRequired("拒绝清理 Wine 托管目录之外的路径: \(path)")
+            }
+            guard canonical.path.hasPrefix(versionsPrefix) else {
+                throw VersionManagerError.recoveryRequired("拒绝清理越界 Wine 路径: \(path)")
+            }
+            do {
+                try FileManager.default.removeItem(at: url)
+            } catch {
+                // Downloader cancellation and this manager cleanup can be
+                // concurrent. Treat a path already removed by the other
+                // owner as verified cleanup; preserve every real failure.
+                guard FileManager.default.fileExists(atPath: url.path) else {
+                    continue
+                }
+                throw error
+            }
+        }
+    }
+
+    internal func recordRecovery(_ record: RecoveryRecord) async -> String? {
+        do {
+            try await persistenceStore.appendRecoveryRecord(record)
+            return nil
+        } catch {
+            await logWriter.error("Wine 恢复事实无法持久化: \(error.localizedDescription)", module: "WineVersionManager")
+            return error.localizedDescription
+        }
+    }
+
+    // MARK: - 目录管理
+
+    /// 获取 Wine 版本管理目录
+}

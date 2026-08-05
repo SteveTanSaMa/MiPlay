@@ -1,0 +1,31 @@
+# Xcode
+
+DerivedData/
+
+build/
+.build/
+.swiftpm/
+
+# Xcode user and local state
+
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# macOS
+
+.DS_Store
+
+# Generated diagnostics and test results
+
+*.xcresult/
+*.trace/
+QAArtifacts/
+
+# Local secrets and signing files
+
+.env
+.env.*
+*.p12
+*.mobileprovision
