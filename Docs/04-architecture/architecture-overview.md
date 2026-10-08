@@ -1,201 +1,353 @@
-# MiPlay 架构概览
+# MiPlay 分层架构概览
 
-> **文档状态**：已冻结（Phase 3；当前修订基线见 `architecture-revision-2026-08-03.md`）
-> **更新日期**：2026-08-03
-> **职责边界**：本文件冻结系统如何组织，不规定 Swift 代码写法。
-> **上游**：Product、Research、UX、UI 文档均为冻结输入。
-> **下游**：Implementation 只能在本目录契约内实现；发现契约问题必须回溯 Architecture。
+> **文档状态**：活跃（Active）
+> **架构阶段**：Architecture Overview
+> **更新日期**：2026-08-27
+> **继承自**：Research Architecture Patterns、Product Domain、UX Information Model
 
-## 1. 架构目标与范围
+## 1. 架构总览
 
-MiPlay 当前版本只管理三款固定游戏：原神、崩坏：星穹铁道、绝区零。架构必须支持：定位已安装游戏、完整性校验、Wine 运行时管理、启动确认、内置兼容方案、版本检测、背景素材和日志导出。日志导出通过 `LogExport` Domain task 完成。
-
-当前版本不包含游戏客户端安装、完整游戏更新包下载、自定义任意启动参数、帧率解锁和未进入发布清单的兼容方案。`GameInstall`、`GameUpdate` 不是当前版本的调度任务；版本更新只产生 `VersionCheck` 结果和用户提示。日志 flush 不是业务 Task；用户导出使用 `LogExport`。
-
-## 2. 四层架构
+MiPlay 采用经典的四层架构，严格遵循单向依赖原则：**UI → ViewModel → Domain → Infrastructure**。每一层只依赖其下层的抽象，不跨越层级或直接访问基础设施。
 
 ```text
-UI
-  ↓ 读取投影、提交用户意图
-ViewModel
-  ↓ 调用领域命令/查询，订阅领域事件
-Domain
-  ↓ 调用基础设施能力，维护业务状态和规则
-Infrastructure
-  ↓ Foundation、AppKit、URLSession、Process、文件系统、系统授权
+┌─────────────────────────────────────────────────────────────┐
+│                        UIWindow Layer                        │
+│  MainWindow | SettingsWindow | GameDetailWindow | Sheet     │
+│                       ↓                                        │
+│                  UI Components                               │
+├─────────────────────────────────────────────────────────────┤
+│                     UI ViewModel Layer                       │
+│     LibraryViewModel | SettingsViewModel | GameDetailViewModel│
+│                       ↓                                        │
+│                  @Observable State                           │
+├─────────────────────────────────────────────────────────────┤
+│                       Domain Layer                           │
+│   GameRegistry | GameStateMachine | LaunchOrchestrator      │
+│   SolutionEngine | TaskScheduler | VersionChecker           │
+│                       ↓                                        │
+│                   Domain Services                            │
+├─────────────────────────────────────────────────────────────┤
+│                   Infrastructure Layer                       │
+│   PersistenceStore | FileSystem | Network | Process | Wine  │
+│   Logger | MediaTranscoder | DownloadManager                │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 2.1 UI Layer
+## 2. 分层职责定义
 
-UI 只负责 SwiftUI 场景、布局、控件语义和展示 ViewModel 投影。UI 不读取 Actor 内部状态，不访问 `PersistenceStore`、`Process`、文件路径或系统命令，也不决定业务状态转换。
+### 2.1 UIWindow Layer (UI 层)
 
-固定入口：
+**职责**：纯视图层，负责像素渲染和用户输入接收。不包括任何业务逻辑、状态决策或任务执行。
 
-- `MainWindow`：游戏选择栏、背景、主操作和任务反馈。
-- `PathLocationFlow`：系统文件选择器结果的展示和授权/完整性反馈。
-- `GameDetailWindow`：兼容方案和游戏详情。
-- `Settings`：运行环境、配置和只读状态。
-- `WineProgressSheet`：Wine 获取任务的阶段与进度。
+**核心组件**：
+- **MainWindow**：应用主窗口，沉浸式背景 + 游戏切换条 + 主操作按钮
+- **SettingsWindow**：独立设置场景，NavigationSplitView 双栏布局
+- **GameDetailWindow**：游戏详情独立窗口，兼容方案/性能/日志
+- **WineProgressSheet**：Wine 安装进度 Sheet/Overlay
+- **UI Components**：Liquid Glass 控件、背景素材、状态反馈组件
 
-### 2.2 ViewModel Layer
+**输入**：从 ViewModel 的 @Observable 属性直接绑定渲染
+**输出**：用户交互事件 → 调用 ViewModel 方法或通过 Action 通知 Service
 
-ViewModel 是唯一的 UI 可观察状态持有层，使用 `@Observable` 和 `@MainActor`。ViewModel 保存 UI 投影和纯 UI 状态，不保存第二份可写的业务事实。
+### 2.2 UI ViewModel Layer (视图模型层)
 
-| ViewModel | 负责的投影 | 不负责 |
-|---|---|---|
-| `LibraryViewModel` | 三款游戏的快照、选中游戏、主操作语义、关联任务反馈 | 判断文件是否完整、组装 Wine 命令、写入持久化 |
-| `GameDetailViewModel` | 方案列表、应用记录、风险和恢复事实 | 执行方案、修改系统、决定 `Applied` |
-| `SettingsViewModel` | 配置、Wine 版本、恢复状态和 `LogExport` 投影 | 直接读写 JSON、下载运行时、直接调用 LogWriter |
-| 其他流程 ViewModel | 对应任务的阶段、进度、结果和取消入口 | 直接调用 Infrastructure |
+**职责**：视图状态管理和业务规则表达。每个 ViewModel 负责一个主窗口的状态呈现，使用 `@Observable` 宏实现细粒度观察。
 
-ViewModel 从 Domain 的只读快照和有序事件流构建投影。选中游戏、当前 Tab、窗口是否显示等 UI 状态由 ViewModel 独占，不进入 Game 业务聚合。
+**核心组件**：
+- **LibraryViewModel**：主窗口状态。管理当前选游戏、背景素材、游戏状态、主按钮状态、进度反馈
+- **SettingsViewModel**：设置窗口状态。管理配置值、Wine 状态、游戏信息、读取/保存操作
+- **GameDetailViewModel**：详情窗口状态。管理兼容方案列表、方案应用/回滚状态、风险确认
 
-### 2.3 Domain Layer
+**关键原则**：
+- 不包含业务逻辑，只表达 Domain 层的状态和意图
+- 不直接调用 Infrastructure，所有持久化/网络/进程操作委托给 Domain
+- 通过构造器注入或 Environment 获取 Domain 服务引用
 
-Domain 负责领域对象、业务规则、事务编排、任务调度和状态事件。带有共享可变状态的 Domain 服务使用 Actor 隔离；无状态规则使用不可变值计算。Domain 不标记为默认 `MainActor`，也不持有 SwiftUI 类型。
+### 2.3 Domain Layer (领域层)
 
-| 模块 | 责任 |
-|---|---|
-| `GameRegistry` | 固定三款 Game、路径授权事实、业务状态和领域事件 |
-| `GameStateMachine` | 校验 Game 状态转换，不执行 I/O |
-| `PreLaunchValidator` | 汇总启动前文件、授权、完整性、运行环境和磁盘条件 |
-| `FileIntegrityVerifier` | 基于有效 manifest 得出完整/不完整/不支持/执行失败 |
-| `LaunchOrchestrator` | 按启动契约准备 Wine、构造命令、启动并确认进程 |
-| `SolutionEngine` | 方案能力检查、快照、修改、验证、回滚和应用记录 |
-| `WineVersionManager` | Product 批准托管 Wine 的来源选择、目录发现、asset 下载、安装提交和就绪判断；不检测外部 Wine |
-| `PerformanceOptionManager` | 当前版本允许的少量启动环境选项 |
-| `VersionChecker` | 本地版本与官方版本比较，不执行完整更新 |
-| `TaskScheduler` | 任务接收、互斥、排队、进度、取消和任务事件 |
+**职责**：核心业务逻辑、状态机、编排协调、任务调度。所有业务规则在这里实现。
 
-### 2.4 Infrastructure Layer
+**核心 Agent**：
+- **GameRegistry**：游戏注册、路径管理、权限验证
+- **GameStateMachine**：游戏生命周期状态机，状态转换规则
+- **LaunchOrchestrator**：游戏启动编排器，协调文件、权限、环境、进程
+- **SolutionEngine**：兼容方案引擎，方案应用/回滚控制
+- **TaskScheduler**：任务调度器，Task 生命周期管理
+- **VersionChecker**：版本检测，本地与官方版本比较
+- **PreLaunchValidator**：启动前置验证，综合检查
 
-Infrastructure 只提供外部能力，不决定业务状态。
+**关键原则**：
+- 所有状态变化通过任务（Task）实现
+- 不直接访问文件系统/网络/进程，委托 Infrastructure
+- 定义明确的业务结果事实（Success Facts）和错误恢复路径
 
-| 模块 | 责任和权限边界 |
-|---|---|
-| `PersistenceStore` | `AppData.json` 的读取、备份、迁移、原子写入和恢复 |
-| `GameFileSystemRepository` | 容器内文件和用户选择目录的 scoped 访问；不绕过授权 |
-| `ProcessManager` | `Process` 生命周期、stdout/stderr、超时和退出事实 |
-| `WineRuntimeProvider` | 执行指定 Wine 二进制、准备 `WINEPREFIX`，不选择版本 |
-| `WineVersionDownloader` | 下载、临时文件、完整性检查和解压 |
-| `NetworkDownloadProvider` | HTTP、响应状态、下载取消和网络错误 |
-| `SystemEnvironmentDetector` | 仅提供仍在产品范围内的 macOS、Apple Silicon 和磁盘能力；不提供 Wine 路径、版本或可用性 |
-| `SystemModificationGateway` | 仅代理明确允许的 `/etc/hosts`、hostname 系统修改；不接受任意 shell |
-| `LogWriter` | 结构化、脱敏日志；OSLog、App Support flush/轮转和导出，不承载业务状态 |
+### 2.4 Infrastructure Layer (基础设施层)
 
-## 3. 依赖与通信
+**职责**：提供技术上可复用的底层服务，封装系统资源访问。全部使用 `actor` 实现线程安全。
 
-```text
-SwiftUI View
-  → @MainActor @Observable ViewModel
-    → Domain command/query
-      → Domain actor
-        → Infrastructure actor / value service
+**核心 Actor**：
+- **PersistenceStore**：JSON 文件持久化存储
+- **FileSystem**：文件系统操作（路径、权限、完整性校验）
+- **NetworkService**：HTTP 下载、版本信息获取
+- **ProcessManager**：进程创建、管理、监控
+- **WineRuntimeProvider**：Wine 运行时管理、prefix 操作
+- **Logger**：日志记录
+- **MediaService**：背景视频/图片加载、转码、缓存
+
+**关键原则**：
+- 纯技术实现，无业务逻辑
+- 通过 protocol 抽象，便于测试和替换
+- 每个 actor 有自己独立的状态，状态不共享
+
+## 3. 模块分解
+
+### 3.1 UI 模块结构
+
+```
+MiPlay/UI/
+├── Components/              # 可复用 UI 组件
+│   ├── BackgroundScene.swift        # 沉浸式背景层
+│   ├── GameSelectionRailView.swift  # 游戏切换栏
+│   ├── PrimaryActionButton.swift    # 主操作按钮
+│   ├── TaskFeedbackView.swift       # 任务反馈组件
+│   ├── WineProgressUnit.swift       # Wine 进度细节
+│   └── GlassEffectContainer.swift   # 玻璃材质容器
+│
+├── MainWindow/                # 主窗口场景
+│   ├── MainWindowScene.swift    # 窗口定义和生命周期
+│   ├── BackgroundView.swift     # 背景视图
+│   ├── GameRailView.swift       # 游戏选择栏视图
+│   └── PrimaryActionView.swift  # 主操作区视图
+│
+├── SettingsWindow/            # 设置窗口场景
+│   ├── SettingsWindowScene.swift # 窗口定义
+│   └── SettingsView.swift        # NavigationSplitView 内容
+│
+├── GameDetailWindow/          # 详情窗口场景
+│   ├── GameDetailWindowScene.swift
+│   └── GameDetailView.swift
+│
+└── ViewModels/                # 视图模型层
+    ├── LibraryViewModel.swift        # 主窗口状态
+    ├── SettingsViewModel.swift       # 设置窗口状态
+    └── GameDetailViewModel.swift     # 详情窗口状态
 ```
 
-- UI 不跨过 ViewModel 访问 Domain 或 Infrastructure。
-- ViewModel 不把 Domain Actor 当作 `@Observable` 属性直接绑定；它订阅 Domain 的快照/事件流并更新自己的投影。
-- Domain 只能依赖 Infrastructure 的能力边界；Infrastructure 不依赖 UI 或 ViewModel。
-- 领域服务之间只通过 Sendable 值、命令结果和事件通信；不传递 `Process`、`URLSessionTask`、SwiftUI View 或 ViewModel。
-- Domain 服务可以向同一 `LogWriter` actor 提交脱敏 LogEvent；UI/ViewModel 不持有 LogWriter，日志导出必须经过 Domain `LogExport` task。
-- 共享可变资源必须只有一个 Actor 作为所有者：游戏业务状态归 `GameRegistry`，任务归 `TaskScheduler`，持久化文件归 `PersistenceStore`，进程表归 `ProcessManager`。
+### 3.2 Domain 模块结构
 
-## 4. 应用启动顺序
+```
+MiPlay/Domain/
+├── Game/                          # 游戏相关
+│   ├── Game.swift                    # Game 枚举定义
+│   ├── GameLocation.swift            # 游戏路径授权
+│   ├── GameRegistry.swift            # 游戏注册服务
+│   ├── GameStateMachine.swift        # 游戏状态机
+│   ├── PreLaunchValidator.swift      # 启动前置验证
+│   └── LaunchOrchestrator.swift      # 启动编排器
+│
+├── Solution/                        # 兼容方案
+│   ├── CompatibilitySolution.swift     # 方案定义
+│   ├── SolutionEngine.swift            # 方案执行引擎
+│   ├── SolutionApplication.swift       # 方案应用状态
+│   └── RollbackOrchestrator.swift      # 回滚编排
+│
+├── Runtime/                         # 运行环境
+│   ├── ManagedWineState.swift          # Wine 运行时状态
+│   ├── WinePreflightChecker.swift      # 环境预检
+│   └── PrefixManager.swift             # 共享 prefix 管理
+│
+├── Update/                          # 更新
+│   ├── VersionChecker.swift            # 版本检测
+│   ├── UpdateChecker.swift             # 更新可用性检查
+│   └── GameConfigManager.swift         # 游戏配置管理
+│
+├── Utility/                         # 工具
+│   ├── TaskScheduler.swift             # 任务调度器
+│   ├── TaskQueue.swift                 # 任务队列实现
+│   └── ErrorRecovery.swift             # 错误恢复策略
+│
+└── Protocols/                       # 领域协议
+    ├── GameStateService.swift
+    ├── LaunchService.swift
+    ├── SolutionService.swift
+    └── UpdateService.swift
+```
 
-1. App 组装 Infrastructure 和 Domain 服务；不在 UI 初始化中执行文件、网络或进程工作。
-2. `PersistenceStore` 读取 `AppData.json`，执行 schema 检查和必要迁移。
-3. 若数据损坏且未完成恢复，Domain 进入 `recoveryRequired`；不能用默认值伪装成用户设置或已授权路径。
-4. `GameRegistry` 从已验证数据恢复三款 Game；旧裸路径只进入迁移状态，不能直接作为授权。
-5. `LaunchOrchestrator/GameRegistry` 在发布初始快照前扫描 launch session、`Running` 和 recovery record；无法验证活动进程时建立持久 restart recovery guard。
-6. `TaskScheduler` 将上次退出时的 `pending/running` 标记为中断失败或恢复待确认，绝不自动重放副作用任务。
-7. ViewModel 创建订阅，再取得带序列号的初始快照；后续只按事件顺序更新业务和 Accessibility projection。
-8. UI 展示快照和恢复状态。只有在 Domain 给出可信业务结果后才改变主操作语义。
+### 3.3 Infrastructure 模块结构
 
-## 5. 权限总览
+```
+MiPlay/Infrastructure/
+├── Persistence/                     # 持久化
+│   └── PersistenceStore.swift          # JSON 存储 actor
+│
+├── FileSystem/                      # 文件系统
+│   ├── FileService.swift               # 文件操作
+│   ├── IntegrityVerifier.swift         # 完整性校验
+│   └── LocationManager.swift           # 路径授权管理
+│
+├── Network/                         # 网络
+│   ├── NetworkService.swift            # HTTP 客户端
+│   ├── DownloadManager.swift           # 下载管理
+│   └── VersionFetcher.swift            # 版本信息获取
+│
+├── Process/                         # 进程管理
+│   └── ProcessManager.swift            # 进程生命周期管理
+│
+├── Wine/                            # Wine 运行时
+│   ├── WineRuntimeProvider.swift       # Wine 提供器
+│   ├── WineInstaller.swift             # Wine 安装器
+│   ├── WinePrefixInstaller.swift       # Prefix 安装器
+│   └── WineVersionFactory.swift        # Wine 版本工厂
+│
+├── Logging/                         # 日志
+│   └── Logger.swift                    # 日志 actor
+│
+└── Media/                           # 媒体素材
+    ├── BackgroundVideoPlayer.swift     # 视频播放器
+    ├── ImageBasedBackground.swift      # 图片背景
+    ├── MediaCache.swift                # 媒体缓存
+    └── MediaTranscoder.swift           # 转码服务
+```
 
-### 5.1 用户选择的游戏目录
+## 4. 依赖关系图
 
-- `GameLocation` 的 security-scoped bookmark 是长期授权凭据；`lastKnownPath` 只用于显示和迁移提示。
-- 每次读取或写入都必须解析 bookmark、处理 stale、`startAccessingSecurityScopedResource()`，在同一操作作用域内完成工作，最后匹配 `stopAccessing...()`。
-- 当前工程沙盒能力为用户选择文件只读。读取和完整性校验可以继续；游戏目录写入、替换 DLL、创建备份等需要读写 entitlement 和读写 bookmark。能力未满足时返回 `PermissionAccess.unavailable`，不尝试提权。
+```
+UI ← ViewModel ← Domain ← Infrastructure
 
-### 5.2 系统资源
+依赖注入流程：
+MiPlayApp 构造顺序：
+Infrastructure (创建 Actor) 
+    ↓ 注入到
+Domain (创建 Service，依赖 Infrastructure)
+    ↓ 注入到
+ViewModel (创建 @Observable，依赖 Domain)
+    ↓ 注入到
+UI (创建 View，依赖 ViewModel)
+```
 
-- 游戏目录授权不扩大到 `/etc/hosts`、`/etc/hostname` 或其他系统资源。
-- `/etc/hosts` 和 hostname 只通过 `SystemModificationGateway` 的固定操作进入；普通 Domain 服务不调用 `bash`、`sudo` 或任意系统命令。
-- 系统修改必须先保存原状态，修改后读回验证；应用中途取消转入不可取消的恢复流程。
+### 4.1 层依赖规则
 
-## 6. 启动命令的架构契约摘要
+- ✅ **允许**：上层依赖下层
+- ✅ **允许**：同层模块间的接口依赖
+- ❌ **禁止**：下层依赖上层
+- ❌ **禁止**：跨层依赖（如 UI 直接访问 Infrastructure）
+- ❌ **禁止**：同级循环依赖
 
-启动不是“执行一个 exe”这么简单，`LaunchOrchestrator` 必须向 `WineRuntimeProvider` 提供以下完整事实：
+### 4.2 单向依赖证明
 
-| 项目 | 冻结值 |
-|---|---|
-| Wine binary | `WineVersionManager` 选定的 MiPlay 托管版本 `bin/wine`；没有可验证托管 binary 则失败，不回退系统 Wine |
-| Game executable | 从目标 Game 的受支持相对路径中找到的第一个可执行文件；以绝对路径作为 Wine 的第一个游戏参数 |
-| 参数 | 当前版本只允许产品定义的游戏固定参数和已启用性能选项；不接受用户任意参数 |
-| `WINEPREFIX` | 应用容器内 `Application Support/MiPlay/WinePrefixes/<stableGameID>`，每款游戏独立，不使用游戏目录作为 prefix |
-| DLL override | `WINEDLLOVERRIDES=winemenubuilder.exe=d`；由 prefix 准备和游戏启动沿用，不由用户输入覆盖 |
-| 其他环境变量 | 继承受控基础环境，再合并产品允许的性能环境变量；同名键的最终值必须可记录 |
-| 工作目录 | 游戏安装目录的已解析 scoped URL；scope 在进程启动和必要的确认阶段保持有效 |
-| 成功门槛 | 创建进程只是中间事实；在确认窗口内验证进程仍运行并达到可运行判定后，才产生 `runningConfirmed` |
+通过构造器注入实现：
 
-详细输入、失败、取消、恢复、持久化和用户反馈行为见 `architecture-service-contracts.md` 与 `architecture-phase3-contracts.md`。
+```swift
+// Infrastructure - 无依赖
+final class PersistenceStore { }
 
-本轮四个 P1 的契约和影响范围见 `architecture-p1-repair-impact.md`；它是 Implementation 的直接交付边界，不允许 Implementation 自行解释 Receipt、recoveryRequired 或 stale bookmark 行为。
+// Domain - 依赖 Infrastructure
+final class GameRegistry {
+    private let fileService: FileService
+    private let persistenceStore: PersistenceStore
+    
+    init(fileService: FileService, persistenceStore: PersistenceStore) {
+        self.fileService = fileService
+        self.persistenceStore = persistenceStore
+    }
+}
 
-## 6.1 Phase 3 新增冻结边界
+// ViewModel - 依赖 Domain
+final class LibraryViewModel {
+    private let gameRegistry: GameRegistry
+    private let gameStateMachine: GameStateMachine
+    
+    init(gameRegistry: GameRegistry, gameStateMachine: GameStateMachine) {
+        self.gameRegistry = gameRegistry
+        self.gameStateMachine = gameStateMachine
+    }
+}
 
-- Wine 的可用目录只来自用户当前选择的 Product 批准托管来源；官方 GitHub 为默认，allowlist 镜像必须主动选择，来源失败不自动换源，系统 Wine/Whisky/CrossOver 不得检测、选择、回退或启动。
-- `WineCatalogQuery` 只产生 API/Release metadata 目录结果；`WineAssetDownload` 独立取得 asset。两者都不能单独产生 `WineReady`，后者仍要求 artifact、安装记录、环境准备和重读验证。
-- `pkg_version`、`config.ini` 和 IntegrityManifest 分别保留来源与用途；冲突时不得发布可信版本、完整性或 Running。
-- stale bookmark 的刷新写回必须在五个消费者共享的 scoped lease 内完成，并在真实写回/重读后发布消费者结果。
-- AccessibilityProjection 由对应 `@MainActor` ViewModel 从结构化快照/事件生成；UI 不从视觉效果或 Process 中间事实推断状态。
+// UI - 依赖 ViewModel
+struct MainWindow: View {
+    @ObservedObject var viewModel: LibraryViewModel
+    
+    var body: some View {
+        // 纯渲染
+    }
+}
+```
 
-## 7. 上游追溯
+## 5. 数据流方向
 
-| 上游冻结内容 | 本架构承接 |
-|---|---|
-| Product：三款固定游戏、定位路径、不做完整安装更新 | `GameRegistry` 固定三款；没有 `GameInstall/GameUpdate` 当前任务 |
-| Product：CS-01 条件发布；A-02/A-03/A-06 Deferred；CS-05 Out of Scope | `SolutionEngine` 只允许 CS-01；Deferred/Out of Scope 返回 `Unavailable` |
-| Research：Actor 服务层、任务状态解耦、Apple Sandbox 约束 | Actor 所有权、Domain 事件流、bookmark 和 helper 边界 |
-| UX：任务状态和业务结果分离 | TaskScheduler 任务模型与 Game/Integrity/Solution 独立结果 |
-| UX：启动须进程确认、取消须清理确认 | LaunchOrchestrator 和任务取消契约 |
-| UI：主窗口、路径流程、详情窗口、Settings、Wine 反馈 | ViewModel 投影边界和事件订阅对象 |
-| UI：UI 不创造状态 | Domain 是业务事实唯一写入者，ViewModel 只投影 |
+### 5.1 正向流（用户操作 → 系统响应）
 
-### 7.1 逐项追溯矩阵
+```
+用户点击 → UI 调用 ViewModel → ViewModel 调用 Domain 服务 → 
+Domain 调用 Infrastructure → Infrastructure 执行操作 → 
+返回结果 → Domain 更新业务状态 → ViewModel 读取新状态 → 
+UI 重新渲染
+```
 
-| 来源文件 | 冻结要求 | Architecture 落点 | 可验证证据 |
-|---|---|---|---|
-| `Docs/00-product/product-features.md` | 游戏启动 | `LaunchOrchestrator` + `GameLaunch` + 进程健康确认 | `architecture-service-contracts.md` §6、`architecture-task-queue.md` §1.2 |
-| 同上 | Wine 版本管理，用户无需手动配置 | `WineVersionManager` 托管来源选择、`WineCatalogQuery/WineAssetDownload`、`WineRuntimeProvider` 执行 | `architecture-domain-model.md` §4、服务契约 §7、Revision §4 |
-| 同上 | CS-01 条件发布；A-02/A-03/A-06 Deferred；CS-05 Out of Scope | 发布清单约束、`SystemModificationGateway`、`Unavailable` | `architecture-domain-model.md` §5、服务契约 §11-12、Revision §6-7 |
-| 同上 | 三款游戏状态总览 | 固定三款 GameLibrary 和 GameStateMachine | `architecture-domain-model.md` §2、状态所有权 §1 |
-| 同上 | 定位已安装路径 | GameLocation bookmark 生命周期和旧 path 迁移 | `architecture-domain-model.md` §3、通信 §5 |
-| 同上 | 完整性校验 | `IntegrityVerification` + 有效 manifest 结果 | 服务契约 §5、任务队列 §1.2 |
-| 同上 | 版本检测/背景素材/性能选项/日志 | `VersionCheck`、`BackgroundMediaLoad`、PerformanceOptionManager、LogWriter | 任务队列 §1.2、服务契约 §15-16、概览 §2.3-2.4 |
-| Product：日志导出属于 Should/In Scope | `LogExport` task + 脱敏 LogWriter bundle；不作为业务成功证据 | `architecture-logging-contract.md` §6-8、服务契约 §16 |
-| `Docs/01-research/research-architecture-patterns.md` | 单向分层、Domain 服务、任务队列 | 四层依赖和 TaskScheduler 所有权 | 概览 §2-3、任务队列 §3 |
-| `Docs/01-research/research-pattern-library.md` | Actor 隔离、任务状态解耦、双队列 | 独立 Actor、foreground/background lane、事件流 | ADR 002、ADR 008、状态所有权 §2-3 |
-| `Docs/01-research/research-ux-patterns.md` | 统一 logger、异常退出记录、非阻塞诊断 | LogWriter actor、关键阶段事件、日志与用户错误分离 | `architecture-logging-contract.md` §3、§7-8、ADR 030 |
-| `Docs/01-research/research-apple-platform-constraints.md` | bookmark scope、read-only entitlement、helper/XPC、Process 终止确认 | GameLocation、权限分离、ProcessManager、SystemModificationGateway | ADR 004-007、通信 §5-7、服务契约 §9-11 |
-| `Docs/02-ux/ux-information-model.md` | Task 与业务结果分离 | TaskSnapshot + outcome/error/recovery | 任务队列 §2、服务契约 §1 |
-| 同上 | LaunchOutcome、PermissionAccess、Integrity、Runtime、AppDataRecovery | 领域对象和错误传播模型 | 领域模型 §3-8、通信 §4、服务契约 §13 |
-| `Docs/02-ux/ux-state-flow.md` | 启动确认、清理、完整性、方案回滚和数据恢复流程 | Launch/Integrity/Solution/Persistence 生命周期 | 领域模型 §2、§5、§6；任务队列 §5、§8 |
-| `Docs/03-ui/ui-screen-inventory.md` | MainWindow、PathLocationFlow、GameDetailWindow、Settings、WineProgressSheet | ViewModel 归属和事件投影 | 概览 §2.1-2.2、状态所有权 §4 |
-| `Docs/03-ui/ui-view-responsibility.md` | UI 不执行任务、不判断业务结果 | UI → ViewModel，Domain 是事实源 | 概览 §2.1-2.2、通信 §1 |
-| `Docs/03-ui/ui-component-tree.md` | 主操作、任务反馈、授权反馈不新增业务状态 | Task/业务/权限三类输入分离 | 状态所有权 §4、任务队列 §9 |
-| `Docs/03-ui/ui-state-mapping.md` | pending/running/结果分开；Running/Applied 需真实门槛 | Domain event commit、LaunchOutcome、SolutionApplication | ADR 003、007、010、011 |
-| `Docs/01-research/research-yaagl-download-and-metadata.md` | GitHub API/Release asset 分离、镜像限制、`pkg_version` JSON Lines + MD5、`config.ini` 原始证据 | Wine source policy、WineAssetDownload、LocalGameEvidence、VersionChecker | Revision §4-5、ADR 023-029 |
-| `Docs/03-ui/ui-validation-and-accessibility.md` | Accessibility Tree 状态、进度、错误恢复由结构化事实表达 | ViewModel AccessibilityProjection ownership | Communication §9.1、State Ownership §4.3、ADR 021 |
-| `Docs/02-ux/ux-state-flow.md` | Wine source result、证据冲突、重启恢复和 stale refresh flow | RuntimeSourceResult、LocalGameEvidence、ProcessExitRecoveryRecord、ScopedGameLocationAccess | Phase 3 契约 §2-5 |
+### 5.2 反向流（系统通知 → UI 更新）
 
-追溯规则：实现阶段每个验收项至少能定位到一个 Domain/Infrastructure 结果和一个 ViewModel 投影；若只有 UI 文案而没有事实来源，不视为已覆盖。
+```
+Infrastructure 完成异步操作 → 通过 Task/Continuation/AsyncStream 通知 Domain → 
+Domain 更新领域模型 → ViewModel 的 Observable 属性变更 → 
+SwiftUI 自动触发视图重渲染
+```
 
-## 8. 实现约束
+### 5.3 异步流处理
 
-- 本架构不允许以“Domain `@Observable` 属性直接被 ViewModel 引用”实现状态传播。
-- 本架构不允许把一个默认 `MainActor` 的服务作为所有 Domain/Infrastructure 服务的并发方案。
-- 本架构不允许把裸路径、进程创建、命令返回、备份成功或任务 `completed` 单独升级为业务成功。
-- 本架构不新增通用 UI 框架、通用协议层或未来扩展用的抽象；每个边界只为当前产品问题服务。
+- **ViewModel**：使用 `Task` 包装 Domain 调用，通过 `@State` 管理任务状态
+- **Domain**：使用 `actor` 封装基础设施调用，通过 `AsyncStream`/`AsyncThrowingStream` 返回进度事件
+- **Infrastructure**：使用 `Task` 和 Continuation 管理异步操作
+
+## 6. 错误传播路径
+
+```
+Infrastructure 错误 → 封装为 Domain Error → 传递到 ViewModel → 显示给用户
+
+错误原则：
+1. Infrastructure 返回具体错误类型（NetworkError, IOError, ProcessError）
+2. Domain 封装领域错误（LaunchFailed, PreflightError, SolutionApplyError）
+3. ViewModel 保持错误模型不变，只改变文案
+4. UI 展示错误事实 + 恢复动作，不猜测错误原因
+```
+
+## 7. 状态流动
+
+1. **Task State**：`pending` → `running` → `completed/failed/cancelled`
+2. **Business State**：由 Domain 状态机管理（Game 状态、Wine 状态等）
+3. **Result Facts**：由任务完成的业务结果决定
+
+三个层级独立，任何一层不能替代另一层。
+
+## 8. 架构决策约束
+
+- **主框架**：SwiftUI（App lifecycle）
+- **语言版本**：Swift 6.4
+- **最低部署**：macOS 26+
+- **芯片架构**：Apple Silicon (arm64)
+- **并发模型**：actor + @MainActor + Async/Await
+- **状态管理**：@Observable（ViewModel & Service） + actor（Domain & Infra）
+- **持久化**：JSON 文件 + PersistenceStore actor
+- **依赖注入**：构造器注入 + Environment 注入的混合模式
+
+## 9. 模块清单
+
+| 模块 | 关键类/Actor | 作用 |
+|------|--------------|------|
+| PersistenceStore | actor | JSON 文件持久化存储 |
+| FileService | actor | 文件系统操作 |
+| IntegrityVerifier | actor | 游戏文件完整性校验 |
+| NetworkService | actor | HTTP 网络请求 |
+| ProcessManager | actor | 进程创建和监控 |
+| WineRuntimeModule | actor | Wine 运行时管理 |
+| GameRegistry | Service | 游戏注册和路径管理 |
+| GameStateMachine | Service | 游戏状态机 |
+| LaunchOrchestrator | Service | 游戏启动编排 |
+| SolutionEngine | Service | 兼容方案执行 |
+| TaskScheduler | Service | 任务调度器 |
+| LibraryViewModel | @Observable | 主窗口状态管理 |
+| SettingsViewModel | @Observable | 设置窗口状态管理 |
+
+---
+
+> **注意**：架构设计是静态的，具体实现细节需要遵循架构模式文档和领域模型文档。
+

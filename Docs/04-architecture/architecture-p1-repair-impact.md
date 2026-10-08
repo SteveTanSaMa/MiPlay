@@ -1,7 +1,8 @@
 # MiPlay P1 修复影响分析
 
-> **文档状态**：已冻结（Phase 3；当前修订基线见 `architecture-revision-2026-08-03.md`）
-> **更新日期**：2026-08-03
+> **文档状态**：已冻结（历史 P1 修复基线；Wine 部分已由 2026-08-28 Architecture 回溯取代）
+> **更新日期**：2026-08-28
+> **当前规范**：Wine runtime/prefix 以 `architecture-domain-model.md` §4、`architecture-service-contracts.md` §7-8、`architecture-task-queue.md` §3/§5/§8 和 ADR 037-042 为准；本文中旧的 `WineAssetDownload`、多版本、来源选择和独立 prefix 描述不得直接交付 Implementation。
 > **范围**：Review `P1-REV-001` 至 `P1-REV-004`
 > **实现约束**：本文只冻结契约和影响范围，不修改业务代码，不新增 Deferred 功能。
 
@@ -9,7 +10,7 @@
 
 | P1 | 根因 | 修复契约 | 主要影响模块 | 不改变的边界 |
 |---|---|---|---|---|
-| `P1-REV-001` | Wine asset 下载绕过 TaskScheduler，取消没有贯穿内部 Task/URLSession/解压 | `TaskReceipt`、全局 `wineRuntime` 互斥、统一 Task events、清理确认后才 cancelled | TaskScheduler、WineVersionManager、WineVersionDownloader、NetworkDownloadProvider、Settings VM 入口 | 不增加新的下载产品能力；使用既有托管 Wine 下载目标，任务名按当前修订为 `WineAssetDownload` |
+| `P1-REV-001` | 固定 Wine setup 绕过 TaskScheduler，取消没有贯穿内部 Task/URLSession/解压/Wine 子进程 | `TaskReceipt`、全局 `wineRuntime` 与 `sharedWinePrefix` 互斥、统一 Task events、清理确认后才 cancelled | TaskScheduler、WineVersionManager、WineRuntimeProvider、NetworkDownloadProvider、Settings VM 入口 | 不增加新的下载产品能力；当前任务名为 `WineRuntimeSetup`，目标固定为 `wine-crossover-11.0-1-signed` 和唯一 shared prefix |
 | `P1-REV-002` | `markVersionInstalled` 写入失败被吞掉，下载流仍发布 completed | completed/failed/recoveryRequired 的提交门槛 | WineVersionManager、PersistenceStore、TaskScheduler、DomainEvent | 不改变 JSON 存储方案，不自动把 artifact 视为 installed |
 | `P1-REV-003` | 进程退出后的 Game 状态提交失败仍释放保护，留下 Running/实际退出矛盾 | `ProcessExitRecoveryRecord`、先提交终态再释放 guard、恢复后新任务重试 | LaunchOrchestrator、GameRegistry、ProcessManager、TaskScheduler、AppData | 不新增用户可见 Game 业务状态，不自动重启游戏 |
 | `P1-REV-004` | stale bookmark 只有部分消费路径回写 | 统一 scoped access lease，刷新 bookmark 后先提交，再发布消费者结果 | GameFileSystemRepository、GameRegistry、FileIntegrityVerifier、VersionChecker、PreLaunchValidator、LaunchOrchestrator | 不回退裸 path，不扩大 Sandbox 权限，不新增路径定位功能 |
@@ -30,10 +31,10 @@
 TaskScheduler 接收：
 
 - `intentID`：用户点击下载的一次意图。
-- `kind=WineAssetDownload`。
-- `target.runtimeTag`：目标 Wine 版本。
+- `kind=WineRuntimeSetup`。
+- `target.runtimeIdentity`：固定为 `wine-crossover-11.0-1-signed`；不接受用户版本选择。
 - `priority=userInitiated`。
-- `resourceKeys=[wineRuntime]`。
+- `resourceKeys=[wineRuntime, sharedWinePrefix]`。
 - `cancellationPolicy=cleanupBeforeCancelled`。
 - 已验证的下载 metadata/asset 参数；不包含任意 shell 命令。
 
@@ -63,13 +64,13 @@ Receipt 至少包含 task ID、intent ID、runtime tag、`pending`、event curso
 accepted + pending commit
   → pending
   → running [running commit]
-  → validatingCatalogEntry
-  → downloadingAsset
-  → verifyingAsset
-  → extracting
-  → stagingArtifact
-  → committingInstalledRecord
-  → completed + runtimeReady/outcome
+  → readingFixedEntry
+  → downloading
+  → verifyingArtifact
+  → installingRuntime
+  → preparingSharedPrefix
+  → verifyingRuntimePair
+  → completed + runtimePairReady/outcome
 ```
 
 任何阶段都可以转：
@@ -81,16 +82,16 @@ running
   → failed + recoveryRequired
 ```
 
-`installedWineVersions` 写入和重读验证属于 `committingInstalledRecord` 阶段，不是下载阶段的附属日志。
+固定 runtime 安装记录、shared prefix 记录和 pair 重读验证属于 `verifyingRuntimePair`/提交阶段，不是下载阶段的附属日志；旧多版本列表不属于当前模型。
 
 ### 3.4 失败
 
 | 失败阶段 | Task 终态 | 业务结果 | 恢复动作 |
 |---|---|---|---|
-| catalog entry/source/asset 403/404/429 | `failed` | 未产生 installed runtime | 恢复网络、等待限流或主动改选 allowlist source 后新任务重试 |
+| fixed entry/source/asset 403/404/429 | `failed` | 未产生 fixed installed runtime | 恢复网络或等待限流后重试；不改选来源，不产生替代 entry |
 | 下载中断或尺寸不符 | `failed` | staged archive 无效 | 删除归档并验证清理 |
 | 解压失败 | `failed` | 目标版本未安装 | 删除不完整目录并验证清理 |
-| installed record 写入失败，artifact 可清理 | `failed` | artifact discarded；未安装 | 修复持久化后新任务重试 |
+| runtime/prefix pair 记录写入失败，artifact 可清理 | `failed` | pair 未提交；artifact discarded | 修复持久化后对固定目标新任务重试 |
 | installed record 写入失败，artifact/记录清理不确定 | `failed` + `recoveryRequired` | 版本状态未知，禁止删除/重复下载 | 先扫描、清理或恢复记录并验证 |
 
 没有任何路径把“解压目录存在”直接解释为 `installed`。
@@ -105,16 +106,16 @@ running
 
 ### 3.6 恢复
 
-`recoveryRequired` 记录目标 runtime tag、staged 路径、已知清理动作和最近错误。恢复任务先扫描目标目录和 installed 列表，再删除或重新登记为一致状态；读回验证完成后清除 recovery record。恢复过程不能偷偷开始新的下载。
+`recoveryRequired` 记录固定 runtime identity、shared prefix identity、staged 路径、已知清理动作和最近错误。恢复任务先扫描 runtime/prefix 目录和 pair 记录，再删除未提交结果或恢复为一致状态；读回验证完成后清除 recovery record。恢复过程不能偷偷开始新的下载或采用旧 prefix。
 
 ### 3.7 重试
 
-`failed + recoveryVerified` 或 `cancelled + cleanupVerified` 才能创建新的下载意图。`recoveryRequired` 存在时，新的 Wine 下载、删除和安装记录修改均被拒绝。重试不复用旧 Task ID；同一旧 intent 的重复点击只能得到 deduplicated 结果或明确拒绝。
+`failed + recoveryVerified` 或 `cancelled + cleanupVerified` 才能创建新的固定 setup 意图。`recoveryRequired` 存在时，新的 setup、升级、清理和 pair 记录修改均被拒绝。重试不复用旧 Task ID；同一旧 intent 的重复点击只能得到 deduplicated 结果或明确拒绝。
 
 ### 3.8 权限和持久化
 
 - 权限：下载、解压和 staged artifact 只能位于 App Support 管理的 Wine 目录；metadata/asset 必须来自已验证来源。Wine 下载不获得游戏目录 bookmark、系统文件或 helper 权限。
-- 持久化：`pending`、`running`、终态 Task 和 `installedWineVersions` 都必须由 PersistenceStore 写入并重读验证；pending 提交失败不启动下载，安装记录提交失败不发布 completed。
+- 持久化：`pending`、`running`、终态 Task、固定 runtime 记录和 shared prefix pair 记录都必须由 PersistenceStore 写入并重读验证；pending 提交失败不启动 setup，任一 pair 记录提交失败不发布 completed。
 
 ## 4. P1-REV-002：completed、failed、recoveryRequired 提交语义
 
@@ -327,14 +328,14 @@ Implementation 必须以可注入的 bookmark resolver、PersistenceStore 写入
 - Product 功能边界和 Deferred 清单。
 - App Sandbox 为只读用户选择文件的权限事实；不通过代码绕过。
 - Task 五态集合；`recoveryRequired` 不升级为第六种 Task 状态。
-- Wine 启动命令、`WINEPREFIX`、`WINEDLLOVERRIDES` 和独立 prefix 规则。
+- Wine 启动命令、`WINEPREFIX`、`WINEDLLOVERRIDES` 和 shared prefix lease 规则（当前 prefix 为 `<Application Support>/MiPlay/WinePrefixes/shared`）。
 - 不新增通用调度框架、通用 UI 状态系统或未被四个 P1 要求的服务。
 
 ## 8. 验证映射
 
 | P1 | 最小验证集合 |
 |---|---|
-| `P1-REV-001` | Receipt 只有 pending commit 后返回；同/不同 tag 互斥；取消传播到 URLSession/解压；清理后 cancelled；清理失败 recoveryRequired；无自动重放 |
+| `P1-REV-001` | Receipt 只有 pending commit 后返回；固定目标 setup 互斥；取消传播到 URLSession/解压/Wine 子进程；shared prefix lease 受保护；清理后 cancelled；清理失败 recoveryRequired；无自动重放 |
 | `P1-REV-002` | installed record 写入成功才 completed；写入失败不发 completed；staged artifact 可清理为 failed；清理不确定锁定 recoveryRequired；terminal event 可重读 |
 | `P1-REV-003` | 正常/异常退出终态；提交失败保留 guard；恢复命令幂等且不启动；重启时 Running 无进程进入 recoveryRequired；恢复成功后新任务可入队 |
 | `P1-REV-004` | fresh/stale/access denied；所有五个消费者提交 refreshed location；刷新持久化失败不发布业务成功；scope 成对释放；重试不回退裸 path |

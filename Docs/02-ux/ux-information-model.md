@@ -2,7 +2,8 @@
 
 > **文档状态**：活跃（Active）
 > **UX 阶段**：Information Model
-> **更新日期**：2026-08-03
+> **更新日期**：2026-08-27
+> **修订（I-2/I-3/I-4/I-5）**：2026-08-27 保留背景 hover 与“此 Mac”语义，覆盖旧 Wine 作用域模型，冻结单一 runtime 与共享 prefix 信息模型
 > **继承自**：Product Domain、Product Features、Architecture Task Queue
 
 ## 信息模型规则
@@ -107,19 +108,96 @@ TaskScheduler 对一次可排队操作的生命周期记录。
 
 `Applied` 不表示游戏已启动；`RolledBack` 不表示应用成功；备份成功不改变上述状态。
 
-## 8. RuntimeReadiness（按 Game ID）
+## 8. RuntimeReadiness（固定 runtime + 共享 prefix，按 Game ID）
 
-面向用户使用“运行环境”，技术细节可进入日志。`WineReady` 是当前 Game ID 的 readiness，不是全局机器状态；可用目录、已安装版本、当前选中版本和 readiness 必须分别表达。
+面向用户使用“运行环境”，技术细节可进入日志。当前唯一 runtime 是 `wine-crossover-11.0-1-signed`，三款游戏共用同一个 MiPlay 管理的 prefix。Wine 安装、共享 prefix 和目标游戏 readiness 必须分别表达。
 
-| 结果 | 用户事实 | 依赖任务 |
-|------|---------|---------|
-| `NoSelectedRuntime` | “{游戏名}没有选中的托管运行时” | 获取或选择已安装版本 |
-| `SelectedNotReady` | “{游戏名}的运行时尚未就绪” | 运行环境准备/前置校验 |
-| `WineReady` | “当前运行时：{版本}；{游戏名}已就绪” | 可继续启动前置流程 |
-| `RuntimeUnavailable` | “当前运行时不可用：{原因}” | 来源、资源、权限或适用性恢复 |
-| `RecoveryRequired` | “运行时状态未确认，当前不能继续操作” | 先完成恢复/清理 |
+### 8.1 BackgroundGroupSelectionState（I-2 冻结）
 
-`WineAcquiring` 仅是旧文档中的过程性总称，不是终态，也不是新的 Task 状态。2026-08-05 起，必须按 [ux-runtime-revision-2026-08-05.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/02-ux/ux-runtime-revision-2026-08-05.md) 分开表达下载目标、安装任务、当前选中版本和当前 Game ID 的 readiness。下载完成、文件存在、解压完成或前缀准备开始都不能单独产生 `WineReady`。
+背景组 hover 预览是临时媒体事实，不改变持久化选择，也不删除背景缓存。
+
+| 状态 | 进入条件 | 用户事实 | 持久化影响 |
+|---|---|---|---|
+| `idle` | 未 hover 任何候选组 | 圆点隐藏或可见但未 hover；画面为当前选中组 | 无 |
+| `dotsHidden` | 顶部区域无指针 | 圆点隐藏，画面为当前选中组 | 无 |
+| `dotsVisible` | 指针进入顶部区域 | 候选圆点可见 | 无 |
+| `hoverPreview(groupID)` | hover 候选组 | 正在预览该组 | 无 |
+| `previewLoading(groupID)` | 未缓存且允许加载 | 正在加载预览，可取消 | 无 |
+| `previewFailed(groupID)` | 预览加载失败 | 预览失败，当前背景保持 | 无 |
+| `selected(groupID)` | 用户明确提交且资源验证、选择写回、重读通过 | 当前持久化选中组 | 写入 `selectedBackgroundGroupID` |
+
+`hoverPreview`、`previewLoading` 和 `previewFailed` 不得改变 `selectedBackgroundGroupID`，不得写持久化，不得删除任何背景缓存。只有 `selected(groupID)` 是持久化选中终态。
+
+### 8.2 ManagedWineState（R-1/R-2/R-4 冻结）
+
+固定 runtime 的安装事实与共享 prefix 的运行事实是两个独立状态对象。下载、安装、prefix 初始化和恢复都只绑定这一个固定目标，不产生用户可选择的版本、来源、prefix 或游戏级 Wine 状态。
+
+#### 固定 runtime 安装事实
+
+| 状态 | 进入条件 | 用户事实 | 不能推断 |
+|---|---|---|---|
+| `NoManagedRuntime` | 固定 runtime 未形成可复核安装事实 | “统一 Wine 尚未安装” | 不得从目录、文件或外部 Wine 推断已安装 |
+| `Downloading` | 固定 Release 正在获取 | “正在下载统一 Wine” | 不表示已安装或 prefix 已准备 |
+| `ArtifactReady` | 固定 Release 已完整获取并通过校验 | “统一 Wine 安装资源已验证” | 不表示安装提交完成 |
+| `Installing` | 托管安装、executable 验证或提交正在进行 | “正在安装统一 Wine” | 不表示安装成功 |
+| `Installed` | 安装提交、身份复核和持久化重读均通过 | “统一 Wine 已安装” | 不表示共享 prefix 或任何游戏已就绪 |
+| `InstallFailed` | 安装身份、提交、重读或清理失败 | “统一 Wine 安装失败” | 不得把部分安装当作可用 runtime |
+| `RuntimeUnavailable` | 固定资源、批准来源、架构或托管事实无法确认 | “统一 Wine 当前不可用” | 不提供来源选择或外部 fallback |
+| `RecoveryRequired` | 产生副作用但清理/恢复尚未确认 | “统一 Wine 状态未确认，当前不能继续” | 不得继续安装、初始化或启动 |
+
+#### 共享 prefix 事实
+
+| 状态 | 进入条件 | 用户事实 | 三款游戏影响 |
+|---|---|---|---|
+| `PrefixUnset` | 固定 runtime 已安装但唯一 prefix 尚未初始化 | “共享运行环境尚未准备” | 三款游戏均不能报告 `WineReady` |
+| `PrefixPreparing` | 初始化、更新或验证正在进行 | “正在准备共享运行环境” | 三款游戏均等待，不重复发起 |
+| `PrefixReady` | 唯一 prefix 的身份、内容和准备结果均通过 | “共享运行环境已准备” | 可分别检查三款游戏 readiness |
+| `PrefixNotReady` | 初始化、更新或验证失败 | “共享运行环境准备失败” | 三款游戏均不能报告 `WineReady` |
+| `RecoveryRequired` | prefix 副作用或状态无法确认 | “共享运行环境状态未确认，当前不能继续” | 三款游戏均受保护，先恢复 |
+
+`prefixOccupancy` 是共享 prefix 的独立保护事实：`free`、`busy` 或 `unknown`。`busy` 表示等待当前 Wine 使用结束；它不创建新 prefix、不切换 runtime、不清理正在使用的内容，也不等于初始化失败。
+
+#### 目标游戏 readiness
+
+| 结果 | 进入条件 | 用户事实 | 影响范围 |
+|---|---|---|---|
+| `WineReady` | 固定 runtime 已安装、共享 prefix 已就绪、目标游戏路径/manifest/启动前置通过 | “{游戏名}可使用统一 Wine 启动” | 只允许目标 Game ID 启动 |
+| `RuntimeNotReady` | 固定 runtime 或共享 prefix 未通过门槛 | “统一 Wine 或共享运行环境尚未就绪” | 阻止三款游戏或受影响游戏，按公共事实处理 |
+| `GamePreflightFailed` | runtime/prefix 已就绪，但目标游戏自身路径、manifest、兼容方案或启动前置失败 | “统一运行环境已准备，但{游戏名}启动前置未通过” | 只影响目标 Game ID |
+| `RecoveryRequired` | 共享 runtime/prefix 的恢复未确认 | “统一运行环境状态未确认，当前不能继续” | 三款游戏均不能开始新的相关任务 |
+
+`WineReady` 不是“Wine 已安装”的别名。共享 prefix 已就绪后，三款游戏仍须分别取得自己的游戏 readiness；一款游戏的 `GamePreflightFailed` 不改变另外两款游戏的结果，也不创建新的 runtime 或 prefix。
+
+`GamePreflightFailed` 是 UX 对“游戏自身前置失败”的归因投影，不是新的 Wine runtime、prefix 或 Task 状态。若下游必须使用 Product 已有的 `RuntimeNotReady` 枚举，应同时携带 `failureScope=game`；公共 Wine/prefix 失败则使用 `failureScope=runtime`，两者的用户恢复路径仍必须区分。
+
+#### 旧 per-game 数据迁移后的用户事实
+
+- `selectedWineVersion` 不再是用户选择。只有它与固定身份一致且安装事实重新验证通过时，才可作为固定 runtime 的历史证据；其他值或空值不能成为当前 runtime。
+- `wineVersionOverride` 的所有值都忽略并清除其产品选择含义，不迁移为共享状态，也不产生新的 per-game 状态。
+- 旧的多版本安装记录只保留经固定身份和托管安装事实复核的唯一 Release；旧 per-game prefix 不继续使用，必须重新验证唯一共享 prefix。
+- 迁移后设置页只表达一个固定 runtime、一个共享 prefix 和三款游戏各自 readiness。无法确认时显示 `NoManagedRuntime`、`RuntimeNotReady` 或 `RecoveryRequired`，不能显示“已就绪”。
+
+### 8.3 DeviceInfo（I-5 冻结）
+
+“此 Mac”主层级字段为机型、芯片、内存、macOS 版本，按“关于本机”表达；未知字段不推断。model identifier 与 build number 是详情字段；Wine 目标卷空间独立读取。
+
+| 字段 | 来源 | 用户语义 | 未知/失败语义 |
+|---|---|---|---|
+| 机型 | 系统报告的 machine name | 例如 MacBook Pro | 显示“未知”或“无法读取”，不推断 |
+| 芯片 | 系统报告的 chip name | 例如 Apple M1 Pro | 显示“未知”或“无法读取”，不从 model identifier 推断 |
+| 内存 | 系统报告的物理内存 | 真实内存值 | 不用默认值补齐 |
+| macOS 版本 | 系统报告的产品版本 | 面向用户的版本 | 不用 build number 替代 |
+| model identifier | 系统型号标识 | 详情字段 | 不作为主层级事实 |
+| build number | 系统构建事实 | 详情字段 | 不作为产品版本 |
+| Wine 目标卷空间 | Wine 管理目标所在卷 | 当前/总量 | 不可用时保留失败事实，不改变 Wine readiness |
+
+| 状态 | 用户事实 | 恢复动作 | 终态 |
+|---|---|---|---|
+| `fieldConfirmed` | 字段为系统报告值 | 查看 | 字段可读 |
+| `fieldUnknown` | 系统报告未提供 | 手动刷新或等待系统提供 | 不推断 |
+| `fieldFailed` | 无法读取字段 | 手动刷新；必要时导出日志 | 不用旧值、0 或空值伪装当前值 |
+| `fieldStale` | 显示上一次已确认值 | 刷新 | 旧值标记为等待更新 |
+| `diskSpaceUnavailable` | 无法读取 Wine 目标卷空间 | 等待卷可用或重试 | 不改变 Wine readiness |
 
 ## 9. AppDataRecovery
 
@@ -150,27 +228,22 @@ TaskScheduler 对一次可排队操作的生命周期记录。
 | 恢复动作 | 唯一推荐的下一步及前置条件 |
 | 验证事实 | 恢复/清理是否已读回确认 |
 
-## 11. RuntimeSourceResult
+## 11. ManagedWineAcquisitionResult
 
-运行环境版本发现是“来源查询结果”，不等同于下载任务或 `WineReady`。它不新增 Task.status；查询进行中由现有任务/阶段事实表示。
+固定 runtime 的资源检查是对一个产品固定目标的获取结果，不是可选版本目录，也不产生用户可选择的来源事实。来源由产品固定和管理；用户只能检查、下载、安装、重试或恢复。
 
 | 结果 | 进入条件 | 用户文案 | 恢复动作 | 是否可用于启动 |
-|------|---------|---------|---------|-------------|
-| `catalogLoading` | 正在读取批准来源或批准镜像 | “正在检查游戏运行环境版本” | 等待或取消查询 | 否 |
-| `availableManagedVersions` | 返回有效目录，至少有 allowlist、架构和需求匹配版本 | “找到可用的托管运行环境版本” | 选择后创建下载任务 | 只有安装并验证后才可 |
-| `noAvailableManagedVersion` | 来源有效，但没有可用的托管版本 | “没有可用的托管运行环境版本” | 稍后重试或等待 MiPlay 支持版本 | 否 |
-| `networkFailure` | 当前选定的官方 GitHub 或预置镜像不可达、超时、限流或服务不可用 | “无法连接所选运行环境版本源” | 检查网络后重试，或主动改选其他预置来源 | 否 |
-| `sourceConfigurationError`（403） | 当前选定来源拒绝访问，HTTP 403；没有取得可信目录 | “所选运行环境版本源拒绝访问（403）” | 稍后重试或改选预置来源；不要求用户提供 token | 否 |
-| `sourceConfigurationError` | allowlist、URL、镜像配置或版本策略无法通过校验 | “运行环境版本源配置错误” | 更新 MiPlay 或等待修复，不要求用户改源 | 否 |
-| `catalogInvalid` | 响应可达但数据格式、身份或资源映射无效 | “版本源返回的信息无法验证” | 稍后重试并保留诊断 | 否 |
-| `selectedPresetMirror` | 用户明确选择了 allowlist 内的预置镜像 | “已选择{镜像}作为 Wine 版本源” | 查询该来源或改选其他批准来源 | 否 |
+|---|---|---|---|---|
+| `checking` | 正在检查固定 Release 资源 | “正在检查统一 Wine” | 等待或取消检查 | 否 |
+| `artifactAvailable` | 固定身份、批准来源、架构和资源映射可验证 | “已找到统一 Wine 安装资源” | 开始下载 | 否 |
+| `artifactUnavailable` | 固定资源暂时不可达、服务失败或资源不存在 | “无法获取统一 Wine 安装资源” | 恢复网络或稍后重试 | 否 |
+| `artifactInvalid` | 资源身份、重定向、格式或校验不匹配 | “统一 Wine 安装资源无法验证” | 等待产品修复或重试 | 否 |
+| `artifactDownloaded` | 固定资源完整获取并通过内容校验 | “统一 Wine 安装资源已验证” | 提交安装 | 否 |
+| `installationVerified` | 托管安装、executable 身份、持久化提交和重读均通过 | “统一 Wine 已安装” | 初始化共享 prefix | 否 |
+| `prefixVerified` | 唯一共享 prefix 初始化和验证通过 | “共享运行环境已准备” | 分别检查游戏 readiness | 仅作为公共门槛 |
+| `recoveryRequired` | 清理、安装或 prefix 状态无法确认 | “统一运行环境状态未确认，当前不能继续” | 先完成恢复 | 否 |
 
-### 来源与镜像规则
-
-- 只有 Product allowlist 内的批准来源和批准镜像参与 `RuntimeSourceResult`；用户可以选择预置镜像，但不能输入任意 URL。
-- 官方 GitHub 或预置镜像的查询结果必须保留选定来源身份；一个来源失败不自动改写为另一个来源成功。用户主动改选来源后，才开始新的来源查询。
-- 选定来源失败为该来源的 API/下载错误；配置本身无效为 `sourceConfigurationError`；有效目录为空为 `noAvailableManagedVersion`。
-- 远程目录条目、下载完成、解压完成和 `wine --version` 输出都不能单独产生 `WineReady`。必须有托管身份、内容验证、安装提交、环境准备和重读验证。
+下载、解压、文件存在、`wine --version` 有输出或 prefix 目录存在，都不能单独产生 `installationVerified`、`prefixVerified` 或 `WineReady`。三款游戏的 readiness 仍需按目标 Game ID 单独读取。
 
 ## 12. LocalGameEvidence
 
@@ -232,7 +305,23 @@ TaskScheduler 对一次可排队操作的生命周期记录。
 ### 必须可读的模板
 
 - **Game card**：`label=切换到{游戏名}`；`value={选中状态}，{业务状态}，{当前可用动作}`；`hint=选择后显示该游戏背景和可用操作`。
+- **Background group preview**：`label={组名}背景组预览`；`value=预览中/加载中/失败，当前选中组{组名}`；`hint=离开恢复当前选中组，Return/Space 提交`。
+- **Unified Wine runtime**：`label=统一 Wine`；`value=固定 runtime {固定身份}，安装状态{状态}，共享 prefix {状态}，占用{状态}`；`hint=检查、下载、安装、初始化或恢复，不提供版本/来源/prefix 选择`。
+- **Game readiness**：`label={游戏名}运行环境`；`value=统一 Wine、共享 prefix、游戏启动前置的结构化结果`；`hint=明确区分运行环境失败与游戏自身前置失败`。
+- **This Mac**：`label=此 Mac`；`value={机型}，{芯片}，{内存}，{macOS 版本}，{各字段读取状态}`；未知字段读作“未知”，失败字段读作“无法读取”。
 - **Launch progress**：`label={游戏名}启动`；`value={pending/running}，{阶段}，{真实百分比或进度未知}`；不读出由视觉条或时间猜测的百分比。
 - **Failure/recovery**：`label={目标}操作结果`；`value={阶段}失败，{副作用事实}，{终态}`；`hint={恢复动作}`。`recoveryRequired` 必须读出“当前不能重试”。
 - **Solution**：`Applied` 必须读出“方案已应用并验证，游戏尚未启动”；`RolledBack` 必须读出“应用未成功，应用前状态已恢复并确认”。
-- **Runtime source**：分别读出“没有可用版本”“无法连接版本源”“版本源配置错误”“正在下载”，不能用空列表、颜色或 spinner 推断。
+- **Managed Wine acquisition**：固定目标只读出“正在检查/下载/验证/安装统一 Wine”及对应终态；不能用空列表、颜色或 spinner 推断安装或 prefix 就绪。
+
+## 2026-10-08 设置与任务反馈修订
+
+设置导航分为应用（通用、Wine）、游戏（三款游戏）、关于；各页面标题和一行范围说明帮助用户确认当前配置对象。主窗口仍以背景和启动操作为主，仅有任务或恢复事实时显示局部反馈。选中游戏使用独立白色标记，彩色描边继续传达运行状态，避免两个语义混用。
+
+实现和验证见 [UI 优化修订](../03-ui/ui-revision-2026-10-08.md)。
+
+## 2026-10-09 简化修订
+
+设置保留分组导航和页面标题，删除重复的一行范围说明；“下次启动生效”改用系统 Section footer。Wine 的共享 prefix 对外称为“共享游戏环境”，完整来源 URL 继续可点击。恢复事实仅展示当前游戏对应的未解决记录。准备遮罩将底层按钮从键盘与辅助技术操作区域隔离。
+
+见 [原生 UI 审查](../03-ui/ui-native-review-2026-10-09.md)。

@@ -1,7 +1,7 @@
 # MiPlay 架构决策记录
 
-> **文档状态**：已冻结（Phase 3；当前修订 ADR 023-029 与 `architecture-revision-2026-08-03.md` 同步）
-> **更新日期**：2026-08-03
+> **文档状态**：已冻结（Architecture 回溯；2026-08-28 重置 I-4 运行时模型，并保留 I-1/I-5 契约）
+> **更新日期**：2026-08-28
 > **用途**：记录本阶段冻结的架构决策。实现不得绕过已接受决策；若发现决策与平台事实冲突，必须回溯 Architecture。
 
 ## ADR 001：采用四层单向依赖
@@ -51,7 +51,7 @@
 
 ## ADR 006：冻结 Wine 启动命令和 prefix 归属
 
-- **状态**：Accepted；来源范围由 ADR 016、023-025 进一步收紧
+- **状态**：Deprecated；由 ADR 037-039 取代
 - **决策**：由 WineVersionManager 决定已验证的 MiPlay 托管 Wine；WineRuntimeProvider 只验证并准备该 binary。Process 执行 Wine binary，参数为绝对游戏 exe 加固定/性能参数；工作目录为游戏目录；每款 Game 使用 App Support 下独立 prefix；环境固定包含 `WINEPREFIX` 和 `WINEDLLOVERRIDES=winemenubuilder.exe=d`。不检测或使用系统 Wine。
 - **理由**：将“选择哪个 Wine”和“如何执行 Wine”分离，避免多个决策者。独立 prefix 避免游戏之间相互污染，固定 DLL override 确保 prefix 准备与启动一致。参数数组避免 shell 注入和转义歧义。
 - **备选方案**：A（Process 直接执行 Windows exe）— 未采纳，因为 macOS 不能直接执行目标 exe；B（每款游戏共用一个 prefix）— 未采纳，因为兼容配置和 DLL 状态会互相污染；C（让 UI/用户自由传环境和参数）— 未采纳，因为当前产品明确延期自定义启动参数且扩大风险。
@@ -106,16 +106,16 @@
 ## ADR 012：TaskReceipt 以 pending 持久化提交为接受门槛
 
 - **状态**：Accepted
-- **决策**：TaskScheduler 只有在 pending Task 写入 AppData 并重读验证后才返回 `TaskReceipt`。Receipt 必须包含 task/intent/target、事件 cursor、资源锁、取消策略和 `persistence=committed`。Wine 下载使用全局 `wineRuntime` 互斥：同版本重复请求复用已有 Receipt，不同版本请求返回带冲突 Task ID 的拒绝；不把第二个下载排入等待队列。
+- **决策**：TaskScheduler 只有在 pending Task 写入 AppData 并重读验证后才返回 `TaskReceipt`。Receipt 必须包含 task/intent/target、事件 cursor、资源锁、取消策略和 `persistence=committed`。固定 `WineRuntimeSetup` 使用全局 `wineRuntime` 互斥：同一固定目标重复请求复用已有 Receipt；已有 setup、升级或恢复未收敛时返回带冲突 Task ID 的拒绝，不创建第二个 setup。
 - **理由**：只有裸 Task ID 无法证明任务已被持久接受；Wine 版本目录和安装记录是共享资源，多个下载会造成临时目录、选择和取消状态冲突。
-- **备选方案**：A（先返回 Receipt 再异步写 pending）— 未采纳，因为崩溃或写入失败会产生不存在的任务；B（允许多个 Wine 下载 pending）— 未采纳，因为全局 runtime 资源和版本选择语义会交叉；C（Settings 直接消费 Wine 流）— 未采纳，因为绕过统一取消、历史和事件投影。
+- **备选方案**：A（先返回 Receipt 再异步写 pending）— 未采纳，因为崩溃或写入失败会产生不存在的任务；B（允许多个 WineRuntimeSetup pending）— 未采纳，因为固定 runtime/shared prefix 资源和恢复语义会交叉；C（Settings 直接消费 Wine 流）— 未采纳，因为绕过统一取消、历史和事件投影。
 - **Trade-off**：持久化短暂不可用时用户不能立即提交任务；这是避免任务丢失和伪接受的必要门槛。
 - **影响范围**：TaskScheduler、WineVersionManager、SettingsViewModel 的调用入口、Task history、TaskReceipt 测试。
 
 ## ADR 013：任务终态必须经过持久化提交和重读验证
 
 - **状态**：Accepted
-- **决策**：`completed` 只有业务 outcome、相关 AppData 写入和重读验证全部通过才可发布；`failed` 只有目标未达成且外部副作用已清理、失败记录可重读才成立；`recoveryRequired` 不是 Task.status，而是持久化的恢复保护事实。Wine artifact 在 `installedWineVersions` 提交前始终是 staged，不得列为已安装。
+- **决策**：`completed` 只有业务 outcome、相关 AppData 写入和重读验证全部通过才可发布；`failed` 只有目标未达成且外部副作用已清理、失败记录可重读才成立；`recoveryRequired` 不是 Task.status，而是持久化的恢复保护事实。固定 Wine artifact 和 shared prefix 在 runtime/prefix pair 提交前始终是 staged 或 recovery 事实，不得列为已安装或 ready。
 - **理由**：P1-REV-002 证明吞掉 `markVersionInstalled` 错误会把内存 artifact 误报为已安装。把提交验证设为终态门槛可以阻止 UI 和 Domain 产生不同事实。
 - **备选方案**：A（下载/解压完成即 completed）— 未采纳，因为 AppData 可能没有安装记录；B（写入失败静默重试后仍先完成）— 未采纳，因为事件顺序会误导 UI；C（把 recoveryRequired 加入 Task.status）— 未采纳，因为 UX 已冻结五种 Task 生命周期，恢复是跨任务保护事实。
 - **Trade-off**：终态反馈可能因磁盘写入或重读延迟；实现必须保留 staged artifact 清理和恢复路径。
@@ -142,15 +142,15 @@
 ## ADR 016：当前版本只使用 MiPlay 托管 Wine
 
 - **状态**：Accepted
-- **决策**：只有由 MiPlay 从 Product 批准来源取得、保存、校验、安装并提交记录的 `ManagedWineRuntime` 才能进入 RuntimeCatalog、RuntimeSelection、`WineReady` 或游戏启动。系统 Wine、Whisky、CrossOver 和用户路径不被检测、展示、导入或使用。
+- **决策**：只有由 MiPlay 从产品固定批准来源取得、保存、校验、安装并提交记录的唯一 `ManagedWineRuntime`，以及与其绑定的 `SharedWinePrefix`，才能进入 `RuntimeEnvironment`、`WineReady` 或游戏启动。系统 Wine、Whisky、CrossOver 和用户路径不被检测、展示、导入或使用。
 - **理由**：Product 已冻结“托管 Wine 是唯一可用运行时”；外部 binary/prefix 的来源、版本、权限和可复现性无法由检测路径证明。
 - **备选方案**：A（无托管版本时回退系统 Wine）— 未采纳，因为会绕过 Product allowlist 和安装验证；B（导入 Whisky/CrossOver bottle）— 未采纳，因为引入未知 prefix 权属和运行时污染；C（允许用户指定 Wine path）— 未采纳，因为超出当前产品边界。
 - **Trade-off**：批准来源不可用时用户不能启动，即使系统存在 Wine；换取启动事实可追溯、可验证和一致的权限边界。
-- **影响范围**：WineVersionManager、RuntimeSelection、WineRuntimeProvider、LaunchOrchestrator、SettingsViewModel 和启动验收。
+- **影响范围**：WineVersionManager、RuntimeEnvironment、SharedWinePrefix、WineRuntimeProvider、LaunchOrchestrator、SettingsViewModel 和启动验收。
 
 ## ADR 017：Wine 来源由用户从 allowlist 主动选择
 
-- **状态**：Accepted
+- **状态**：Deprecated；由 ADR 037、040 取代
 - **决策**：新增 `WineCatalogQuery`、`WineAssetDownload` 和 `WineSourceSelection` 契约。官方 GitHub 是默认来源；用户可从 Product allowlist 主动选择预置可信镜像。来源失败不自动切换，用户必须主动改选另一个预置来源；不接受任意 URL、host、token 或 header。
 - **理由**：Research 证明现有 API proxy 不等于 Release asset 镜像，当前第三方 proxy 没有固定版本、内容等价和完整响应验证证据。将其当作默认镜像会把不可信网络行为变成运行时事实。
 - **备选方案**：A（API/asset 任意最快源竞速）— 未采纳，因为最快不等于身份和内容可信；B（自动增加第三方镜像）— 未采纳，因为没有批准和可验证证据；C（网络失败回退系统 Wine）— 未采纳，因为违反 ADR 016。
@@ -196,7 +196,7 @@
 ## ADR 022：Phase 3 Architecture 文档是完成口径唯一来源
 
 - **状态**：Accepted
-- **决策**：Implementation/QA 文档必须引用本阶段的 Managed Wine、WineCatalogQuery、LocalGameEvidence、restart recovery、stale writeback 和 AccessibilityProjection 口径；旧的系统 Wine fallback、下载完成即 Ready、配置文件即完整、PID 即 Running 和 UI 视觉推断均视为过时。
+- **决策**：Implementation/QA 文档必须引用当前固定 Managed Wine、WineRuntimeSetup、SharedWinePrefix、LocalGameEvidence、restart recovery、stale writeback 和 AccessibilityProjection 口径；旧的系统 Wine fallback、下载完成即 Ready、配置文件即完整、PID 即 Running 和 UI 视觉推断均视为过时。
 - **理由**：DOC-REV-001 表明下游完成口径分叉会让实现即使通过局部测试仍违反 Product/UX/Architecture 冻结事实。
 - **备选方案**：A（各 Agent 保留本地解释）— 未采纳，因为无法形成可审计验收；B（只在 QA 末尾修正文档）— 未采纳，因为 Implementation 会在错误契约上继续扩散；C（修改 Product/UX 以适配实现）— 未采纳，因为回溯方向错误。
 - **Trade-off**：下游文档同步成为显式交付项；换取跨阶段术语和验收口径一致。
@@ -213,7 +213,7 @@
 
 ## ADR 024：Wine source 采用用户主动选择的 Product allowlist
 
-- **状态**：Accepted
+- **状态**：Deprecated；由 ADR 037、040 取代
 - **决策**：官方 GitHub 是默认 source；用户只能主动选择预置 allowlist mirror。source ID、HTTPS endpoint、host/path、架构、release/asset 规则和 policy revision 由 Product 配置固定。来源失败不自动切换，用户只能重试或主动改选另一个预置 source。
 - **理由**：研究无法把 API proxy、302 或速度证明为 Release asset 的内容等价镜像；主动选择使来源身份和失败反馈可审计。
 - **备选方案**：A（固定顺序自动 fallback）— 未采纳，因为用户未选择且错误类别可能被掩盖；B（任意 URL/镜像输入）— 未采纳，因为供应链和权限不可验证；C（竞速最快源）— 未采纳，因为最快不等于可信。
@@ -222,7 +222,7 @@
 
 ## ADR 025：API discovery、Release metadata 和 asset download 分离
 
-- **状态**：Accepted
+- **状态**：Deprecated；由 ADR 040 取代
 - **决策**：`WineCatalogQuery` 只发现和验证 API/Release metadata，输出 CatalogEntry；`WineAssetDownload` 只接收已验证 CatalogEntry 并取得 asset bytes。API 200、asset URL、302、Content-Length 或下载进度均不能单独产生 WineReady。
 - **理由**：Research 已确认 API prefix、Release JSON 和 asset bytes 可能具有不同身份、重定向和失败行为；分离才能分别表达 403、429、空列表、asset forbidden 和内容不完整。
 - **备选方案**：A（一个下载服务完成所有步骤）— 未采纳，因为职责混合会吞掉阶段错误；B（只按 URL 下载）— 未采纳，因为无法验证 release/asset identity；C（API 结果直接 Ready）— 未采纳，因为没有安装和内容证据。
@@ -241,7 +241,7 @@
 ## ADR 027：PerGameSettings 和 BackgroundGroup 以 Game ID 隔离
 
 - **状态**：Accepted
-- **决策**：GlobalSettings 只保存应用级设置和 Wine source selection；PerGameSettings 按 Game ID 保存 metadata 展示、性能/兼容入口状态、背景组选择和失败事实引用。BackgroundGroup 绑定 Game ID、版本、source identity 以及 image/video/theme 资源身份；目标组失败或取消时保留上一有效组。
+- **决策**：GlobalSettings 只保存应用级设置和固定 runtime/shared prefix 的安全摘要；PerGameSettings 按 Game ID 保存 metadata 展示、性能/兼容入口状态、背景组选择和失败事实引用，不保存 Wine 版本或 prefix 绑定。BackgroundGroup 绑定 Game ID、版本、source identity 以及 image/video/theme 资源身份；目标组失败或取消时保留上一有效组。
 - **理由**：UX/UI 明确要求不同游戏设置和背景选择不串用；背景资源失败不应污染游戏安装、完整性或启动状态。
 - **备选方案**：A（全局当前背景/设置）— 未采纳，因为会跨游戏泄漏；B（只保存 URL）— 未采纳，因为无法表达资源版本和验证状态；C（失败时静默选择其他组）— 未采纳，因为改变了用户意图。
 - **Trade-off**：AppData 需要按 Game 保存更多摘要；换取隔离、可恢复和明确反馈。
@@ -258,7 +258,7 @@
 
 ## ADR 029：Managed Wine 启动命令和权限边界固定
 
-- **状态**：Accepted
+- **状态**：Deprecated；由 ADR 037-039 取代
 - **决策**：启动只能执行已验证 Managed Wine binary；参数为绝对游戏 exe 加固定/批准性能参数；prefix 为 App Support 下的独立 Game ID 目录；环境固定包含 `WINEPREFIX` 和 `WINEDLLOVERRIDES=winemenubuilder.exe=d`；游戏目录 bookmark scope、App Support prefix 和系统修改 helper 三者权限不互相替代。
 - **理由**：固定命令和独立 prefix 能隔离游戏、避免 shell/任意环境输入，并保持 Sandbox 与系统修改最小权限边界。
 - **备选方案**：A（用户任意 binary/参数）— 未采纳，因为破坏 Managed Wine 和可审计性；B（游戏目录作为 prefix）— 未采纳，因为权限和游戏文件污染混在一起；C（bookmark 直接写 hosts/hostname）— 未采纳，因为游戏授权不等于系统授权。
@@ -274,6 +274,114 @@
 - **Trade-off**：现有自由文本调用需要经过安全化/结构化收敛，导出前必须 flush，可能增加诊断延迟；换取日志不会成为第二业务事实源，且敏感值不会进入文件或导出。
 - **影响范围**：LogWriter、TaskScheduler/LogExport、GameRegistry、LaunchOrchestrator、WineVersionManager、VersionChecker、SolutionEngine、Persistence/Process/Network consumers、SettingsViewModel 和日志测试。
 
+## ADR 031：API 背景集合指纹是缓存失效的唯一依据（I-1）
+
+- **状态**：Accepted
+- **决策**：背景缓存以 `(Game ID, 组 ID, 资源身份)` 为单元；每个 Game 维护一个 API 背景集合指纹，由 API 返回的集合内容（组 ID 顺序、各组资源身份/版本、source identity）计算，不含 `selectedBackgroundGroupID` 或 hover 态。只有指纹变化时才允许按 diff 清理不再属于当前集合或资源身份已变化的缓存；用户切换、hover 预览、失败和取消都不删除缓存。指纹与缓存 manifest 存 App Support 媒体缓存目录，AppData 只保存选择。
+- **理由**：当前实现用“缓存 ID 不同”触发删除，无法区分用户切换与 API 变更，切换分组会误删其他分组缓存；指纹把“集合是否变化”和“呈现选择”分离。
+- **备选方案**：A（用 `selectedBackgroundGroupID` 做缓存清理依据）— 未采纳，因为用户切换会被当成内容变更；B（每次加载全量清缓存）— 未采纳，因为会浪费并删除其他分组资源；C（用 URL 直接判断）— 未采纳，因为 URL 不能表达集合身份和资源版本变化。
+- **Trade-off**：需要维护指纹与 manifest，并在指纹缺失时保守不清缓存；收益是用户切换无损、API 变更可回收。
+- **影响范围**：BackgroundMediaService、BackgroundMediaLoad、媒体缓存目录、PersistenceStore（选择持久化）、LibraryViewModel 预览。
+
+## ADR 032：Wine 生效版本按 Game ID 解析为覆盖优先、全局回退（I-4）
+
+- **状态**：Deprecated；由 ADR 037、041 取代
+- **决策**：`PerGameSettings.wineVersionOverride` 保存单 Game 覆盖；全局默认仍由 AppData `selectedWineVersion` 表达。生效版本解析固定为 `wineVersionOverride ?? selectedWineVersion`。覆盖存在但无效时不自动回退全局；只有覆盖不存在时才回退。两者都必须已安装托管版本；下载/安装目标不成为有效选中。
+- **理由**：Product/UX/UI 已冻结“全局 / 单独”；“覆盖优先、无覆盖回退”是唯一解析规则，避免多来源歧义。
+- **备选方案**：A（只有全局版本）— 未采纳，因为无法按游戏分别使用不同版本；B（覆盖失效时静默回退全局）— 未采纳，因为会掩盖用户单独选择并产生非预期启动环境；C（覆盖存在且失效时显示全局）— 未采纳，因为违反冻结的“当前选中版本失效显示未就绪”。
+- **Trade-off**：失效覆盖需要用户显式修复或移除；换来版本事实不静默漂移。
+- **影响范围**：WineVersionManager、PerGameSettings、GameRegistry、LaunchOrchestrator、SettingsViewModel。
+
+## ADR 033：WineVersionManager 提供游戏级选择、读取与 readiness API（I-4）
+
+- **状态**：Deprecated；由 ADR 037、039 取代
+- **决策**：WineVersionManager 提供按 Game ID 的覆盖设置/移除、全局默认读取/设置、`effectiveVersion(for:)`、`checkReadiness(for:)` 和 `validatedRuntime(for:)`。无 Game 上下文的 `checkReadiness()` 只表达全局/默认运行时状态（gameID 为 nil），不得产生任何 Game 的 `WineReady`；`LaunchOrchestrator` 只消费按目标 Game 解析后的 runtime。Wine 下载全局 `wineRuntime` 互斥语义不变。
+- **理由**：UX 要求 readiness 是当前 Game 级结论；启动编排必须从目标 Game 的有效版本出发，Settings 无游戏上下文不能误报。
+- **备选方案**：A（全局 readiness 继续当启动门槛）— 未采纳，因为掩盖游戏级 prefix 与覆盖差异；B（每个 Game 独立下载互斥）— 未采纳，因为改变已冻结的全局 `wineRuntime` 下载互斥；C（UI 自行解析覆盖）— 未采纳，因为业务解析必须由 Domain 唯一所有者执行。
+- **Trade-off**：WineVersionManager 接口增加 Game ID 参数；换来版本解析和 readiness 单一决策者。
+- **影响范围**：WineVersionManager、SettingsViewModel、LibraryViewModel、LaunchOrchestrator、PreLaunchValidator。
+
+## ADR 034：Wine 版本删除保护覆盖全局默认与全部游戏覆盖（I-4）
+
+- **状态**：Deprecated；由 ADR 042 取代
+- **决策**：删除版本前必须同时检查全局 `selectedWineVersion`、所有 `PerGameSettings.wineVersionOverride`、活动下载和未收敛恢复记录；任一引用存在即拒绝删除并返回 `conflict`/`recoveryRequired`。删除成功后重读验证无任何引用和安装记录。用户必须先改选或移除全部引用后才能删除被引用版本。
+- **理由**：只检查全局会留下指向已删版本的覆盖，启动和 readiness 会产生无效运行时引用；Product/UX 已冻结“存在任一引用时不得删除”。
+- **备选方案**：A（只检查全局）— 未采纳，因为残留覆盖引用；B（删除时自动清除覆盖）— 未采纳，因为会改变用户单独选择事实且可能覆盖失败；C（允许删除后按需重建）— 未采纳，因为已删版本无法恢复且破坏安装事实。
+- **Trade-off**：删除被引用版本需要多一步解除引用；换来没有悬空运行时引用。
+- **影响范围**：WineVersionManager 删除流程、GameRegistry/PerGameSettings、PersistenceStore、SettingsViewModel、恢复记录。
+
+## ADR 035：AppData schema 3 增量迁移兼容旧文件（I-4）
+
+- **状态**：Deprecated；由 ADR 041 取代
+- **决策**：AppData 目标格式升级为 schema 3：`PerGameSettings` 新增 `wineVersionOverride`；`selectedWineVersion` 继续作为全局默认；旧 `lastCachedBackgroundIds` 保留为兼容诊断字段，不再作为选中或缓存失效依据。schema 1/2 按版本迁移：备份 → 迁移 → 写入 → 重读验证 → 发布；旧 `selectedWineVersion` 迁移为全局默认，不自动写入任何 Game 覆盖；迁移失败保留旧文件与备份。
+- **理由**：既有用户文件必须无损升级；全局/覆盖分离要求新增字段；不能把旧全局选择静默复制到三款游戏，也不能用新字段缺失绕过迁移验证。
+- **备选方案**：A（不升 schema，直接添加字段）— 未采纳，因为违反既有“未来格式必须递增版本迁移”的契约且无法表达迁移验证；B（迁移时自动为三款游戏写覆盖）— 未采纳，因为改变用户意图且违背冻结；C（丢弃旧字段）— 未采纳，因为会导致数据丢失。
+- **Trade-off**：需要一次显式迁移和验证；换来旧文件可回滚、新字段无歧义。
+- **影响范围**：PersistenceStore、AppData、GameRegistry、WineVersionManager、BackgroundMediaService、QA 迁移测试。
+
+## ADR 036：SystemInfo 字段契约与最小设备标识（I-5）
+
+- **状态**：Accepted
+- **决策**：SystemEnvironmentDetector 的 `SystemInfo` 区分 `machineName`（用户可读机型）、`chipName`（系统报告芯片名）、`physicalMemory`、`osVersion`、`buildNumber`、`modelIdentifier`（详情）和 `isAppleSilicon`。`machineName` 不来自 `hw.model` 推断；`chipName` 绝不使用 `hw.model`；字段缺失或失败分别保持 `unknown/failed`，不伪造旧值、0 或默认值。不读取、不展示、不持久化序列号、平台 UUID、UDID 等敏感标识；磁盘空间只针对 Wine 管理目标卷。
+- **理由**：Research 已确认 `hw.model=MacBookPro18,1` 是 model identifier 而非芯片名；UI/UX 冻结主层级四行；敏感设备标识应最小化。
+- **备选方案**：A（用 `hw.model` 当 chipName）— 未采纳，因为与 Research 和产品要求冲突；B（从 model identifier 推断营销型号）— 未采纳，因为没有可验证映射；C（失败时用旧值、0 或默认）— 未采纳，因为会伪装当前值。
+- **Trade-off**：真实芯片/机型字段依赖系统报告，个别平台可能 unknown；换取准确、可审计且不泄露标识。
+- **影响范围**：SystemEnvironmentDetector、SystemInfo、SettingsViewModel、GeneralPane、诊断导出脱敏规则。
+
+## ADR 037：当前版本固定为单一 Wine runtime 与单一 catalog entry
+
+- **状态**：Accepted
+- **决策**：当前版本唯一 runtime identity 为 `wine-crossover-11.0-1-signed`。`WineVersionManager` 只读取并验证一个产品批准的 fixed catalog entry，固定来源策略、目标架构和 asset 校验要求；不提供版本列表、来源选择、用户 URL、外部 Wine 检测或 fallback。远程 API 只能验证该固定目标，不能扩大支持范围。
+- **理由**：用户于 2026-08-27 明确要求三款游戏统一使用该 Wine，并移除按游戏选择 Wine 的产品路径。单一身份使下载、安装、readiness 和启动的事实来源一致，也消除旧全局/按游戏选择模型的歧义。
+- **备选方案**：A（保留多版本 catalog）— 未采纳，因为会重新引入用户选择和迁移歧义；B（允许用户选择批准来源）— 未采纳，因为产品要求简化设置且来源应由产品固定；C（检测系统 Wine 并 fallback）— 未采纳，因为无法证明其托管身份、版本和权限边界。
+- **Trade-off**：批准资源不可用时不能切换其他版本或本机 Wine；换取可复现、可审计和最小的运行时配置面。
+- **影响范围**：WineVersionManager、SettingsViewModel、WineRuntimeProvider、PreLaunchValidator、LaunchOrchestrator、网络下载和运行时迁移。
+
+## ADR 038：三款游戏共用一个稳定 SharedWinePrefix
+
+- **状态**：Accepted
+- **决策**：三款游戏唯一共享 prefix identity 为 `sharedWinePrefix`，稳定路径为 `<Application Support>/MiPlay/WinePrefixes/shared`。prefix 由固定 Wine binary 初始化、验证和恢复；Game ID 不参与 prefix 路径、选择或持久化绑定。缺少 authoritative record、身份不一致或内容不明时进入 `migrationRequired`/`RecoveryRequired`，不得静默采用旧目录或外部 prefix。
+- **理由**：Research 已确认相同 `WINEPREFIX` 共享 Wine server 和 prefix 状态；将 prefix 作为单一公共事实，才能正确表达三款游戏共同受到的初始化、损坏和恢复影响。
+- **备选方案**：A（继续 `WinePrefixes/<gameID>`）— 未采纳，因为违反共享 prefix 要求；B（运行时按需复制 prefix）— 未采纳，因为会产生未定义的副本身份和额外迁移复杂度；C（复用系统/Whisky/CrossOver prefix）— 未采纳，因为不属于 MiPlay 托管边界。
+- **Trade-off**：共享 prefix 损坏会同时阻止三款游戏，且不能用另一 prefix 绕过；换取单一状态、可验证恢复和一致启动环境。
+- **影响范围**：WineRuntimeProvider、WineVersionManager、LaunchCommand、PreLaunchValidator、LaunchOrchestrator、AppData schema 4 和旧 prefix 迁移。
+
+## ADR 039：共享 prefix 使用独占 lease，禁止未协调的并发启动和修改
+
+- **状态**：Accepted
+- **决策**：增加全局 `sharedWinePrefix` 独占资源 lease。prefix 初始化、修复、恢复、升级、兼容性写入和每次游戏启动都必须取得该 lease。启动 lease 从 prefix 准备完成前持续到进程退出、termination confirmed 和清理完成；同一时间不允许第二款游戏启动或任何流程修改该 prefix。冲突返回明确 `busy/conflict`，不隐式创建重复任务或第二个 prefix。
+- **理由**：Research 指出 Swift actor 无法协调外部 Wine 子进程，`wineserver -w` 也不是应用级互斥。共享 prefix 的注册表、用户目录和 server 状态需要跨任务的显式生命周期保护。
+- **备选方案**：A（允许多游戏并发启动）— 未采纳，因为当前没有真实兼容性证据且无法隔离共享状态；B（只依赖 `wineserver -w`）— 未采纳，因为它不是完整的任务互斥协议；C（只锁 prefix 初始化）— 未采纳，因为运行中修改或恢复仍可能污染活动进程。
+- **Trade-off**：同一时刻最多一个共享 prefix 使用者，可能拒绝或延迟第二个启动；换取可确认的 prefix 生命周期和可恢复失败边界。
+- **影响范围**：TaskScheduler、WineVersionManager、WineRuntimeProvider、LaunchOrchestrator、ProcessManager、任务取消和恢复。
+
+## ADR 040：用单一 WineRuntimeSetup 任务简化获取、安装和 prefix 准备
+
+- **状态**：Accepted
+- **决策**：当前产品用一个固定目标的 `WineRuntimeSetup` Domain task 串联 fixed catalog entry 读取、资源下载、内容验证、托管安装提交、共享 prefix 准备和最终 pair 验证。允许内部阶段事件区分网络、校验、安装和 prefix 准备，但不暴露可选版本/来源列表，也不把任一中间阶段当作 `WineReady`。原有 `WineCatalogQuery`、`WineAssetDownload` 作为当前产品任务契约废止。
+- **理由**：用户要求简化 Wine 下载、安装与设置流程；固定目标下保留阶段事实即可支持错误、取消和恢复，无需让用户理解多版本目录和来源选择。
+- **备选方案**：A（保留两个用户可见任务）— 未采纳，因为会暴露已移除的选择流程；B（下载完成即 ready）— 未采纳，因为 prefix 初始化和安装提交仍是独立门槛；C（单一无阶段黑盒任务）— 未采纳，因为无法准确表达取消、失败和恢复位置。
+- **Trade-off**：Domain executor 内部需要维护更长的事务状态；换取设置页单一入口和固定目标的一致进度语义。
+- **影响范围**：TaskScheduler、WineVersionManager、NetworkDownloadProvider、WineRuntimeProvider、SettingsViewModel、任务持久化和取消/恢复。
+
+## ADR 041：schema 4 迁移不继承旧 Wine 选择或旧 per-game prefix
+
+- **状态**：Accepted
+- **决策**：当前 canonical AppData schema 为 schema 4。schema 3 的 `selectedWineVersion`、`selectedWineSource`、`installedWineVersions` 和 `PerGameSettings.wineVersionOverride` 只作为迁移输入：固定 tag 只可作为重新验证候选，其他/空值不能授权旧 Wine；所有 per-game override 清除产品含义。旧 `WinePrefixes/<gameID>` 不合并、不改名后采用；可安全隔离则作为 legacy recovery data 保留，否则迁移阻止在 `migrationRequired`/`RecoveryRequired`。任何共享 prefix adoption 都必须有新的 authoritative record 和完整验证。
+- **理由**：旧 schema 记录了已经被用户覆盖的新产品边界；静默继承会让旧 Wine、旧来源或旧 prefix 继续影响启动，并制造不可见的运行时选择。
+- **备选方案**：A（把旧 selected version 直接转成当前 runtime）— 未采纳，因为未证明安装身份和 prefix 绑定仍有效；B（把每个 override 合并到共享状态）— 未采纳，因为多个冲突选择无法定义唯一事实；C（自动挑一个旧 prefix）— 未采纳，因为无法证明其来源、内容和三款游戏共享资格。
+- **Trade-off**：部分旧用户需要重新下载、重新准备 prefix 或人工恢复；换取迁移后不会静默使用旧运行环境。
+- **影响范围**：PersistenceStore、AppData、WineVersionManager、WineRuntimeProvider、启动 readiness、旧目录清理和迁移测试。
+
+## ADR 042：固定 runtime 与 shared prefix 的删除、升级和回滚必须成对保护
+
+- **状态**：Accepted
+- **决策**：当前固定 runtime 和 shared prefix 不提供用户删除 API。失败临时 artifact、未提交安装结果和确认无效的 staged/rollback 数据可按恢复规则清理。未来 Product 批准的升级必须作为 runtime/prefix pair transaction 执行：阶段校验、取得 `wineRuntime` 与 `sharedWinePrefix` locks、保留旧 pair 回滚事实、准备并验证新 pair、原子提交。升级失败或取消时保留旧有效 pair；旧 pair 无法确认时进入 `RecoveryRequired`。清理旧数据前必须确认无活动 launch lease、进程、恢复记录或未提交事务。
+- **理由**：共享 prefix 与 Wine binary 是绑定的运行环境；只替换其中一个会留下混合状态。用户删除当前 runtime 也会直接使三款游戏失去唯一运行环境。
+- **备选方案**：A（允许分别升级 binary 和 prefix）— 未采纳，因为会产生不兼容 pair；B（删除后重新生成 prefix）— 未采纳，因为丢失可回滚事实并可能扩大副作用；C（失败后静默使用新旧混合状态）— 未采纳，因为无法形成可信 readiness。
+- **Trade-off**：升级期间操作被串行化，失败恢复可能阻止启动；换取运行时身份、prefix 内容和持久化事实的一致性。
+- **影响范围**：WineVersionManager、WineRuntimeProvider、TaskScheduler、PersistenceStore、LaunchOrchestrator、RecoveryRequired 投影和发布升级流程。
+
 ## 3. 历史冲突处理
 
 以下旧描述不再代表当前架构：
@@ -286,5 +394,9 @@
 | 普通 Process/bash 可直接修改 `/etc/hosts`/hostname | 被 ADR 005 取代，必须走受限系统修改边界 |
 | 进程创建或任务完成即表示启动成功 | 被 ADR 007/008 取代，必须读取 outcome 和健康确认 |
 | JSON 无需 schema/迁移/恢复契约 | 被 ADR 009 取代 |
+| 全局/按 Game ID 的 Wine 选择与 `override ?? global` | 被 ADR 037-042 取代，改为固定单一 runtime 与单一 shared prefix |
+| 背景缓存 ID 不同即删除旧缓存 | 被 ADR 031 取代，改为 API 背景集合指纹失效 |
+| `lastCachedBackgroundIds` 可作为选中或缓存失效依据 | 被 ADR 031 取代，改为选择与缓存清理分离 |
+| `hw.model` 可作为芯片名 | 被 ADR 036 取代，芯片名只取系统报告值 |
 
 历史 UI 窗口拓扑决策不在本 Task 改写范围内；本轮只冻结它们与 Domain/Infrastructure 的通信和状态边界。

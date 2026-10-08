@@ -5,6 +5,7 @@
 //  Created by Steve Tan on 2026/7/7.
 //
 
+import AppKit
 import SwiftUI
 
 // Source: Architecture Design → ViewModel Layer → SettingsViewModel
@@ -28,14 +29,18 @@ public final class SettingsViewModel {
     private(set) var winePath: String = ""
     /// 系统版本
     private(set) var systemVersion: String = ""
+    /// I-5: system-provided machine marketing name, e.g. "MacBook Pro".
+    private(set) var machineName: String = ""
     /// 芯片类型
-    private(set) var chipModel: String = ""
+    private(set) var chipName: String = ""
+    /// Hardware identifier retained for diagnostics; the settings UI does not display it.
+    private(set) var modelIdentifier: String = ""
+    /// I-5: readable physical memory, e.g. "16 GB".
+    private(set) var physicalMemoryText: String = ""
     /// 磁盘空间
     private(set) var diskSpaceText: String = ""
     /// 游戏列表（用于管理）
     private(set) var managedGames: [Game] = []
-    /// Per-game presentation settings. The key is always a fixed Game ID.
-    private(set) var perGameSettings: [String: PerGameSettings] = [:]
     /// 错误信息
     private(set) var errorMessage: String?
     /// 关于信息
@@ -46,31 +51,36 @@ public final class SettingsViewModel {
     /// 游戏客户端更新可用通知
     private(set) var isGameUpdateNotificationEnabled = true
 
-    // MARK: - Wine 版本状态（F-001）
+    // MARK: - Wine runtime setup
 
-    /// 可用 Wine 版本列表
-    private(set) var availableWineVersions: [WineVersionInfo] = []
-    /// 已安装版本数量
-    private(set) var installedWineCount: Int = 0
-    /// 已安装的 Wine 版本（即使网络版本列表暂时不可用也保持可见）
-    private(set) var installedWineVersions: [WineVersionInfo] = []
-    /// Wine 下载进度（进行中时非 nil）
+    /// WineRuntimeSetup 的进度（进行中时非 nil）
     private(set) var downloadProgress: WineDownloadProgress?
-    /// 当前正在下载的版本标签。与高频进度数据分离，供版本列表保持稳定布局。
+    /// 当前正在准备的固定 runtime 标签。
     private(set) var activeWineDownloadTag: String?
     private(set) var wineDownloadTask: ScheduledTask?
-    private(set) var wineCatalogTask: ScheduledTask?
     private(set) var wineRecoveryRequired: String?
-    /// Wine 版本列表是否正在刷新
-    private(set) var isRefreshingWineVersions = false
-    /// Wine 目录查询的真实失败/空目录事实
-    private(set) var wineCatalogMessage: String?
+    /// Fixed Wine target and shared prefix projection for the simplified UI.
+    private(set) var fixedRuntimeTag = WineVersionManager.fixedRuntimeTag
+    /// Wine 运行时来源的仓库页面地址（设置页「来源」展示并用浏览器打开）。
+    var wineSourceRepositoryURL: URL { BuiltInWineVersions.officialSource.repositoryWebURL }
+    private(set) var sharedPrefixPath = ""
+    private(set) var sharedPrefixReady = false
+    private(set) var versionCheckTasks: [String: ScheduledTask] = [:]
+    /// 每游戏性能选项（Metal HUD / 解锁帧率…）
+    private(set) var performanceOptions: [String: [PerformanceOption]] = [:]
+    /// 影响游戏运行的应用级设置（Metal HUD、帧率解锁、Retina、左 Command）。
+    /// 对照 YAAGL 的全局开关；保存后在下一次启动游戏时生效。
+    private(set) var gameEnvironmentSettings = GameEnvironmentSettings()
+    /// 手动"校验文件完整性"任务的快照（每游戏）
+    private(set) var integrityCheckTasks: [String: ScheduledTask] = [:]
 
     /// 刷新 Wine 状态
     public func refreshWineState() async {
-        // Settings has no implicit game selection. Do not turn a valid runtime
-        // binary into WineReady before a game-specific prefix is verified.
-        switch await wineVersionManager.checkReadiness() {
+        let readiness = await wineVersionManager.checkReadiness()
+        let prefix = await wineVersionManager.validatedSharedPrefix()
+        sharedPrefixReady = prefix != nil
+        sharedPrefixPath = prefix?.path ?? ""
+        switch readiness {
         case .ready(let versionPath):
             wineStatus = .ready(version: URL(fileURLWithPath: versionPath).lastPathComponent)
             winePath = URL(fileURLWithPath: versionPath).appendingPathComponent("bin/wine").path
@@ -89,61 +99,19 @@ public final class SettingsViewModel {
         }
     }
 
-    /// 刷新 Wine 版本列表
-    public func refreshWineVersions() async {
-        wineCatalogGeneration &+= 1
-        let generation = wineCatalogGeneration
-        isRefreshingWineVersions = true
-        wineCatalogMessage = nil
-        do {
-            let sourceID = await wineVersionManager.getSelectedSourceID()
-            let policyRevision = BuiltInWineVersions.sourceDescriptor(for: sourceID)?.policyRevision ?? "unknown"
-            if let existing = wineCatalogTask,
-               existing.state == .pending || existing.state == .running {
-                do {
-                    try await taskScheduler.cancel(taskId: existing.id)
-                } catch {
-                    guard generation == wineCatalogGeneration else { return }
-                    wineCatalogMessage = error.localizedDescription
-                    isRefreshingWineVersions = false
-                    return
-                }
-            }
-            guard generation == wineCatalogGeneration else { return }
-            let receipt = try await taskScheduler.enqueueReceipt(
-                type: .wineCatalogQuery,
-                gameId: nil,
-                context: ["sourceID": sourceID, "policyRevision": policyRevision]
-            )
-            guard generation == wineCatalogGeneration else {
-                do {
-                    try await taskScheduler.cancel(taskId: receipt.taskID)
-                } catch {
-                    errorMessage = error.localizedDescription
-                }
-                return
-            }
-            latestWineCatalogTaskID = receipt.taskID
-            wineCatalogTask = try await taskScheduler.taskSnapshot(id: receipt.taskID)
-        } catch {
-            guard generation == wineCatalogGeneration else { return }
-            wineCatalogMessage = error.localizedDescription
-            isRefreshingWineVersions = false
-        }
-    }
-
-    /// 下载指定 Wine 版本
-    public func downloadWineVersion(_ version: WineVersionInfo) async {
+    /// Enqueues the one fixed WineRuntimeSetup task. The UI never supplies a
+    /// version tag, source, URL or per-game target.
+    public func setupWineRuntime() async {
         do {
             let receipt = try await taskScheduler.enqueueReceipt(
-                type: .wineVersionDownload,
+                type: .wineRuntimeSetup,
                 gameId: nil,
-                context: ["tagName": version.tagName]
+                context: ["runtimeIdentity": WineVersionManager.fixedRuntimeTag]
             )
             let task = try await taskScheduler.taskSnapshot(id: receipt.taskID)
             wineDownloadTask = task
             activeWineDownloadTag = task.state == .pending || task.state == .running
-                ? version.tagName
+                ? WineVersionManager.fixedRuntimeTag
                 : nil
             wineRecoveryRequired = nil
         } catch {
@@ -160,58 +128,53 @@ public final class SettingsViewModel {
         }
     }
 
-    /// 删除一个托管 Wine 版本。
-    public func deleteWineVersion(tagName: String) async {
+    public func checkVersion(for gameID: String) async {
+        guard managedGames.contains(where: { $0.id == gameID }) else {
+            errorMessage = "游戏尚未定位，无法检查版本"
+            return
+        }
         do {
-            try await wineVersionManager.deleteVersion(tagName: tagName)
-            await refreshInstalledWineProjection()
-            await refreshWineVersions()
-            await refreshWineState()
+            let receipt = try await taskScheduler.enqueueReceipt(
+                type: .versionCheck,
+                gameId: gameID
+            )
+            versionCheckTasks[gameID] = try await taskScheduler.taskSnapshot(id: receipt.taskID)
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
-    /// 选中 Wine 版本
-    public func selectWineVersion(tagName: String) async {
-        do {
-            try await wineVersionManager.selectVersion(tagName: tagName)
-            await refreshInstalledWineProjection()
-            await refreshWineVersions()
-            await refreshWineState()
-        } catch {
-            errorMessage = error.localizedDescription
-        }
+    public func isCheckingVersion(for gameID: String) -> Bool {
+        guard let task = versionCheckTasks[gameID] else { return false }
+        return task.state == .pending || task.state == .running
     }
 
     // MARK: - Dependencies
 
-    private let persistenceStore: PersistenceStore
     private let systemDetector: SystemEnvironmentDetector
     private let wineVersionManager: WineVersionManager
     private let gameRegistry: GameRegistry
     private let fileSystemRepository: GameFileSystemRepository
     private let taskScheduler: TaskScheduler
+    private let performanceOptionManager: PerformanceOptionManager
     private var taskObservation: Task<Void, Never>?
     private var progressObservation: Task<Void, Never>?
     private var lastTaskEventSequence: UInt64 = 0
-    private var wineCatalogGeneration: UInt64 = 0
-    private var latestWineCatalogTaskID: ScheduledTaskID?
 
     public init(
-        persistenceStore: PersistenceStore,
         systemDetector: SystemEnvironmentDetector,
         wineVersionManager: WineVersionManager,
         gameRegistry: GameRegistry,
         fileSystemRepository: GameFileSystemRepository,
-        taskScheduler: TaskScheduler
+        taskScheduler: TaskScheduler,
+        performanceOptionManager: PerformanceOptionManager
     ) {
-        self.persistenceStore = persistenceStore
         self.systemDetector = systemDetector
         self.wineVersionManager = wineVersionManager
         self.gameRegistry = gameRegistry
         self.fileSystemRepository = fileSystemRepository
         self.taskScheduler = taskScheduler
+        self.performanceOptionManager = performanceOptionManager
     }
 
     // MARK: - Initialization
@@ -222,13 +185,11 @@ public final class SettingsViewModel {
         currentLanguage = UserDefaults.standard.stringArray(forKey: "AppleLanguages")?.first ?? "zh-Hans"
         isGameUpdateNotificationEnabled = UserDefaults.standard.object(forKey: "gameUpdateNotificationsEnabled") as? Bool ?? true
         systemVersion = systemDetector.getOSVersion()
-        chipModel = systemDetector.getChipModel()
+        chipName = systemDetector.getChipName()
+        modelIdentifier = systemDetector.getModelIdentifier()
+        machineName = systemDetector.getMachineName()
+        physicalMemoryText = systemDetector.getPhysicalMemoryText()
         managedGames = await gameRegistry.getAllGames()
-        do {
-            perGameSettings = try await persistenceStore.readAppData().perGameSettings
-        } catch {
-            errorMessage = error.localizedDescription
-        }
 
         // 检测 Wine（统一通过 WineVersionManager）
         await refreshWineState()
@@ -243,10 +204,69 @@ public final class SettingsViewModel {
 
         aboutInfo = AboutInfo()
 
-        // 加载 Wine 版本列表
         await startTaskObservation()
-        await refreshWineVersions()
         await restoreWineTaskProjection()
+        await restoreCheckTaskProjections()
+        await loadPerformanceOptions()
+        gameEnvironmentSettings = await wineVersionManager.gameEnvironmentSettings()
+    }
+
+    // MARK: - 游戏运行设置（通用设置页；对照 YAAGL 的全局开关）
+
+    /// 切换 Metal HUD（启动时注入 `MTL_HUD_*`）。
+    public func applyMetalHUD(_ isEnabled: Bool) {
+        updateGameEnvironmentSettings { $0.metalHUD = isEnabled }
+    }
+
+    /// 切换解锁帧率（等待解锁工具接入后生效）。
+    public func applyFPSUnlock(_ isEnabled: Bool) {
+        updateGameEnvironmentSettings { $0.fpsUnlock = isEnabled }
+    }
+
+    /// 切换 Retina 模式（`RetinaMode`：y = 按设备像素渲染）。
+    public func applyRetinaMode(_ isEnabled: Bool) {
+        updateGameEnvironmentSettings { $0.retinaMode = isEnabled }
+    }
+
+    /// 切换「左 Command 映射为 Control」（`LeftCommandIsCtrl`）。
+    public func applyLeftCommandIsCtrl(_ isEnabled: Bool) {
+        updateGameEnvironmentSettings { $0.leftCommandIsCtrl = isEnabled }
+    }
+
+    /// 同步更新内存状态（`Toggle` 的 setter 返回后立刻读到新值，开关不回弹），
+    /// 持久化转后台；失败回滚并报错。与 `applyPerformanceOptionChange` 同一模式。
+    private func updateGameEnvironmentSettings(_ mutate: (inout GameEnvironmentSettings) -> Void) {
+        var updated = gameEnvironmentSettings
+        mutate(&updated)
+        guard updated != gameEnvironmentSettings else { return }
+        let previous = gameEnvironmentSettings
+        gameEnvironmentSettings = updated
+        // 显式捕获 manager：`[weak self]` 下不能隐式访问 self 的成员。
+        Task { [weak self, wineVersionManager] in
+            do {
+                try await wineVersionManager.updateGameEnvironmentSettings(updated)
+            } catch {
+                guard let self else { return }
+                // 只有当前值仍是本次写入的值时才回滚，避免覆盖后续修改。
+                if self.gameEnvironmentSettings == updated {
+                    self.gameEnvironmentSettings = previous
+                }
+                self.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    /// 恢复最近一次版本检查/完整校验任务的投影（应用重启后按钮状态正确）。
+    private func restoreCheckTaskProjections() async {
+        let tasks = await taskScheduler.allTaskSnapshots().sorted(by: { $0.createdAt < $1.createdAt })
+        for task in tasks where task.type == .versionCheck {
+            guard let gameID = task.gameId else { continue }
+            if task.context["fileVerification"] == "true" {
+                integrityCheckTasks[gameID] = task
+            } else {
+                versionCheckTasks[gameID] = task
+            }
+        }
     }
 
     // MARK: - Language
@@ -262,27 +282,6 @@ public final class SettingsViewModel {
     public func setGameUpdateNotificationEnabled(_ isEnabled: Bool) {
         isGameUpdateNotificationEnabled = isEnabled
         UserDefaults.standard.set(isEnabled, forKey: "gameUpdateNotificationsEnabled")
-    }
-
-    public func metadataDisplayEnabled(for gameID: String) -> Bool {
-        perGameSettings[gameID]?.metadataDisplayEnabled ?? true
-    }
-
-    public func setMetadataDisplayEnabled(for gameID: String, enabled: Bool) async {
-        do {
-            var appData = try await persistenceStore.readAppData()
-            var settings = appData.perGameSettings[gameID] ?? PerGameSettings(gameID: gameID)
-            settings.metadataDisplayEnabled = enabled
-            appData.perGameSettings[gameID] = settings
-            try await persistenceStore.writeAppData(appData)
-            let verified = try await persistenceStore.readAppData()
-            guard verified.perGameSettings[gameID]?.metadataDisplayEnabled == enabled else {
-                throw PersistenceStore.StoreError.writeFailed("游戏设置写回后重读不一致")
-            }
-            perGameSettings = verified.perGameSettings
-        } catch {
-            errorMessage = error.localizedDescription
-        }
     }
 
     // MARK: - Game Library Management
@@ -353,44 +352,6 @@ public final class SettingsViewModel {
         errorMessage = nil
     }
 
-    /// 使远程版本与本地已安装版本共存，确保离线时用户仍能管理已下载运行时。
-    private func mergeWineVersions(
-        available: [WineVersionInfo],
-        installed: [WineVersionInfo]
-    ) -> [WineVersionInfo] {
-        var merged = Dictionary(uniqueKeysWithValues: available.map { version in
-            var normalized = version
-            // The catalog is cached; installation records are the source of
-            // truth for the local downloaded state.
-            normalized.isDownloaded = false
-            normalized.isSelected = false
-            return (normalized.tagName, normalized)
-        })
-        for installedVersion in installed {
-            if var remoteVersion = merged[installedVersion.tagName] {
-                remoteVersion.isDownloaded = true
-                remoteVersion.isSelected = installedVersion.isSelected
-                merged[installedVersion.tagName] = remoteVersion
-            } else {
-                merged[installedVersion.tagName] = installedVersion
-            }
-        }
-        return merged.values.sorted { $0.publishedAt > $1.publishedAt }
-    }
-
-    /// Reprojects local installation facts without waiting for a catalog
-    /// network request. This keeps completion and deletion visible immediately.
-    private func refreshInstalledWineProjection() async {
-        let installed = await wineVersionManager.getInstalledVersions()
-        installedWineVersions = installed
-        installedWineCount = installed.count
-        guard availableWineVersions.isEmpty == false else { return }
-        availableWineVersions = mergeWineVersions(
-            available: availableWineVersions,
-            installed: installed
-        )
-    }
-
     private func startTaskObservation() async {
         taskObservation?.cancel()
         progressObservation?.cancel()
@@ -412,18 +373,12 @@ public final class SettingsViewModel {
     }
 
     private func consume(_ progress: TaskProgress) async {
-        guard let task = try? await taskScheduler.taskSnapshot(id: progress.taskId),
-              task.type == .wineVersionDownload || task.type == .wineCatalogQuery else { return }
-        if task.type == .wineCatalogQuery {
-            if task.state == .pending || task.state == .running {
-                wineCatalogTask = task
-                isRefreshingWineVersions = true
-                wineCatalogMessage = nil
-            } else {
-                await project(task)
-            }
+        guard let task = try? await taskScheduler.taskSnapshot(id: progress.taskId) else { return }
+        if task.type == .versionCheck {
+            await projectVersionCheck(task)
             return
         }
+        guard task.type == .wineRuntimeSetup else { return }
         if task.state == .pending || task.state == .running {
             projectProgress(
                 task: task,
@@ -437,12 +392,11 @@ public final class SettingsViewModel {
     }
 
     private func consume(_ event: TaskEvent) async {
-        guard event.snapshot.type == .wineVersionDownload || event.snapshot.type == .wineCatalogQuery else { return }
-        if event.snapshot.type == .wineCatalogQuery,
-           let latestWineCatalogTaskID,
-           event.snapshot.id != latestWineCatalogTaskID {
+        if event.snapshot.type == .versionCheck {
+            await projectVersionCheck(event.snapshot)
             return
         }
+        guard event.snapshot.type == .wineRuntimeSetup else { return }
         if lastTaskEventSequence != 0, event.sequence > lastTaskEventSequence + 1,
            let snapshot = try? await taskScheduler.taskSnapshot(id: event.snapshot.id) {
             await project(snapshot)
@@ -458,7 +412,7 @@ public final class SettingsViewModel {
         download: TaskDownloadProgress? = nil
     ) {
         wineDownloadTask = task
-        activeWineDownloadTag = task.context["tagName"]
+        activeWineDownloadTag = WineVersionManager.fixedRuntimeTag
         downloadProgress = WineDownloadProgress(
             phase: phase,
             progress: progress,
@@ -470,46 +424,38 @@ public final class SettingsViewModel {
 
     private func restoreWineTaskProjection() async {
         let tasks = await taskScheduler.allTaskSnapshots().sorted(by: { $0.createdAt > $1.createdAt })
-        if let task = tasks.first(where: { $0.type == .wineVersionDownload }) {
+        if let task = tasks.first(where: { $0.type == .wineRuntimeSetup }) {
             await project(task, refreshCatalog: false)
         }
-        if let task = tasks.first(where: { $0.type == .wineCatalogQuery }) {
-            await project(task)
+    }
+
+    private func projectVersionCheck(_ task: ScheduledTask) async {
+        guard let gameID = task.gameId else { return }
+        if task.context["fileVerification"] == "true" {
+            integrityCheckTasks[gameID] = task
+        } else {
+            versionCheckTasks[gameID] = task
+        }
+        switch task.state {
+        case .pending, .running:
+            return
+        case .completed:
+            managedGames = await gameRegistry.getAllGames()
+        case .failed, .cancelled:
+            if task.state == .failed {
+                errorMessage = task.error ?? task.recovery ?? "版本检查失败"
+            }
         }
     }
 
     private func project(_ task: ScheduledTask, refreshCatalog: Bool = true) async {
-        if task.type == .wineCatalogQuery {
-            wineCatalogTask = task
-            latestWineCatalogTaskID = task.id
-            switch task.state {
-            case .pending, .running:
-                isRefreshingWineVersions = true
-                wineCatalogMessage = nil
-            case .completed:
-                isRefreshingWineVersions = false
-                let available = await wineVersionManager.cachedAvailableVersions()
-                let installed = await wineVersionManager.getInstalledVersions()
-                installedWineVersions = installed
-                installedWineCount = installed.count
-                availableWineVersions = mergeWineVersions(available: available, installed: installed)
-                wineCatalogMessage = available.isEmpty ? "当前没有符合产品范围的托管 Wine 版本" : nil
-            case .failed:
-                isRefreshingWineVersions = false
-                wineCatalogMessage = task.error ?? task.recovery ?? "Wine 版本目录不可用"
-            case .cancelled:
-                isRefreshingWineVersions = false
-                wineCatalogMessage = "Wine 版本目录查询已取消"
-            }
-            return
-        }
-
+        _ = refreshCatalog
         wineDownloadTask = task
         switch task.state {
         case .pending, .running:
             projectProgress(task: task, phase: task.phaseDescription, progress: task.progress)
         case .completed:
-            guard task.outcome == "wineInstalled" else {
+            guard task.outcome == "runtimePairReady" || task.outcome == "wineInstalled" else {
                 wineRecoveryRequired = "Wine 任务缺少已安装结果"
                 errorMessage = wineRecoveryRequired
                 activeWineDownloadTag = nil
@@ -519,10 +465,6 @@ public final class SettingsViewModel {
             activeWineDownloadTag = nil
             downloadProgress = nil
             wineRecoveryRequired = nil
-            await refreshInstalledWineProjection()
-            if refreshCatalog {
-                await refreshWineVersions()
-            }
             await refreshWineState()
         case .cancelled:
             activeWineDownloadTag = nil
@@ -540,4 +482,153 @@ public final class SettingsViewModel {
             errorMessage = task.error ?? "Wine 下载未完成"
         }
     }
+
+    // MARK: - 性能选项（每游戏）
+
+    /// 加载三款游戏的性能选项投影。
+    public func loadPerformanceOptions() async {
+        var options: [String: [PerformanceOption]] = [:]
+        for game in managedGames {
+            options[game.id] = performanceOptionManager.getOptions(for: game.id)
+        }
+        performanceOptions = options
+    }
+
+    public func options(for gameID: String) -> [PerformanceOption] {
+        performanceOptions[gameID] ?? []
+    }
+
+    /// 单个选项的当前快照（含参数值）。
+    public func performanceOption(gameID: String, optionID: String) -> PerformanceOption? {
+        options(for: gameID).first { $0.id == optionID }
+    }
+
+    public func setPerformanceOption(gameID: String, optionID: String, enabled: Bool) async {
+        do {
+            try await performanceOptionManager.setOption(
+                gameId: gameID,
+                optionId: optionID,
+                enabled: enabled
+            )
+            performanceOptions[gameID] = performanceOptionManager.getOptions(for: gameID)
+        } catch {
+            // 失败时回滚乐观应用的内存状态，界面开关回到真实值。
+            performanceOptions[gameID] = performanceOptionManager.getOptions(for: gameID)
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// 同步应用开关状态并返回是否被接受。
+    ///
+    /// SwiftUI 的 `Toggle` 在 setter 返回后会立刻重新读取绑定值：若状态要等
+    /// `Task` 里的异步持久化才更新，开关会先弹回原位。因此这里同步写入内存
+    /// 状态（界面立即停在正确位置），持久化在后台进行，失败再回滚。
+    @discardableResult
+    public func applyPerformanceOptionChange(
+        gameID: String,
+        optionID: String,
+        enabled: Bool
+    ) -> Bool {
+        var options = performanceOptionManager.getOptions(for: gameID)
+        guard let index = options.firstIndex(where: { $0.id == optionID }) else {
+            return false
+        }
+        let previous = options[index].isEnabled
+        guard previous != enabled else { return true }
+        options[index].isEnabled = enabled
+        performanceOptions[gameID] = options
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.performanceOptionManager.setOption(
+                    gameId: gameID,
+                    optionId: optionID,
+                    enabled: enabled
+                )
+                self.performanceOptions[gameID] = self.performanceOptionManager.getOptions(for: gameID)
+            } catch {
+                // 持久化失败：回滚内存状态并报告，避免界面显示未保存的开关。
+                var reverted = self.performanceOptionManager.getOptions(for: gameID)
+                if let index = reverted.firstIndex(where: { $0.id == optionID }) {
+                    reverted[index].isEnabled = previous
+                }
+                self.performanceOptions[gameID] = reverted
+                self.errorMessage = error.localizedDescription
+            }
+        }
+        return true
+    }
+
+    /// 更新选项参数（如 MetalFX 空间缩放系数）。非法输入由领域层拒绝并回报。
+    public func setPerformanceOptionValue(gameID: String, optionID: String, value: String) async {
+        do {
+            try await performanceOptionManager.setValue(
+                gameId: gameID,
+                optionId: optionID,
+                value: value
+            )
+            performanceOptions[gameID] = performanceOptionManager.getOptions(for: gameID)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// 报告无法解析的选项参数输入（视图层已回落到已保存值）。
+    public func reportInvalidPerformanceParameter(optionName: String, rawValue: String) {
+        let shown = rawValue.isEmpty ? "空" : rawValue
+        errorMessage = "「\(optionName)」的参数「\(shown)」不是数字：请输入 1.0–2.0 之间的值"
+    }
+
+    /// 报告被夹取到合法区间的参数输入（视图层已显示实际生效值）。
+    public func reportParameterClamped(optionName: String, appliedValue: String) {
+        errorMessage = "「\(optionName)」的参数超出 1.0–2.0，已按 \(appliedValue) 生效"
+    }
+
+    // MARK: - 校验文件完整性（手动入口）
+
+    /// 排入逐文件 MD5 完整校验（耗时数分钟；不阻塞启动与媒体加载）。
+    public func verifyGameFiles(for gameID: String) async {
+        guard managedGames.contains(where: { $0.id == gameID }) else {
+            errorMessage = "游戏尚未定位，无法校验文件"
+            return
+        }
+        do {
+            let receipt = try await taskScheduler.enqueueReceipt(
+                type: .versionCheck,
+                gameId: gameID,
+                context: ["fileVerification": "true"]
+            )
+            integrityCheckTasks[gameID] = try await taskScheduler.taskSnapshot(id: receipt.taskID)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func isVerifyingFiles(for gameID: String) -> Bool {
+        guard let task = integrityCheckTasks[gameID] else { return false }
+        return task.state == .pending || task.state == .running
+    }
+
+    // MARK: - 打开目录（快速操作）
+
+    public func openGameDirectory(for gameID: String) {
+        guard let game = managedGames.first(where: { $0.id == gameID }),
+              let path = game.installPath, !path.isEmpty else {
+            errorMessage = "游戏尚未定位"
+            return
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path, isDirectory: true))
+    }
+
+    public func openDataDirectory() async {
+        let url = await fileSystemRepository.appSupportDirectory()
+        NSWorkspace.shared.open(url)
+    }
+
+    public func openLogsDirectory() async {
+        let url = await fileSystemRepository.appSupportDirectory()
+            .appendingPathComponent("Logs", isDirectory: true)
+        NSWorkspace.shared.open(url)
+    }
+
 }

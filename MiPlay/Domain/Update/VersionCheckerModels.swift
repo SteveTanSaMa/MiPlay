@@ -92,6 +92,8 @@ extension VersionChecker {
         public let pkgVersionEntries: [PkgVersionEntry]
         public let pkgVersionMapping: PkgVersionMappingStatus
         public let pkgVersionValidationErrors: [String]
+        /// 上次检查是否执行了逐文件校验（nil = 旧数据未记录）。
+        public let fileVerificationPerformed: Bool?
 
         public var pkgVersionEntryCount: Int { pkgVersionEntries.count }
 
@@ -115,6 +117,7 @@ extension VersionChecker {
             pkgVersionEntries: [PkgVersionEntry] = [],
             pkgVersionMapping: PkgVersionMappingStatus? = nil,
             pkgVersionValidationErrors: [String] = [],
+            fileVerificationPerformed: Bool? = nil,
             gameID: String? = nil,
             locationRevision: Int? = nil,
             readAt: Date = Date(),
@@ -133,6 +136,7 @@ extension VersionChecker {
             self.pkgVersionEntries = pkgVersionEntries
             self.pkgVersionMapping = pkgVersionMapping ?? (pkgVersionEntries.isEmpty ? .notPresent : .unmapped)
             self.pkgVersionValidationErrors = pkgVersionValidationErrors
+            self.fileVerificationPerformed = fileVerificationPerformed
             self.parseStatus = parseStatus ?? (pkgVersionEntries.isEmpty ? .configOnly : .configAndPkg)
             self.sourceSummary = sourceSummary ?? (pkgVersionEntries.isEmpty ? ["config.ini"] : ["config.ini", "pkg_version"])
         }

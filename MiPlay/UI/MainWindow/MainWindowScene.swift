@@ -13,6 +13,7 @@ import SwiftUI
 /// 主窗口场景。MiPlay 的核心交互场景。
 struct MainWindowScene: Scene {
     let libraryViewModel: LibraryViewModel
+    let registerWindow: (NSWindow) -> Void
 
     var body: some Scene {
         WindowGroup(id: "main") {
@@ -20,6 +21,7 @@ struct MainWindowScene: Scene {
                 libraryViewModel: libraryViewModel
             )
             .frame(width: 1280, height: 688)
+            .background(WindowRegistrar(registerWindow: registerWindow))
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1280, height: 688)
@@ -33,7 +35,6 @@ struct MainWindowScene: Scene {
 struct MainWindowContentView: View {
     // Source: Code Review → CR-3 — @State 语义误用
     let libraryViewModel: LibraryViewModel
-    @Environment(\.openWindow) private var openWindow
     /// 游戏库为空时默认选中的占位游戏类型
     // Source: UI Design → UI-11/UI-12 — 材质按钮 + hover 效果
     @State private var selectedPlaceholderType: GameType? = .genshinImpact
@@ -60,8 +61,6 @@ struct MainWindowContentView: View {
     /// 主内容区域：导航栏在左下角，内容居中
     private var mainContent: some View {
         ZStack {
-            Color.clear
-                .ignoresSafeArea()
             // 沉浸式背景
             // Source: UI/UX Review → UX-16 — 视图切换动画
             BackgroundView(
@@ -69,35 +68,6 @@ struct MainWindowContentView: View {
                 media: libraryViewModel.backgroundMedia
             )
             .accessibilityHidden(true)
-            .transition(.opacity)
-            .animation(.easeInOut(duration: 0.4), value: effectiveGameType)
-
-            if libraryViewModel.backgroundGroups.count > 1 {
-                VStack(spacing: 6) {
-                    HStack(spacing: 10) {
-                        ForEach(libraryViewModel.backgroundGroups) { group in
-                            BackgroundGroupButton(
-                                groupID: group.groupID,
-                                isSelected: group.groupID == libraryViewModel.selectedBackgroundGroupID
-                            ) {
-                                Task { await libraryViewModel.selectBackgroundGroup(id: group.groupID) }
-                            }
-                        }
-                    }
-                    if let error = libraryViewModel.backgroundGroupError {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .accessibilityLabel("背景组切换失败")
-                            .accessibilityValue(error)
-                    }
-                }
-                .padding(.top, 18)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("背景组选择")
-            }
 
             // 前景内容
             VStack(spacing: 0) {
@@ -113,11 +83,11 @@ struct MainWindowContentView: View {
                             set: { newId in if let id = newId { libraryViewModel.selectGame(id: id) } }
                         ),
                         selectedPlaceholderType: $selectedPlaceholderType,
-                        onRemoveGame: { gameId in Task { await libraryViewModel.removeGame(id: gameId) } },
                         onLocateGame: { gameType in locateGame(type: gameType) },
                         onPreload: { gameType in
                             Task { await libraryViewModel.preloadMedia(for: gameType.rawValue) }
-                        }
+                        },
+                        iconURLs: libraryViewModel.gameIconURLs
                     )
                     .frame(width: 76)
 
@@ -128,7 +98,9 @@ struct MainWindowContentView: View {
                         MainTaskFeedbackView(
                             game: libraryViewModel.selectedGame,
                             progress: libraryViewModel.launchProgress,
-                            recovery: libraryViewModel.recoveryRecords.first
+                            recovery: libraryViewModel.recoveryRecords.first {
+                                $0.resolvedAt == nil && $0.gameID == libraryViewModel.selectedGameId
+                            }
                         ) { recordID in
                             Task { await libraryViewModel.retryProcessExitRecovery(recordID: recordID) }
                         }
@@ -139,9 +111,6 @@ struct MainWindowContentView: View {
                                 guard let game = libraryViewModel.selectedGame else { return }
                                 if case .enabled(_, let action) = libraryViewModel.primaryButtonState, action == .locate {
                                     locateGame(type: game.type)
-                                } else if case .enabled(_, let action) = libraryViewModel.primaryButtonState, action == .viewFix {
-                                    // Source: P1-011 — LaunchFailed 修复方案入口
-                                    openWindow(id: "game-detail", value: game.id)
                                 } else {
                                     Task { await libraryViewModel.performPrimaryAction() }
                                 }
@@ -152,11 +121,21 @@ struct MainWindowContentView: View {
                 .padding(.horizontal, 30)
                 .padding(.bottom, 48)
             }
+            .disabled(libraryViewModel.isStartupPreparationVisible)
+            .accessibilityHidden(libraryViewModel.isStartupPreparationVisible)
 
-            // Loading 覆盖层（初始化中或素材加载中，阻断交互）
-            // Source: 用户反馈 — 遮罩层不可见：initialize() 中 loading 状态持续过短
-            if libraryViewModel.shouldShowMediaLoadingOverlay {
-                MediaLoadingOverlay()
+            // 启动准备全屏遮罩（Wine 环境 → 背景素材，阻断交互）
+            // Source: 用户指令 — 遮罩由 startupPhase 驱动，从首帧起覆盖主页
+            // （修复冷启动时遮罩不显示、需切换游戏才出现的问题）
+            if libraryViewModel.isStartupPreparationVisible {
+                StartupPreparationOverlay(
+                    phase: libraryViewModel.startupPhase,
+                    detail: libraryViewModel.startupDetail,
+                    progress: libraryViewModel.startupProgress,
+                    failure: libraryViewModel.startupFailure
+                ) {
+                    Task { await libraryViewModel.retryStartupPreparation() }
+                }
             }
         }
         .alert("错误", isPresented: .init(
@@ -169,93 +148,22 @@ struct MainWindowContentView: View {
         }
     }
 
-    /// 定位游戏：直接弹 NSOpenPanel 选择 .exe，跳过类型选择界面
+    /// 定位游戏：弹 NSOpenPanel 选择游戏安装目录，跳过类型选择界面。
     private func locateGame(type: GameType) {
         let panel = NSOpenPanel()
-        panel.canChooseFiles = true
+        panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.message = "选择 \(type.displayName) 的游戏可执行文件或安装目录"
+        panel.message = "选择 \(type.displayName) 的游戏安装目录"
 
-        // Source: 用户反馈 — NSOpenPanel 居中于主窗口
-        if let mainWindow = NSApp.mainWindow {
-            let center = CGPoint(x: mainWindow.frame.midX - 320, y: mainWindow.frame.midY - 120)
-            panel.setFrameOrigin(center)
+        let completion: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { await libraryViewModel.locateGame(type: type, selectedURL: url) }
         }
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        Task {
-            await libraryViewModel.locateGame(type: type, selectedURL: url)
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            panel.begin(completionHandler: completion)
         }
-    }
-
-}
-
-private struct BackgroundGroupButton: View {
-    let groupID: String
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Circle()
-                .fill(isSelected ? Color.primary : Color.secondary.opacity(0.55))
-                .frame(width: 10, height: 10)
-        }
-        .buttonStyle(.plain)
-        .frame(width: 24, height: 24)
-        .contentShape(Rectangle())
-        .accessibilityLabel("背景组 \(groupID)")
-        .accessibilityValue(isSelected ? "当前选中" : "未选中")
-        .accessibilityHint("切换到此背景组")
-        .help("切换背景组 \(groupID)")
-    }
-}
-
-// Source: UI Design -> Accessibility Tree -> TaskFeedbackView
-private struct MainTaskFeedbackView: View {
-    let game: Game?
-    let progress: LibraryViewModel.LaunchProgress?
-    let recovery: RecoveryRecord?
-    let retry: (String) -> Void
-
-    var body: some View {
-        VStack(alignment: .trailing, spacing: 6) {
-            if let progress {
-                HStack(spacing: 8) {
-                    if let value = progress.progress {
-                        ProgressView(value: value)
-                            .frame(width: 90)
-                    } else {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-                    Text(progress.phase)
-                        .font(.caption)
-                        .foregroundStyle(.primary)
-                }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(game?.type.displayName ?? "游戏")启动任务：\(progress.phase)")
-                .accessibilityValue(progress.progress.map { "\(Int($0 * 100))%" } ?? "进行中")
-            }
-
-            if let recovery, recovery.resolvedAt == nil {
-                HStack(spacing: 8) {
-                    Label("状态需要恢复", systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                    Button("重试恢复") {
-                        retry(recovery.id)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("\(game?.type.displayName ?? "游戏")状态恢复失败")
-                .accessibilityValue(recovery.detail)
-            }
-        }
-        .accessibilityElement(children: .contain)
     }
 }

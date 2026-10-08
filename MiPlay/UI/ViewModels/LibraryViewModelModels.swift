@@ -19,7 +19,6 @@ extension LibraryViewModel {
         case locate
         case launch
         case update
-        case viewFix
     }
 
     /// 主按钮状态

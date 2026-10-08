@@ -128,3 +128,15 @@ MainWindow [window]
 - Settings 每次打开相对于主窗口的 frame 坐标和 visibleFrame 裁切结果。
 
 没有真实截图或录屏时，不得把实验标记为视觉验证通过；只能标记为几何推导通过。
+
+## 2026-10-08 验证补充
+
+新增游戏选择 `.isSelected` trait、导航区域标签与设置标题 `.isHeader` trait；新增白色选中短条、按钮操作 glyph 均作为装饰，不生成额外朗读节点。进度组读出阶段与真实百分比，恢复组提供完整 detail 和独立重试按钮。
+
+原生截图检查覆盖浅/深背景的控件和任务反馈、通用设置浅/深外观及缓存主题与官方图标。证据与限制见 [本轮修订](ui-revision-2026-10-08.md)。VoiceOver、Tab/Space/Return/Escape 和系统减少动态效果/透明度的实际操作验收仍待执行，静态截图和单元测试不代替这些验收。
+
+## 2026-10-09 实际输入验证
+
+在隔离原生 NSHostingView 窗口中，用 computer use 确认游戏选择 trait/value 更新、Tab/Shift-Tab 导航、Space/Return 激活，以及主操作每次按键只触发一次回调。系统焦点边界可见；Settings 侧栏点击/Down 导航和 Form 滚动通过，未定位游戏的检查/校验按钮为 disabled。多行 Toggle 明确添加 label/hint，避免说明文字替代设置名称。
+
+AX 树检查不是 VoiceOver 朗读验收。系统 Reduce Motion/Transparency/Increase Contrast 未实际切换，三项均为 false；完整应用的启动遮罩焦点和目录 Sheet 取消路径也未实测。证据及边界见 [原生 UI 审查](ui-native-review-2026-10-09.md)。

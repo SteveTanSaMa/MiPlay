@@ -29,3 +29,6 @@ QAArtifacts/
 .env.*
 *.p12
 *.mobileprovision
+
+# Local development preferences
+.commandcode/

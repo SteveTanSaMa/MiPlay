@@ -4,6 +4,7 @@
 > **UI 阶段**：界面结构设计
 > **Task 4 修正**：所有图标入口使用标准 `Button`，状态反馈不创建业务状态。
 > **Task 4 修正**：稳定 Button 几何、Liquid Glass 分离和辅助技术节点。
+> **Product/Research 回溯修订**：2026-08-28。此前 I-4 的“全局 / 单独 Wine 版本”组件树已废止，改为固定 runtime + 共享 prefix。
 
 ---
 
@@ -18,16 +19,23 @@ MainWindow
 │   └── BackgroundFallbackSection — 降级背景 [accessibilityHidden]
 │       └── DefaultBackgroundView — 系统默认背景
 │
+├── BackgroundGroupControl — 顶部居中背景组圆点控制 [仅有效组 > 1；默认 opacity 0；hover 区域触发显示]
+│   ├── BackgroundRevealStrip — 顶部 40pt 悬停检测区 [仅 onHover，不拦截点击/手势]
+│   │   └── BackgroundGroupButton (×N) — 标准 Button [24 × 24pt 命中框，间距 10pt]
+│   │       ├── BackgroundDotView — 10pt 圆点；hover 放大/高亮仅作用于圆点内容
+│   │       └── BackgroundPreviewFeedback — 预览加载失败事实（失败时显示）
+│
 
 ├── GameSelectionRailView — 左下角游戏选择栏 [GlassEffectContainer, accessibility children contained]
 │   └── GameIconButton (×3) — 标准 Button，命中框 64 × 64pt，间距 12pt
 │       └── GameIconContent — Button label 的视觉内容 [glassEffect 56 × 56pt, cornerRadius: 16pt]
-│           ├── GameIconView — glyph，hover/选中仅变换此内容
-│           └── StatusDotView — 状态标识圆点（不单独进入 Accessibility Tree）
+│           ├── GameIconView — 官方 icon；缺失时使用 SF Symbol 与原生黑色玻璃
+│           ├── StatusOutline — 业务状态颜色描边（与图标同步变换）
+│           └── SelectionMarker — 左侧 3 × 20pt 白色标记，独立表达当前选择 [accessibilityHidden]
 │
 ├── PrimaryActionView — 右下角主操作区
 │   ├── ActionButtonSection — 主操作按钮
-│   │   └── PrimaryActionButton — 状态驱动的大按钮 [220 × 64pt, Glass.regular, glassEffect, cornerRadius: 16pt]
+│   │   └── PrimaryActionButton — 状态驱动的大按钮 [220 × 64pt, Glass.clear + black tint 0.18, glassEffect, cornerRadius: 16pt]
 │   │       ├── ButtonLabelView — 按钮文字（定位游戏/启动/更新/查看修复方案）
 │   │       ├── ButtonLoadingIndicator — 仅在真实任务进行时展示
 │   │       └── TaskFeedbackView — 阶段、可信进度、失败事实、取消或重试入口 [accessibility group]
@@ -79,7 +87,7 @@ GameDetailWindow
     │   │   ├── SolutionNameView — 方案名称
     │   │   ├── SolutionDescriptionView — 方案简述
     │   │   ├── RiskLevelBadge — 风险等级标识（低/中/高）
-    │   │   ├── ScopeLabelView — 作用范围标识（全局/局部）
+    │   │   ├── ScopeLabelView — 兼容方案作用范围标识（全局/局部；非 Wine 作用范围）
     │   │   └── WineRequirementView — 所需 Wine 版本（如需要）
     │   └── SolutionApplicationRecordView — 方案应用记录
     │       ├── ApplicationStateView — Applied / RolledBack / Failed / 恢复未确认
@@ -109,68 +117,61 @@ GameDetailWindow
 > - Detail 使用 `Form { Section }` + `.formStyle(.grouped)`，行高 min 42pt
 > - 只读信息行使用 `LabeledContent`（macOS 13+）
 > - 同一时刻仅一个设置窗口实例
+> - Wine 设置不包含“全局 / 单独”作用范围、版本列表、来源选择或删除当前 runtime 的控件
 
 ```
-Settings  [800 × 448, hiddenTitleBar, contentSize]
-│
-└── NavigationSplitView  [无 sidebar toggle 限制]
-    │
-    ├── Sidebar  [固定 240pt, 列表项 24pt]
-    │   └── List(selection: $selectedPane)
-    │       ├── PaneItem — "通用" (gearshape)
-    │       ├── PaneItem — "原神" (gamecontroller)
-    │       ├── PaneItem — "星穹铁道" (gamecontroller)
-    │       ├── PaneItem — "绝区零" (gamecontroller)
-    │       ├── PaneItem — "Wine 环境" (wineglass)
-    │       └── PaneItem — "关于" (info.circle)
-    │
-    └── Detail  [Form + .formStyle(.grouped), padding(32)]
-        ├── GeneralPaneView  [通用]
-        │   ├── Section "语言" → Picker
-        │   ├── Section "更新与版本" → Toggle
-        │   └── Section "系统环境" → LabeledContent [行高 min 42pt]
-        │
-        ├── GamePaneView(×3)  [单款游戏，按选中切换]
-        │   ├── Section "基本信息" → LabeledContent
-        │   ├── Section "安装状态" → LabeledContent
-        │   └── Section "兼容方案" → caption
-        │
-        ├── WinePaneView  [Wine 环境]
-        │   ├── Section "运行时状态" → LabeledContent
-        │   └── Section "已安装版本" → list
-        │
-        └── AboutPaneView  [VStack 居中, spacing >= 20]
-            ├── AppIconView — 应用图标 (64pt)
-            ├── AppNameView — "MiPlay"
-            ├── VersionInfoView — 版本 + 构建号
-            ├── LicenseView — 许可证
-            ├── Divider
-            └── DescriptionView — 描述文字
+Settings [800 × 448pt, hiddenTitleBar, contentSize]
+└── NavigationSplitView
+    ├── Sidebar [240pt, native List]
+    │   ├── Section 应用 → 通用 / Wine 环境
+    │   ├── Section 游戏 → 原神 / 星穹铁道 / 绝区零
+    │   └── 关于
+    └── Detail [560pt]
+        ├── PageHeader → 当前页面标题 / 一行范围说明
+        └── Form [grouped, scrollable, identity = selectedItem]
+            ├── 通用 → 游戏运行 / 语言 / 更新 / 目录
+            ├── 游戏 ×3 → 游戏 / 操作 / 性能选项
+            ├── Wine → 固定版本 / 来源 Link / 运行状态 / 共享 prefix / 恢复动作
+            └── 关于 → 应用版本 / 许可证 / 此 Mac
 ```
 ## WineProgressSheet 组件树
 
 ```
-WineProgressSheet
-├── SheetHeaderSection — Sheet 标题区
-│   ├── SheetTitleView — "正在准备运行环境"
-│   └── SheetSubtitleView — 当前触发的操作描述（启动/路径定位）
-│
-├── ProgressVisualSection — 进度可视化区
-│   ├── ProgressRingView — 确定或不定进度指示，取决于真实进度
-│   ├── ProgressPercentageView — 仅在可估算时显示百分比
-│   └── DownloadSpeedView — 下载速度
-│
-├── StageDescriptionSection — 阶段描述区
-│   ├── CurrentStageLabel — 当前阶段文字（下载中/校验中/解压中）
-│   └── StageProgressListView — 阶段列表
-│       └── StageItemView (×N) — 单个阶段项（已完成/进行中/待处理）
-│
-├── StatusDetailSection — 状态细节区
-│   ├── FileSizeInfoView — 文件大小信息
-│   ├── EstimatedTimeView — 预计剩余时间
-│   └── NetworkStatusView — 网络状态指示
-│
-└── SheetActionSection — 底部操作区
-    ├── CancelButtonView — 可取消任务的标准 Button
-    └── RetryButtonView — 可恢复失败的标准 Button
+WineProgressSheet  [统一任务的临时反馈，不是第二个管理入口]
+├── RuntimeTaskHeaderSection — 固定 runtime 身份与当前阶段
+├── RuntimeProgressSection — 确定或不定进度、传输量与速度
+├── SharedPrefixStateRow — 共享 prefix 准备/验证事实
+└── RuntimeTaskActionSection — 单一动作槽：取消或重试；不提供版本选择/删除
 ```
+
+---
+
+### RecoveryOverlay 组件树
+
+```
+RecoveryOverlay  [重启恢复 / 路径授权刷新遮罩，Z 轴覆盖主窗口交互层]
+├── RecoveryOverlayBackground — 半透明不光标遮罩，阻断底层交互
+├── RecoveryContainer — 居中容器，GlassEffect
+│   ├── RecoveryTitleView — 恢复阶段标题（“上次游戏状态未完成同步，正在恢复” / “正在刷新游戏路径授权”）
+│   ├── RecoveryProgressView — 进度指示器（环形/不定）
+│   ├── RecoveryDescriptionView — 辅助说明文本（“已保留原数据，正在重新同步状态” / “旧授权已过期，正在创建新授权”）
+│   ├── RecoveryStatusRow — 具体事实行（重启恢复：进程退出确认 / 路径刷新：写回中）
+│   └── RecoveryErrorView — 失败事实（恢复提交失败 / 写回失败）
+└── RecoveryActionSlot — 仅当失败时显示重试 Button；恢复进行中无操作入口
+```
+
+
+## 2026-10-08 任务反馈组件更新
+
+`MainTaskFeedbackView` 从主场景拆出，位于主按钮上方，宽 300pt、内边距 16pt、圆角 16pt。
+只在存在启动进度或未解决恢复记录时生成；不产生空白卡片。
+使用深色 `regularMaterial` 内容面板，操作按钮继续使用原生 Liquid Glass。
+确定进度为阶段文字、百分比及进度条；未知进度为阶段文字和 spinner。
+恢复内容为警示标题、真实 detail（最多三行，help 与 accessibility 保留全文）、重试按钮。
+详情与完整验证记录见 [UI 优化修订](ui-revision-2026-10-08.md)。
+
+## 当前实现补充：原生优化（2026-10-09）
+
+本节覆盖早期树中与当前实现冲突的说明。游戏图标、状态描边均为固定几何；移除 GameIconScale / 自定义 hover 变换，仅保留预加载回调。游戏/设置/主按钮使用 borderless Button、系统 focusable 与 Space/Return key-down 激活。任务内容面板为 280pt 宽、12pt padding，仅真实任务期间生成。启动遮罩显示时主操作区域 disabled 且 accessibilityHidden。设置详情只显示单行页面标题，不再显示范围副标题。
+
+`BackgroundScene` 在生命周期任务中准备播放器；未选中、scene 非 active 或 Reduce Motion 时暂停，Reduce Motion 下显示静态图。`ImageBackgroundView` 统一加载背景/主题图，body 不做磁盘 I/O。无引用的 `GameInformationView` 兼容存根已删除。完整记录见 [原生 UI 审查](ui-native-review-2026-10-09.md)。

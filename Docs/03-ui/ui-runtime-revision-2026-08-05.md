@@ -1,19 +1,23 @@
-# MiPlay UI 回溯：Wine 设置稳定布局与运行验证
+# MiPlay UI 回溯：统一 Wine runtime 与共享 prefix
 
-日期：2026-08-05  
-责任阶段：UI Agent  
-回溯问题：`DL-001`、`DL-003`、`INFO-001`、`INFO-002`、`INFO-003`、`INFO-004`
+日期：2026-08-28
+责任阶段：UI Agent
+回溯问题：`R-4`，承接 `I-4-OVERRIDE`
+
+> **当前状态**：Product/Research 回溯后的 UI 输入稿。
+> **硬约束**：三款游戏统一使用 `wine-crossover-11.0-1-signed`，共用一个 MiPlay 管理的 Wine runtime 和一个共享 prefix。
+> **替代关系**：此前 I-4 的“全局 / 单独 Wine 版本”设计在 2026-08-27 已被用户新要求覆盖；本文件不再把旧选择模型作为实现输入。
+> **范围**：只规定 UI 结构、状态投影、稳定布局和可访问性；不修改 Swift、Domain、Architecture、Persistence 或 Wine 下载逻辑。
 
 ## 1. 范围与边界
 
-本次 UI 修改依据以下冻结产出：
+本次 UI 修改依据以下当前上游产出：
 
-- `Docs/02-ux/ux-runtime-revision-2026-08-05.md`
-- `Docs/01-research/research-wine-archive-and-mac-info-2026-08-05.md`
-- `Docs/03-ui/ui-state-mapping.md`
-- `Docs/03-ui/ui-window-navigation.md`
+- `Docs/00-product/product-features.md`
+- `Docs/00-product/product-runtime-revision-2026-08-05.md`
+- `Docs/01-research/research-wine-shared-prefix-2026-08-27.md`
 
-本次只修改设置窗口 UI 和 UI 验证资料，不改变 Domain、Infrastructure、Persistence、下载状态来源或 Wine 安装逻辑。UI 不把下载完成、文件存在、解压目录存在或进度达到 100% 显示为安装成功或 `WineReady`。
+本次只修改设置窗口 UI 文档，不改变 Domain、Infrastructure、Persistence、下载状态来源或 Wine 安装逻辑。UI 不把下载完成、文件存在、解压目录存在或进度达到 100% 显示为安装成功、共享 prefix 就绪或 `WineReady`。
 
 涉及源码：
 
@@ -21,30 +25,32 @@
 - `MiPlay/UI/SettingsWindow/SettingsAppViews.swift`
 - `MiPlay/UI/SettingsWindow/SettingsWindowScene.swift`（固定列宽和相对主窗口定位已由前序 UI 修改保留）
 
-## 2. 抽动原因与实验
+## 2. 上游事实与 UI 边界
 
-### 2.1 原因假设
+### 2.1 固定 runtime 与共享 prefix
 
-下载任务原来把阶段、字节量、速度、取消动作和错误内容作为条件视图插入或移除；同一 Wine 版本行的操作列也在“下载、转圈、使用/删除、当前使用”之间改变内容宽度。高频进度事件因此可能同时触发：
+当前 UI 只允许表达以下事实：
 
-1. 任务区域高度变化；
-2. `Form` 重新计算 Section 行高；
-3. 版本行操作列重新测量；
-4. Liquid Glass 材料重新计算边界，造成用户看到的快速抽动或融合。
+1. 固定 runtime 身份为 `wine-crossover-11.0-1-signed`。
+2. 三款游戏共用同一个固定 runtime。
+3. 三款游戏共用同一个 MiPlay 管理的共享 prefix。
+4. 来源由产品固定和管理；用户不选择来源、镜像、URL 或外部路径。
+5. 用户不选择 Wine 版本，不为游戏设置 Wine 覆盖，不删除固定 runtime 或共享 prefix。
+6. 下载、安装、共享 prefix 准备和目标游戏启动前置验证是不同事实，不能互相替代。
 
-这不是通过删除错误状态来解决的。错误、取消和恢复事实仍然显示。
+Research 已确认共享 prefix 会进入三款游戏共同面对的 Wine 状态，但资源锁、并发限制和恢复协议仍由 Architecture/Implementation 冻结。UI 只显示这些上游状态的结构化投影。
 
-### 2.2 实验与结果
+### 2.2 稳定布局决策
 
 | 实验 | 观察 | 决策 |
 |---|---|---|
-| A：逐项切换动态文本，观察任务区域和版本列表 | 进度、阶段、速度值来自同一任务，但状态子视图会重建 | 保留状态驱动内容，固定父区域和字段位置 |
-| B：下载中同时显示真实进度和未知速度 | `ProgressView` 的数值更新不需要改变宽度；未知值如果被移除会改变行结构 | 保留“进度未知/速度未知/大小未知”占位值 |
-| C：下载、取消、错误状态切换 | 终态不应挤掉目标和当前任务标题 | 固定 `当前任务` 区域为 `122pt`，终态复用同一内容区域 |
-| D：操作列切换 Download/Busy/Use/Delete/Current | 文案和按钮数量不同会改变右侧测量结果 | Wine 行高度 `48pt`，右侧操作列固定 `136pt` |
-| E：高频进度更新时保留 SwiftUI 默认事务 | 进度事件可能带来隐式布局动画 | 任务区域使用 `transaction.animation = nil`；数值仍更新，错误仍显示 |
+| A：动态阶段、字节量、速度和错误切换 | 同一任务的字段变化可能重建条件视图 | 固定单一任务区域和字段位置 |
+| B：固定 runtime 身份始终不变 | 不存在多个版本行或操作列切换 | runtime 身份只读显示，不创建版本列表 |
+| C：下载、安装、prefix 准备和恢复切换 | 各阶段高度不同会导致设置页抽动 | 所有阶段复用同一 `122pt` 任务区域 |
+| D：三款游戏共用事实 | 单款游戏 readiness 不能替代公共 prefix 状态 | 共用 runtime/prefix 用只读结构表达，游戏启动前置另行投影 |
+| E：高频进度更新 | 默认事务可能触发布局动画 | 任务区域关闭局部隐式布局动画；状态值继续更新 |
 
-实测下载中截图的窗口像素尺寸均为 `800 × 480`（包括标题栏），设置内容区保持同一窗口边界。运行时 AX 树连续读到同一任务区域，只更新目标状态、阶段、进度和传输值；未观察到 Section 被替换或错误覆盖其他控件。
+旧截图的窗口像素尺寸为 `800 × 480`（包括标题栏），只能作为窗口边界和旧任务区的历史证据，不能证明新的固定 runtime 页面已实现。
 
 ## 3. 稳定布局契约
 
@@ -53,92 +59,89 @@
 | Settings 窗口 | `800 × 448pt` 内容尺寸 | 打开时相对主窗口中心定位，重新打开重新计算 |
 | Sidebar | `min/ideal/max = 240pt` | 分隔线不可拖动到消失 |
 | Detail | `min/ideal/max = 560pt` | 内容在 Detail 内滚动，不改变列宽 |
-| 当前任务区域 | `122pt` | idle、pending、running、completed、failed、cancelled、recovery 共用区域 |
+| 固定 runtime 行 | min `42pt` | 固定身份不换行；状态值尾部截断 |
+| 共享 prefix 行 | min `42pt` | 状态值尾部截断；不显示路径 |
+| 三款游戏共用行 | min `42pt` | 固定三款游戏事实，不出现选择控件 |
+| 当前任务区域 | `122pt` | idle、下载、安装、prefix 准备、失败、取消、恢复共用区域 |
 | 进度指示器 | `220 × 16pt` | 真实估算用确定进度，否则显示 indeterminate |
-| 目标/状态行 | `20pt` 高，状态列 `72pt` | 版本标签最多一行，中间截断 |
+| 目标/状态行 | `20pt` 高，状态列 `72pt` | 固定目标 `wine-crossover-11.0-1-signed`，状态只更新值 |
 | 阶段行 | `22pt` 高 | 阶段值最多一行，尾部截断；不创建新行 |
 | 传输行 | `18pt` 高，速度列 `84pt` | 真实字节/速度显示真实值，否则显示未知占位 |
-| 取消按钮 | `24pt` 高 | 只在 pending/running 出现；父区域仍保持固定高度 |
-| Wine 版本行 | `48pt` 高 | 名称一行，tag 中间截断 |
-| Wine 操作列 | `136pt` | Download、Busy、Use/Delete、Current 在同一列内切换 |
+| 任务动作槽 | 固定位置 | 下载并安装、重试、取消最多显示一个，由上游 action 决定 |
 
-动态文案不会以硬编码的最长字符串作为唯一依据；尺寸约束、单行截断和未知占位共同保证窗口不跳动。Liquid Glass 材料和设置窗口导航契约保持不变。
+动态文案不会以硬编码的最长字符串作为唯一依据；固定身份、单行截断、未知占位和稳定任务区域共同保证窗口不跳动。Liquid Glass 材料和设置窗口导航契约保持不变。
 
 ## 4. UI 状态映射
 
-| 真实状态 | 任务区呈现 | 允许的结论/动作 |
+| 上游事实 | UI 主区域 | 可见动作/限制 |
 |---|---|---|
-| 无任务 | `暂无 Wine 下载或安装任务` | 不显示成功状态 |
-| `pending` | 目标 + `等待中` + indeterminate/占位字段 | 可取消；不改变已安装版本和当前运行时 |
-| `running` 下载 | 目标 + `进行中` + 真实阶段、真实进度（若有）、字节和速度（若有） | 可取消；不显示已安装或 `WineReady` |
-| `running` 安装/验证 | 目标 + `进行中` + 安装/验证阶段；无真实下载数据时显示未知 | 等待或按上游规则取消；不进入已安装列表 |
-| `completed` 且 `outcome = wineInstalled` | 任务完成事实；当前运行时由独立状态行重读 | 只在安装事实重读后显示已安装；不自动显示选中或游戏就绪 |
-| `completed` 但缺少安装结果 | `任务已完成，但安装结果未确认` | 保留错误/恢复事实；不显示成功 |
-| `failed` | `失败` 或 `需要恢复` + 原因 | 错误不会覆盖其他控件；旧的有效版本保持不变 |
-| `cancelled` 且 `cleanupVerified` | `已取消` + `下载已取消，临时资源清理已确认` | 可再次选择可用版本；不显示安装成功 |
-| `cancelled` 但清理未确认 | `需要恢复` + recovery 原因 | 不允许 UI 自行创建重试任务；先由上游恢复事实 |
-| Wine 目录查询中 | 可用版本 Section 内稳定显示 `正在获取版本` | 不把查询中当作空列表 |
-| Wine 目录失败/不可用 | 保留错误原因和“版本目录不可用”状态 | 不把 403、网络失败或无效目录改写成空列表 |
+| `NoManagedRuntime` | 固定 runtime 身份 + 未安装托管状态；共享 prefix 未就绪 | 单一“下载并安装”入口；不显示版本选择 |
+| `Downloading` | 固定目标 + 下载阶段 + 真实进度/未知进度 | 按任务能力显示取消；不显示已安装或 `WineReady` |
+| `ArtifactReady` | 固定目标 + 资源已校验，等待安装 | 等待安装提交；不显示已安装或 `WineReady` |
+| `Installing` | 固定目标 + 安装阶段 | 保持任务区域稳定；不显示安装完成 |
+| `Installed` | 固定 runtime 已安装 | 进入共享 prefix 准备；不显示 prefix 已就绪 |
+| `PrefixPreparing` | 固定 runtime + 共享 prefix 准备中 | 三款游戏均不显示完整 `WineReady` |
+| `PrefixReady` | 固定 runtime 已安装 + 共享 prefix 已准备 | 允许各游戏分别进行启动前置验证；不推断三款均通过 |
+| `RuntimeNotReady` | 共享环境或目标启动前置未就绪，并显示具体事实 | 由上游 action 提供重试/修复；不显示成功 |
+| `WineReady` | 固定 runtime、共享 prefix 与当前目标游戏启动前置均通过 | 仅表达当前目标游戏可进入启动流程 |
+| `InstallFailed` / `RuntimeUnavailable` | 失败类别、固定目标和此前有效事实 | 只显示上游提供的单一重试或恢复动作 |
+| `Cancelled` | 取消事实与清理结果 | 不覆盖此前有效 runtime/prefix；可重新提交同一固定目标 |
+| `RecoveryRequired` | 恢复/清理未确认；固定 runtime/prefix 状态受保护 | 阻止新的下载、安装或启动；只显示恢复动作 |
+| `Upgrading` / `UpgradeFailed` | 受控升级阶段或失败事实 | 不显示版本选择；失败时保留旧有效事实或进入恢复 |
 
-### 4.1 当前运行时、可用版本、已安装版本
+### 4.1 共享状态与游戏状态边界
 
-Wine 环境页明确分成四个 Section：
+- `PrefixReady` 是公共环境状态，不等于三款游戏均为 `WineReady`。
+- 某一游戏启动前置失败时，只在该游戏上下文显示失败，不创建新的 runtime 或 prefix，也不改变另外两款游戏的 Wine/prefix 身份。
+- 共享 prefix 失效、恢复未完成或公共任务进行中时，三款游戏都必须看到公共环境未就绪事实；UI 不将某一游戏的旧成功显示为共享环境当前成功。
 
-1. `当前运行时`：托管 Wine 的安装与就绪事实、来源和重新检测入口；不展示任意系统 `wine` 路径。
-2. `当前任务`：下载、安装、验证、取消、失败和恢复中的目标及进展。
-3. `已安装版本`：MiPlay 管理范围内可重读的本地安装事实。
-4. `可用版本`：批准来源目录返回的可获取版本；目录结果不覆盖本地已安装事实。
+## 5. Accessibility 与交互
 
-`当前运行时` 在全局 Settings 中只表达托管运行时事实；具体 Game ID 的 prefix/readiness 仍由 per-game 设置和启动前置流程表达，不能用全局状态冒充某款游戏已就绪。
+| 对象 | Role/Label | Value | 约束 |
+|---|---|---|---|
+| 统一 Wine 状态组 | `统一 Wine 运行环境` | 固定 runtime、共享 prefix、公共任务事实 | 只读，不表达三款游戏均已启动验证 |
+| 固定 runtime 行 | `托管 Wine runtime` | `wine-crossover-11.0-1-signed` + 安装状态 | 不可选择、删除或替换 |
+| 共享 prefix 行 | `共享 Wine prefix` | 准备、就绪、失败或恢复事实 | 不读出路径，不按游戏拆分 |
+| 三款游戏共用行 | `共用运行环境的游戏` | 原神、星穹铁道、绝区零共用同一 runtime/prefix | 不提供激活动作 |
+| 任务状态组 | `统一 Wine 任务` | 目标、阶段、进度/未知进度、传输和终态 | 高频速度不逐次播报 |
+| 任务动作 | `下载并安装` / `重试` / `取消` | 当前唯一可执行动作 | 由上游 action 决定，UI 不自行推断 |
 
-### 4.2 此 Mac
+键盘与 VoiceOver 激活结果必须与鼠标一致。任务进行中保持相同焦点顺序；安装中、恢复中和不可用状态不制造版本行或删除按钮。共享 prefix 的公共状态变化可以播报，但不得把它播报为三款游戏的 `WineReady`。
 
-`此 Mac` 移到通用设置，作为只读信息组展示：
+## 6. 与其他 UI 结构的关系
 
-- `机型标识`：当前数据源返回的 model identifier，例如 `MacBookPro18,1`；不称为芯片名称，也不推导 16 英寸营销名称。
-- `macOS 版本`：当前数据源返回的产品版本。
-- `磁盘空间`：面向 Wine 管理目标卷的可读结果；检测失败显示 `无法读取目标磁盘空间`，不把空值或 0 显示成剩余空间。
+本次回溯只替换 Wine 页面，不改变此前已冻结的 I-2 背景圆点和 I-5 “此 Mac”结构：
 
-`INFO-003` 的真实机型名称和芯片字段仍需 Research/Infrastructure 修复数据源；UI 已停止把 model identifier 命名为“芯片”。`INFO-004` 的检测失败也不能由 UI 猜测或替换为根卷空间。
+- I-2 背景圆点仍按现有 UI 文档的隐藏、顶部悬停区、位置和 hover 反馈规格执行。
+- I-5 “此 Mac”仍为机型、芯片、内存、macOS 版本四行只读信息；未知或失败时不推断。
+- “此 Mac”与固定 Wine/shared prefix 状态分开，不用设备信息推断 runtime/prefix readiness。
 
-## 5. 运行时 Accessibility 证据
+## 7. 验证记录
 
-使用刚构建的 `/tmp/MiPlayDerivedData/Build/Products/Debug/MiPlay.app` 读取实际 AX 树，结果如下：
+### 7.1 文档检查
 
-| 控件/状态 | 运行时语义 |
-|---|---|
-| Settings splitter | `disabled`，值 `240`；sidebar 不可拖到消失 |
-| 当前任务 | `Description: Wine 当前任务`，Details 包含目标、状态、阶段、进度、传输量和速度 |
-| 下载进度 | `Description: 下载进度`，Value 为真实比例，Details 为百分比 |
-| 传输信息 | 独立状态对象，Details 为字节量和速度；未知值明确读为未知/Zero KB/s，不虚构速度 |
-| 取消 | `Description: 取消 Wine 下载`，Hint 为停止下载并清理临时资源 |
-| 下载版本 | `Description: 下载 {版本名}`，Hint 明确下载完成不代表选中或游戏就绪 |
-| 当前运行时 | 安装与就绪值、托管来源和重新检测按钮均可读 |
-| 此 Mac | `机型标识`、`macOS 版本`、`磁盘空间` 为同一只读状态组；失败值明确为无法读取目标磁盘空间 |
+- [x] 固定 runtime 身份为 `wine-crossover-11.0-1-signed`。
+- [x] 明确三款游戏共用一个 runtime 和一个 prefix。
+- [x] 移除 Wine 作用范围、版本选择、来源选择、按游戏 Wine 覆盖和固定 runtime 删除入口。
+- [x] 统一下载、安装、重试入口，取消只作为同一任务槽中的上游动作。
+- [x] 失败、下载中、安装中和恢复中共用稳定任务区域。
+- [x] 明确共享 runtime/prefix 就绪不等于三款游戏均通过启动前置验证。
 
-VoiceOver/键盘可达性要求：所有 `Button` 使用 Return/Space，sidebar 行使用方向键选择；取消按钮只在任务可取消时存在并保持标准 Button 语义。高频速度采样作为状态 value 更新，不新增逐采样 announcement。重试和恢复动作只有在 ViewModel/Domain 提供真实 action 后才能出现；本轮不创建假的按钮。
+### 7.2 运行验证边界
 
-## 6. 截图验证矩阵
+现有 `validation-artifacts/settings-wine-*.jpg` 截图来自旧多版本 Wine 页面，只能证明旧窗口尺寸和旧任务区的历史边界，不能证明本稿的新 UI 结构。新结构尚未有运行截图，因为本 UI Agent 不修改 Swift 实现。
 
-截图均为 macOS 运行时截图，设置窗口内容尺寸为 `800 × 448pt`，图片包含标题栏所以像素尺寸为 `800 × 480`。
+新结构需要由 Implementation/Review/QA 验证：
 
-| 场景 | 证据 | 结果 |
-|---|---|---|
-| 主窗口正常/hover/高对比度/Reduce Motion | `validation-artifacts/main-normal.jpg`、`main-hover-focus.jpg`、`main-increase-contrast.jpg`、`main-reduce-motion.jpg` | 前序 UI/P1-08 运行验证资料；本轮未改变主窗口结构 |
-| 通用 Settings 与 Mac 信息 | `validation-artifacts/settings-general-mac-info-latest.jpg` | “此 Mac”独立分组；真实未知/失败值没有被伪造 |
-| Wine 任务 idle | `validation-artifacts/settings-wine-cancelled-full-latest.jpg` 的任务区域仍占固定高度 | 终态区域不消失 |
-| Wine 下载中 | `validation-artifacts/settings-wine-progress-full.jpg` | 目标、阶段、进度、传输量、速度和取消控件在固定区域内；动态值未改变主区域边界 |
-| Wine 取消且清理确认 | `validation-artifacts/settings-wine-cancelled-full-latest.jpg` | 只更新为已取消事实，不显示安装成功 |
-| Wine 失败/恢复 | `validation-artifacts/settings-wine-recovery.jpg` | 错误原因可见；旧版本保持不变；恢复状态不冒充成功 |
-| 安装中/安装成功 | 无截图 | 本次真实下载在下载阶段取消；当前归档可执行文件验证问题使 UI 不得伪造 `wineInstalled`。状态映射已定义，需上游修复后补运行证据 |
-| 重试 | 无截图 | 当前 SettingsViewModel 没有 Wine 任务重试/恢复 action；本轮明确不凭 UI 增加业务动作，回溯到 Architecture/Implementation |
-| Settings 重新打开 | `settings-general-mac-info-latest.jpg`、`settings-wine-progress-full.jpg` | 重新打开后列宽和内容尺寸保持；定位逻辑由 `SettingsWindowPositioner` 相对主窗口居中 |
+1. Settings 在 `800 × 448pt` 内容尺寸下无重叠、无版本列表和无按游戏 Wine 控件。
+2. 固定 runtime、共享 prefix、三款游戏共用说明和单一任务入口在下载、安装、失败、取消、恢复状态下保持布局稳定。
+3. 共享 prefix 已就绪时，UI 不把三款游戏全部标记为 `WineReady`；目标游戏 readiness 仍独立投影。
+4. 旧 schema 迁移或新状态读取失败时，UI 不恢复“全局 / 单独”选择，不恢复旧版本列表，也不恢复删除固定 runtime 的路径。
 
-## 7. 结论
+## 8. 交接
 
-- `DL-001`：UI 修复完成。下载动态字段不再决定 Section 尺寸，操作列和任务区固定，进度更新关闭局部隐式布局动画。
-- `INFO-001`、`INFO-002`：UI 结构完成。当前运行时、当前任务、已安装版本和可用版本分层显示。
-- `INFO-003`、`INFO-004`：UI 不再扩大错误。当前 model identifier 和磁盘检测失败如实展示，真实机型/芯片和目标卷检测仍回溯 Research/Infrastructure。
-- `DL-003`：UI 不显示不存在的成功状态；归档路径和 Wine 可执行文件验证继续由 Research/Implementation 负责。
-- 安装成功与任务重试的运行证据暂不宣称完成，原因是当前上游状态/action 尚未提供可验证条件。
-
+- Product/Research：固定 runtime 与共享 prefix 事实已作为本稿输入。
+- UX：需基于本稿重跑 Wine 用户流程、状态文案和失败恢复流程，不能沿用 I-4 作用范围流程。
+- Architecture：需冻结共享 prefix 生命周期、资源锁、并发和恢复契约；UI 不代替这些定义。
+- Implementation：按本稿重构 SettingsWineView 的 UI 投影；不得新增 UI 层业务判断或持久化字段。
+- Review/Performance/QA/Release：使用新的统一 runtime/prefix 验收矩阵，不引用旧多版本截图作为通过证据。

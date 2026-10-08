@@ -1,57 +1,69 @@
-# Research 修订报告: Wine 归档结构与 macOS 设备信息
+# Research 修订报告: 固定 Wine 归档结构与 macOS 设备信息
 
-日期: 2026-08-05  
-范围: Wine 归档结构、当前和参考实现的路径假设、Mac 硬件信息、macOS 版本、磁盘容量。  
+日期: 2026-08-27
+范围: 固定 release `wine-crossover-11.0-1-signed` 的 Wine 归档结构、当前和参考实现的路径假设、Mac 硬件信息、macOS 版本、磁盘容量。
 限制: 本文件只记录研究事实、代码证据、Apple 本地 SDK/man page 证据和待验证项，不修改源码、Product、UX、UI 或 Architecture 文档。
 
 ## 1. 结论摘要
 
-1. 本地用户归档 `wine-devel-11.8-osx64-signed.tar.xz` 的顶层目录是 `wine/`。实际 Wine binary 是 `wine/bin/wine`，不是归档根下的 `bin/wine`。归档中未发现 `wine64`，但发现 `wineboot`、`winecfg` 和 `wineserver`。
-2. 当前 MiPlay 用 `tar -xJf ... -C <staging>` 解压且没有 `--strip-components`。因此本地归档解压后实际路径是 `<staging>/wine/bin/wine`。当前 `extractArchive` 在返回前检查 `<staging>/bin/wine`，会直接把该归档判定为“解压后未找到 wine 可执行文件”。这是当前安装失败的已证实路径不匹配，不是仅凭 UI 状态推断的原因。
-3. 当前 Wine 版本管理器、readiness、已安装版本扫描和 runtime provider 都固定检查 `<版本根>/bin/wine`。即使绕过下载阶段检查，实际保留顶层目录的归档仍不能通过后续验证。
-4. 旧版 MiPlay 同样调用 `tar -xJf` 且保留顶层目录；旧版 `WineManager` 没有在安装后验证 `bin/wine`，所以“旧版本正常”不能从代码直接证明。旧版后续 `wine64` 路径也与当前本地归档不匹配。
-5. YAAGL 的事实是：运行时根目录预期包含 `wine/`，binary 选择为先尝试 `./wine/bin/wine64`，失败后回退 `./wine/bin/wine`。它的 `tar_extract_directory` 支持显式 `--strip-components`，但该函数本身不证明所有 Wine 归档都应被 strip。
-6. `MacBookPro18,1` 是 `hw.model` 的机器型号标识，不是芯片名称。当前本机的独立实证是 `hw.model=MacBookPro18,1`、`machdep.cpu.brand_string=Apple M1 Pro`、`system_profiler` 的 `machine_name=MacBook Pro` 和 `chip_type=Apple M1 Pro`。本地 Apple 工具没有在这次输出中给出“16 英寸”字段，因此不能只凭 `MacBookPro18,1` 推导营销名称。
-7. `ProcessInfo.operatingSystemVersion` 是数字版本结构，`sw_vers --productVersion` 是用户可见的产品版本，`sw_vers --buildVersion` 或 `kern.osversion` 是构建号。当前本机的实证为 `27.0` 和 `26A5388g`。当前源码把数字版本格式化为 `27.0.0`，这解释了 UI 与 `sw_vers` 的差异。
-8. 当前磁盘检测失败有一个直接的代码路径：`SettingsViewModel` 把 `NSHomeDirectory()` 作为普通字符串传给检测器，检测器随后无条件调用 `startAccessingSecurityScopedResource()`；Apple SDK 说明 security scope 来自用户选择或 security-scoped bookmark，字符串路径不会携带该 scope。当前 guard 失败时不会进入 resource-value 或 FileManager fallback，因此很可能直接显示“检测失败”。
+1. 固定 release `wine-crossover-11.0-1-signed` 的本地归档资产大小为 `456021524` bytes，SHA-256 为 `89fa7e90fb626523a90d5867a03c6be785d017176739c6320a3b86c7838c3a35`；该摘要与 GitHub release API 返回的 digest 一致。
+2. 目标归档唯一顶层目录是 `wine/`。实际 Wine binary 是 `wine/bin/wine`，不是归档根下的 `bin/wine`；归档中存在 `wineboot` 和 `wineserver`，不存在 `wine64` 和 `winecfg`。
+3. 当前 MiPlay 用 `tar -xJf ... -C <staging>` 解压且没有 `--strip-components`。因此目标归档解压后实际路径是 `<staging>/wine/bin/wine`。当前 `extractArchive` 在返回前检查 `<staging>/bin/wine`，会直接把该归档判定为“解压后未找到 wine 可执行文件”。这是当前安装失败的已证实路径不匹配，不是仅凭 UI 状态推断的原因。
+4. 当前 Wine 版本管理器、readiness、已安装版本扫描和 runtime provider 都固定检查 `<版本根>/bin/wine`。即使绕过下载阶段检查，实际保留顶层目录的目标归档仍不能通过后续验证。
+5. 目标归档不包含 `prefix/`、`wine/prefix/`、`drive_c/` 或 `dosdevices/`；prefix 是 Wine 初始化后产生的运行时状态，不能把归档内的 `wine/` 目录当作 prefix。
+6. YAAGL 的事实是：运行时根目录预期包含 `wine/`，binary 选择为先尝试 `./wine/bin/wine64`，失败后回退 `./wine/bin/wine`。它的 `tar_extract_directory` 支持显式 `--strip-components`，但该函数本身不证明所有 Wine 归档都应被 strip。
+7. `MacBookPro18,1` 是 `hw.model` 的机器型号标识，不是芯片名称。当前本机的独立实证是 `hw.model=MacBookPro18,1`、`machdep.cpu.brand_string=Apple M1 Pro`、`system_profiler` 的 `machine_name=MacBook Pro` 和 `chip_type=Apple M1 Pro`。本地 Apple 工具没有在这次输出中给出“16 英寸”字段，因此不能只凭 `MacBookPro18,1` 推导营销名称。
+8. `ProcessInfo.operatingSystemVersion` 是数字版本结构，`sw_vers --productVersion` 是用户可见的产品版本，`sw_vers --buildVersion` 或 `kern.osversion` 是构建号。当前本机的实证为 `27.0` 和 `26A5421a`。当前源码把数字版本格式化为 `27.0.0`，这解释了 UI 与 `sw_vers` 的差异。
+9. 当前磁盘检测失败有一个直接的代码路径：`SettingsViewModel` 把 `NSHomeDirectory()` 作为普通字符串传给检测器，检测器随后无条件调用 `startAccessingSecurityScopedResource()`；Apple SDK 说明 security scope 来自用户选择或 security-scoped bookmark，字符串路径不会携带该 scope。当前 guard 失败时不会进入 resource-value 或 FileManager fallback，因此很可能直接显示“检测失败”。
 
 ## 2. 本地归档实证
 
 ### 2.1 对象和命令
 
-归档路径:
+目标 release tag:
 
-`/Users/stevetan/Downloads/AnimeGameWineDownloads/wine-devel-11.8-osx64-signed.tar.xz`
+`wine-crossover-11.0-1-signed`
+
+本地归档路径:
+
+`/tmp/miplay-wine-research-20260827-aria2/wine-crossover-11.0-1-osx64-signed.tar.xz`
+
+release API:
+
+`https://api.github.com/repos/yaagl/anime-game-wine/releases/tags/wine-crossover-11.0-1-signed`
 
 执行的检查:
 
 ```sh
 stat -f '%N %z bytes' \
-  /Users/stevetan/Downloads/AnimeGameWineDownloads/wine-devel-11.8-osx64-signed.tar.xz
-file /Users/stevetan/Downloads/AnimeGameWineDownloads/wine-devel-11.8-osx64-signed.tar.xz
+  /tmp/miplay-wine-research-20260827-aria2/wine-crossover-11.0-1-osx64-signed.tar.xz
+file /tmp/miplay-wine-research-20260827-aria2/wine-crossover-11.0-1-osx64-signed.tar.xz
 shasum -a 256 \
-  /Users/stevetan/Downloads/AnimeGameWineDownloads/wine-devel-11.8-osx64-signed.tar.xz
-tar -tJf wine-devel-11.8-osx64-signed.tar.xz
-tar -tvJf wine-devel-11.8-osx64-signed.tar.xz
+  /tmp/miplay-wine-research-20260827-aria2/wine-crossover-11.0-1-osx64-signed.tar.xz
+tar -tJf /tmp/miplay-wine-research-20260827-aria2/wine-crossover-11.0-1-osx64-signed.tar.xz
+tar -tvJf /tmp/miplay-wine-research-20260827-aria2/wine-crossover-11.0-1-osx64-signed.tar.xz
 ```
 
 结果:
 
 | 项目 | 结果 | 证据性质 |
 | --- | --- | --- |
-| 文件类型 | XZ compressed tar，checksum CRC64 | 本地 `file` 输出 |
-| 大小 | `417187260` bytes，约 398 MiB | 本地 `stat` 输出 |
-| SHA-256 | `42430b7e8398642d7121e7cbac0aa03ce7312b4500e4ddf7eb75a7c8f2407a9c` | 本地 `shasum -a 256` 输出；仅是该文件摘要，不是 pkg_version 语义 |
-| 归档条目数 | `12105` | 本地 `tar -tJf` 输出计数 |
+| release asset | `wine-crossover-11.0-1-osx64-signed.tar.xz` | release API asset identity 与本地文件名 |
+| 文件类型 | XZ compressed tar | 本地 `file` 输出 |
+| 大小 | `456021524` bytes | 本地 `stat` 输出；与 release asset size 一致 |
+| SHA-256 | `89fa7e90fb626523a90d5867a03c6be785d017176739c6320a3b86c7838c3a35` | 本地 `shasum -a 256` 输出，并与 release API digest 一致 |
+| 归档条目数 | `12637` | 本地 `tar -tJf` 输出计数 |
 | 顶层目录 | `wine` | 本地 `tar -tJf` 输出 |
-| `wine/bin/wine` | 存在，归档权限 `-rwxr-xr-x` | 本地 `tar -tvJf` 输出 |
+| `wine/bin/wine` | 存在，归档权限 `-rwxr-xr-x`，x86_64 Mach-O | 本地 `tar -tvJf` 与 `file` 输出 |
 | `wine/bin/wine64` | 未发现 | 对完整 listing 的精确路径查询 |
-| `wine/bin/wineboot` | 存在 | 本地 `tar -tvJf` 输出 |
-| `wine/bin/winecfg` | 存在 | 本地 `tar -tvJf` 输出 |
-| `wine/bin/wineserver` | 存在 | 本地 `tar -tvJf` 输出 |
-| `wine/prefix` | 未发现 | 对完整 listing 的前缀查询 |
+| `wine/bin/wineboot` | 存在，shell wrapper | 本地 `tar -tvJf` 与 `file` 输出 |
+| `wine/bin/winecfg` | 未发现 | 对完整 listing 的精确路径查询 |
+| `wine/bin/wineserver` | 存在，x86_64 Mach-O | 本地 `tar -tvJf` 与 `file` 输出 |
+| `wine/lib` / `wine/lib/wine` | 存在 | 对完整 listing 的路径查询 |
+| `wine/share/wine/wine.inf` | 存在 | 对完整 listing 的路径查询 |
+| `prefix` / `wine/prefix` / `drive_c` / `dosdevices` | 未发现 | 对完整 listing 的前缀查询 |
 
-归档前几项为 `wine/`、`wine/bin/`、`wine/lib/`、`wine/share/` 等。当前实证没有发现一个可作为游戏专属 prefix 的 `prefix/` 顶层或 `wine/prefix/` 目录；Wine prefix 是否在之后创建属于运行时流程，不应从本归档推断。
+归档前几项为 `wine/`、`wine/bin/`、`wine/lib/`、`wine/share/` 等。当前实证没有发现可作为 prefix 的目录；Wine prefix 是否在之后创建属于运行时流程，不应从本归档推断。
 
 ### 2.2 真实路径矩阵
 
@@ -61,11 +73,17 @@ tar -tvJf wine-devel-11.8-osx64-signed.tar.xz
 | `wine/bin/wine` | 存在 | 本地归档的可执行 Wine binary |
 | `wine/bin/wine64` | 不存在 | 不能假定旧版或其他发行包一定提供它 |
 | `wine/bin/wineboot` | 存在 | 同一归档中的辅助 binary |
-| `wine/bin/winecfg` | 存在 | 同一归档中的辅助 binary |
+| `wine/bin/winecfg` | 不存在 | 不能把 `winecfg` 当作目标归档提供的辅助 binary |
 | `wine/bin/wineserver` | 存在 | 同一归档中的辅助 binary |
-| `prefix` / `wine/prefix` | 未发现 | 不能把 prefix 当作归档内固定资源 |
+| `wine/lib` / `wine/lib/wine` | 存在 | runtime 资源目录随 `wine/` 顶层目录提供 |
+| `wine/share/wine/wine.inf` | 存在 | `wineboot` 初始化所需资源在归档内存在 |
+| `prefix` / `wine/prefix` / `drive_c` / `dosdevices` | 未发现 | 不能把 prefix 当作归档内固定资源 |
 
 这份矩阵只对上述本地文件负责。其他 release、签名变体、架构变体或镜像返回的归档必须重新执行 listing 和 binary 检查。
+
+### 2.3 旧 11.8 研究的适用范围
+
+此前 `wine-devel-11.8-osx64-signed.tar.xz` 的归档检查属于 2026-08-05 的历史研究材料。它可以保留作为旧 release 的对照，但不能作为当前固定 release `wine-crossover-11.0-1-signed` 的路径、文件存在性、摘要或兼容性结论。当前 release 的结论以上述本地 listing、`file` 输出和 release API digest 为准；未来 release 也必须重新执行同类检查。
 
 ## 3. 当前 MiPlay 解压与失败路径
 
@@ -83,7 +101,6 @@ tar -tvJf wine-devel-11.8-osx64-signed.tar.xz
 ```text
 <staging>/wine/bin/wine
 <staging>/wine/bin/wineboot
-<staging>/wine/bin/winecfg
 <staging>/wine/bin/wineserver
 ```
 
@@ -115,8 +132,8 @@ tar -tvJf wine-devel-11.8-osx64-signed.tar.xz
 
 已确认的是“本地归档结构”和“当前路径假设互相不一致”。以下事项仍需后续阶段验证:
 
-- 目标产品契约应采用保留顶层目录，还是在受控解压时 strip 顶层目录。
-- 所有被批准 Wine 版本是否都采用相同顶层目录。
+- 对当前固定 release，若保留归档顶层目录，则安装目录中的 binary 路径事实是 `<runtimeRoot>/wine/bin/wine`；是否在受控解压时 strip 顶层目录属于后续 Architecture / Implementation 契约。
+- 未来 release 是否采用相同顶层目录，必须在该 release 冻结后重新验证。
 - binary 路径统一后，动态库、`share`、`lib` 和 Wine prefix 的相对查找是否仍与 runtime provider 的工作目录一致。
 - 归档 binary 在真实签名 App、App Sandbox 和 Hardened Runtime 下的启动结果。
 
@@ -134,7 +151,7 @@ tar -tvJf wine-devel-11.8-osx64-signed.tar.xz
 - `References/MiPlay/Wine/WineVersion.swift:64-129` 通过 GitHub Releases API 取得资产，保存 `asset.size` 和可选 `sha256` 元数据；这与归档内部路径是两个独立问题。
 - `References/MiPlay/Wine/WinePrefix.swift:49-91`、`References/MiPlay/Launcher/GameLauncher.swift:99-100` 和 `References/MiPlay/Launcher/LaunchService.swift:177` 使用 `bin/wine64`，而本地归档没有 `wine64`。
 
-因此旧版代码的可复用事实是“调用 tar 可展开该类归档，并把顶层目录保留在目标目录内”；不可直接复用的部分是“把版本根当成 binary 根”和“固定使用 wine64”。旧版本没有提供“安装成功且可启动”的充分代码证据，用户反馈的“旧版本正常”仍应通过可重复运行测试确认。
+因此旧版代码的可复用事实是“调用 tar 可展开该类归档，并把顶层目录保留在目标目录内”；不可直接复用的部分是“把版本根当成 binary 根”和“固定使用 wine64”。这只是参考实现事实，不构成当前固定 release 的安装结论。目标 release 没有 `wine64`，并且没有 `winecfg`，因此不能把旧版命令名称或旧 11.8 研究结果直接带入当前流程。
 
 ### 4.2 YAAGL
 
@@ -198,12 +215,12 @@ physical_memory: 16 GB
 
 ProductName: macOS
 ProductVersion: 27.0
-BuildVersion: 26A5388g
+BuildVersion: 26A5421a
 
 hw.model: MacBookPro18,1
 machdep.cpu.brand_string: Apple M1 Pro
 hw.optional.arm64: 1
-kern.osversion: 26A5388g
+kern.osversion: 26A5421a
 ```
 
 `system_profiler` 的完整输出还包含序列号、平台 UUID 等识别信息。用户信息界面和诊断导出不应默认展示或记录这些字段；`-detailLevel mini` 的 Apple man page 说明该级别不包含 personal information，但它是否提供所需硬件字段仍需在目标系统验证。
@@ -217,7 +234,7 @@ kern.osversion: 26A5388g
 | 芯片名称 | 本机 `system_profiler` 的 `chip_type` 和 `machdep.cpu.brand_string` 都为 `Apple M1 Pro` | 本机实证的芯片字符串 | 不应把 `hw.model` 作为 Apple Silicon 芯片名；跨机型字符串可用性需验证 |
 | Apple Silicon 判断 | 本机 `hw.optional.arm64=1` | 本机 selector 返回已启用 arm64 | selector 失败、虚拟机和未来硬件的错误处理需要测试 |
 | macOS 用户版本 | `sw_vers --productVersion`；`ProcessInfo.operatingSystemVersion` | 产品版本或数字版本结构 | 不应把 build number 当成用户版本 |
-| macOS build | `sw_vers --buildVersion`；`kern.osversion` | 本机为 `26A5388g` | 不应把 build number 展示为 `27.0` |
+| macOS build | `sw_vers --buildVersion`；`kern.osversion` | 本机为 `26A5421a` | 不应把 build number 展示为 `27.0` |
 
 ### 5.3 Apple 本地 SDK 和工具依据
 
@@ -301,10 +318,10 @@ Apple SDK 的 `NSURL.h:86-103` 说明 security-scoped URL 来自 security-scoped
 
 ### 7.1 Wine 归档
 
-- 对每个批准资产在安装前执行 listing，并记录顶层目录、目标 binary、是否存在 `wine64`、archive size 和摘要。
+- 对当前固定 release asset 在安装前执行 listing，并记录顶层目录、目标 binary、是否存在 `wine64`、archive size 和摘要；未来 release 需要重复该检查。
 - 不能仅检查一个硬编码路径。应在批准的归档布局契约中明确是保留顶层还是 strip，并测试至少一个带顶层目录和一个布局不同的拒绝样本。
 - 在成功安装前验证真实 `wine` binary 存在、可执行，并使用同一 binary 执行 `--version`；同时验证 Wine 依赖的相对目录工作方式。
-- 若 archive 不含 `wine64`，运行时必须使用已验证的 `bin/wine` fallback；不能由旧版代码的 `wine64` 假设覆盖该事实。
+- 当前目标 archive 不含 `wine64`，归档内已验证的目标 binary 是 `wine/bin/wine`；解压后实际路径取决于后续是否保留 `wine/` 顶层目录，不能由旧版代码的 `wine64` 假设覆盖该事实。
 - 安装失败、取消和验证失败必须清理 staging；清理失败要保留 recovery fact，不能只报告下载成功。
 
 ### 7.2 Mac 信息
@@ -366,6 +383,6 @@ Apple SDK 的 `NSURL.h:86-103` 说明 security-scoped URL 来自 security-scoped
 | `hw.model` 是 chip name | 否，已排除 |
 | `MacBookPro18,1` 对应 16 英寸营销名称 | 未确认，不可从本地证据推断 |
 | 当前本机芯片字符串 | 已确认，本机实证为 Apple M1 Pro |
-| `27.0` 与 `26A5388g` 的字段区分 | 已确认 |
+| `27.0` 与 `26A5421a` 的字段区分 | 已确认 |
 | 目标卷存在容量信息 | 已确认，本机命令约 24 GB available |
 | 当前“检测失败”的 security-scope 代码路径 | 高可信根因，需真实签名 App 复测 |

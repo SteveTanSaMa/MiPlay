@@ -198,6 +198,41 @@ import XCTest
         XCTAssertEqual(persistedAfterRetry.games.first?.state, .installed)
     }
 
+    func testPendingProcessExitRecoveryCommitsAutomaticallyThroughViewModel() async throws {
+        let game = Game(
+            id: GameType.genshinImpact.rawValue,
+            type: .genshinImpact,
+            location: nil,
+            state: .running,
+            version: nil,
+            lastLaunchDate: nil,
+            solutionApplications: []
+        )
+        let fixture = try await makeScheduler(games: [game])
+        _ = try await fixture.registry.recordProcessExitRecovery(
+            gameID: game.id,
+            processID: UUID(),
+            statusCode: 9,
+            terminatedBySignal: true,
+            detail: "退出后状态尚未提交"
+        )
+
+        let viewModel = LibraryViewModel(
+            gameRegistry: fixture.registry,
+            launchOrchestrator: fixture.launchOrchestrator,
+            backgroundMediaService: fixture.backgroundMediaService,
+            persistenceStore: fixture.persistence,
+            taskScheduler: fixture.scheduler,
+            logWriter: fixture.logger
+        )
+        await viewModel.refreshGames()
+
+        let pending = await fixture.registry.pendingRecoveryRecords(gameID: game.id)
+        XCTAssertTrue(pending.isEmpty)
+        let state = await fixture.registry.getGame(by: game.id)?.state
+        XCTAssertEqual(state, .installed)
+    }
+
     func testRestartReconcilesPersistentRunningWithoutInventingNormalExit() async throws {
         let baseURL = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: baseURL) }
@@ -363,6 +398,61 @@ import XCTest
         XCTAssertEqual(recoveredData.recoveryRecords.count, 1)
         XCTAssertEqual(recoveredData.recoveryRecords.first?.id, guardRecord.id)
         XCTAssertNotNil(recoveredData.recoveryRecords.first?.resolvedAt)
+    }
+
+    /// 回归：AppData 的 ISO8601 时间戳只有秒级精度，同一秒创建的多条恢复记录
+    /// 必须按"结论强弱"确定性排序。否则提交顺序随机，最终状态会在保守结论
+    /// （restartReconciliation → LaunchFailed）和具体退出事实
+    /// （processExit → Installed）之间摇摆（此前的偶发失败用例）。
+    func testRecoveryCommitOrderIsDeterministicForEqualTimestamps() {
+        let sameInstant = Date(timeIntervalSince1970: 1_700_000_000)
+        let conservative = RecoveryRecord(
+            kind: "restartReconciliation",
+            gameID: GameType.genshinImpact.rawValue,
+            target: GameBusinessState.launchFailed.rawValue,
+            phase: "restartReconciliation",
+            detail: "应用重启后无法验证旧游戏进程",
+            createdAt: sameInstant
+        )
+        let concrete = RecoveryRecord(
+            kind: "processExit",
+            gameID: GameType.genshinImpact.rawValue,
+            target: GameBusinessState.installed.rawValue,
+            phase: "exitStateCommit",
+            detail: "退出后状态尚未提交",
+            createdAt: sameInstant
+        )
+
+        // 保守结论先提交，具体退出事实最后提交 → 具体事实最终生效。
+        XCTAssertTrue(GameRegistry.precedesInRecoveryCommitOrder(conservative, concrete))
+        XCTAssertFalse(GameRegistry.precedesInRecoveryCommitOrder(concrete, conservative))
+
+        // 时间不同仍以时间为准。
+        let later = RecoveryRecord(
+            kind: "restartReconciliation",
+            phase: "restartReconciliation",
+            detail: "更晚的保守结论",
+            createdAt: sameInstant.addingTimeInterval(1)
+        )
+        XCTAssertTrue(GameRegistry.precedesInRecoveryCommitOrder(concrete, later))
+
+        // 完全相同的键（same createdAt / kind / rank）也必须确定：按 id 排序。
+        let lowerID = RecoveryRecord(
+            id: "A-000",
+            kind: "processExit",
+            phase: "exitStateCommit",
+            detail: "first",
+            createdAt: sameInstant
+        )
+        let higherID = RecoveryRecord(
+            id: "B-111",
+            kind: "processExit",
+            phase: "exitStateCommit",
+            detail: "second",
+            createdAt: sameInstant
+        )
+        XCTAssertTrue(GameRegistry.precedesInRecoveryCommitOrder(lowerID, higherID))
+        XCTAssertFalse(GameRegistry.precedesInRecoveryCommitOrder(higherID, lowerID))
     }
 
 }

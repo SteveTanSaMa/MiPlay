@@ -1,7 +1,7 @@
 # MiPlay 模块通信与异常传播
 
-> **文档状态**：已冻结（Phase 3；当前修订基线见 `architecture-revision-2026-08-03.md`）
-> **更新日期**：2026-08-03
+> **文档状态**：已冻结（Architecture 回溯；运行时模型于 2026-08-28 重置）
+> **更新日期**：2026-08-28
 > **通信原则**：命令向下，结果向上，事件横向广播；异常在产生层分类，在 ViewModel 层投影为用户可理解事实。
 
 ## 1. 通信方向
@@ -55,15 +55,15 @@ OS result
 |---|---|---|---|
 | `LibraryViewModel` | `TaskScheduler` | 启动、完整性、版本检查、取消、重试意图 | TaskReceipt/拒绝 |
 | `GameDetailViewModel` | `TaskScheduler` | 应用方案、回滚、取消（按策略） | TaskReceipt/拒绝 |
-| `SettingsViewModel` | `TaskScheduler` | Wine 目录查询、选择、下载、删除、日志导出意图 | Runtime snapshot/TaskReceipt |
+| `SettingsViewModel` | `TaskScheduler` | 固定 WineRuntimeSetup、恢复、日志导出意图 | Runtime/prefix snapshot/TaskReceipt |
 | `TaskScheduler` | Domain executor | 类型化任务输入、取消信号、互斥资源 | 阶段、outcome、错误 |
-| `TaskScheduler` | `WineVersionManager` | `WineCatalogQuery`、source selection、托管版本选择和 `WineAssetDownload` 输入 | RuntimeSourceResult/RuntimeSelection/Task events |
+| `TaskScheduler` | `WineVersionManager` | 固定 catalog entry 读取、WineRuntimeSetup、共享 prefix lease 和恢复输入 | Runtime/prefix snapshot/Task events |
 | `WineVersionManager` | `LocalGameEvidenceReader` | 不直接调用；通过 Game/路径任务请求本地证据 | LocalGameEvidence |
 | `FileIntegrityVerifier` / `VersionChecker` | `LocalGameEvidenceReader` | Game ID、有效 location lease、取消信号 | LocalGameEvidence 或 typed error |
 | `LaunchOrchestrator` | `GameRegistry` | Launching、Running、退出和失败转换 | DomainEvent |
 | `LaunchOrchestrator` | `PreLaunchValidator` | Game 快照和校验意图 | ValidationResult |
-| `LaunchOrchestrator` | `WineVersionManager` | 请求生效 runtime | RuntimeSelection |
-| `LaunchOrchestrator` | `WineRuntimeProvider` | Wine binary、Game exe、prefix、环境 | Prefix/进程准备结果 |
+| `LaunchOrchestrator` | `WineVersionManager` | 请求固定 `validatedRuntime()` 和 shared prefix lease | Runtime/prefix pair + lease |
+| `LaunchOrchestrator` | `WineRuntimeProvider` | 固定 Wine binary、Game exe、shared prefix、环境 | Prefix/进程准备结果 |
 | `LaunchOrchestrator` | `ProcessManager` | LaunchCommand、等待确认、终止 | ProcessResult/ExitEvent |
 | `SolutionEngine` | `GameFileSystemRepository` | 游戏目录快照/验证/回滚 | 文件事实 |
 | `SolutionEngine` | `SystemModificationGateway` | 结构化 hosts/hostname 变更 | 修改/验证/回滚事实 |
@@ -114,13 +114,12 @@ ViewModel 只把 Domain error 投影成 UI 已冻结的事实：
 - 持久化失败 → 数据未确认/恢复待处理，不显示已保存。
 - 用户取消 → 只有清理/回滚确认后显示 `cancelled`。
 
-### 4.4 Wine 来源错误映射
+### 4.4 Wine 固定 entry 与 setup 错误映射
 
-- HTTP 429：Infrastructure 保留 status、`Retry-After` 和来源 ID；Domain 映射为 `networkFailure/rateLimited`，不无限自动重试，不请求用户 token。
-- API 403 映射为 `apiForbidden`，asset 403 映射为 `assetForbidden`；二者都保留 source/status，不自动换源、不请求用户 token。
-- 有效空目录：映射为 `noAvailableManagedVersion`，不是网络失败，也不是“检测失败”。
-- 响应 schema、release tag、asset、架构或 allowlist 身份不一致：映射为 `catalogInvalid`，不能切换到未经批准的镜像。
-- 当前用户选择的来源失败不自动切换到另一个 source；用户必须主动选择 allowlist source。镜像 API 成功也不能替代 Release asset bytes 的独立验证。
+- HTTP 429：Infrastructure 保留 status、`Retry-After` 和固定 source identity；Domain 映射为 `networkFailure/rateLimited`，不无限自动重试，不请求用户 token，也不换源。
+- API 或 asset 被拒绝：映射为固定 entry 的 `apiForbidden/assetForbidden`，保留 status 和 source 摘要，不产生替代 entry。
+- 响应 schema、固定 release tag、asset、架构或批准 source identity 不一致：映射为 `catalogInvalid`，不能扩大为版本列表或切换未经批准的来源。
+- 固定 entry 验证通过但安装、shared prefix 准备或 pair 重读失败：映射为 `runtimeUnavailable`、`prefixPreparationFailed` 或 `recoveryRequired`；不得用过期 metadata、旧 Wine 或外部 prefix fallback。
 
 ### 4.5 本地版本证据错误映射
 
@@ -184,9 +183,9 @@ stored resolvable
 
 ```text
 WineVersionManager
-  → RuntimeSelection（已验证 binary 来源和版本）
+  → validatedRuntime()（固定 binary + shared prefix pair）
 LaunchOrchestrator
-  → WineRuntimeProvider.preparePrefix
+  → WineRuntimeProvider.acquireSharedPrefixLease / prepareSharedPrefix
   → LaunchCommand
 ProcessManager
   → ProcessCreated
@@ -195,16 +194,16 @@ LaunchOrchestrator
   → GameRegistry transition + Task outcome
 ```
 
-`WineCatalogQuery` 只产生 API/Release metadata 的 CatalogEntry；`WineAssetDownload` 从已验证 CatalogEntry 取得 asset bytes。两个阶段通过 source ID、policy revision 和 release/asset identity 关联，但不合并为一个“下载成功”事实。
+`WineRuntimeSetup` 只接受产品固定的 catalog entry，内部依次取得 asset bytes、提交固定 runtime、准备 shared prefix，并验证 pair。阶段事件仍区分 metadata、下载、安装和 prefix 准备，但这些阶段不产生版本选择状态，也不能单独成为 `WineReady`。
 
 启动命令固定为：执行 `wineBinary`，参数 `[gameExecutable] + fixed/performance arguments`，工作目录为游戏目录，环境包含：
 
 ```text
-WINEPREFIX=<AppSupport>/MiPlay/WinePrefixes/<stableGameID>
+WINEPREFIX=<AppSupport>/MiPlay/WinePrefixes/shared
 WINEDLLOVERRIDES=winemenubuilder.exe=d
 ```
 
-命令构造不调用 shell，不接受任意环境键。进程创建事件只能推动 `Launching` 的中间阶段；只有运行确认事件推动 `Running`。
+命令构造不调用 shell，不接受任意环境键。`sharedWinePrefix` lease 必须覆盖 prefix 准备、命令创建、进程确认、退出和清理；进程创建事件只能推动 `Launching` 的中间阶段，只有运行确认事件推动 `Running`。同一 prefix 被占用时返回 `busy/conflict`，不得让第二个游戏绕过 lease。
 
 进程退出后的通信必须带 session ID 和 termination-confirmed 事实：
 
@@ -265,7 +264,7 @@ Domain 将已确定的业务事实转换为安全 LogEvent 后提交给 `LogWrit
 | 投影 | 所有者 | 必须包含 | 禁止来源 |
 |---|---|---|---|
 | 游戏卡片/主操作/启动进度/错误恢复 | `LibraryViewModel` | Game ID、选中态、业务态、Task status/phase、真实 progress、side effect、唯一 recovery action | 颜色、hover、状态点、Process 创建 |
-| Wine 目录/source/download | `SettingsViewModel` | `RuntimeSourceResult`、source identity、403/429/认证/空列表反馈和 Task 事实 | 系统 Wine 路径、外部 runtime 或任意 URL 推断为可用 |
+| 固定 runtime/shared prefix setup | `SettingsViewModel` | 固定 identity、setup 阶段、403/429/校验/安装/prefix/recovery 和 Task 事实 | 版本列表、来源选择、系统 Wine 路径、外部 runtime 或任意 URL 推断为可用 |
 | 路径授权/本地证据 | Path/Library 对应 ViewModel | fresh/stale、刷新提交、证据来源、重新授权动作 | `lastKnownPath`、文件存在推断授权 |
 | 兼容方案 | `GameDetailViewModel` | Applying/Applied/RolledBack/Failed、恢复和不可取消事实 | 备份成功、颜色或命令返回 |
 

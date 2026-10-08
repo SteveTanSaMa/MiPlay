@@ -47,6 +47,7 @@ export async function createLauncher({
   channelClient: {
     installDir,
     installState,
+    supportsD3d12,
     showPredownloadPrompt,
     updateRequired,
     install,
@@ -81,6 +82,7 @@ export async function createLauncher({
     locale,
     gameInstallDir: installDir,
     configForChannelClient: createConfig,
+    supportsD3d12,
     onCheckUpdate,
   });
 
@@ -256,15 +258,13 @@ export async function createLauncher({
                         : locale.get("LAUNCH")
                       : locale.get("INSTALL")}
                   </Button>
-                  <Show when={installState() == "INSTALLED"}>
-                    <IconButton
-                      onClick={onOpen}
-                      disabled={programBusy()}
-                      fontSize={30}
-                      aria-label="Settings"
-                      icon={<IconSetting />}
-                    />
-                  </Show>
+                  <IconButton
+                    onClick={onOpen}
+                    disabled={programBusy()}
+                    fontSize={30}
+                    aria-label="Settings"
+                    icon={<IconSetting />}
+                  />
                 </ButtonGroup>
               </PopoverTrigger>
               <PopoverContent

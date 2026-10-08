@@ -70,6 +70,28 @@ import XCTest
         }
     }
 
+    func testGameTypeResolvesNestedExecutableAndDirectExecutableSelection() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gameDirectory = root.appendingPathComponent("ZenlessZoneZero Game", isDirectory: true)
+        try FileManager.default.createDirectory(at: gameDirectory, withIntermediateDirectories: true)
+        let executable = gameDirectory.appendingPathComponent("ZenlessZoneZero.exe")
+        try Data("fixture".utf8).write(to: executable)
+
+        XCTAssertEqual(
+            GameType.zenlessZoneZero.firstExistingExecutable(at: root.path),
+            executable.path
+        )
+        XCTAssertEqual(
+            GameType.zenlessZoneZero.resolvedInstallationDirectory(at: root),
+            gameDirectory.standardizedFileURL
+        )
+        XCTAssertEqual(
+            GameType.zenlessZoneZero.resolvedInstallationDirectory(at: executable),
+            gameDirectory.standardizedFileURL
+        )
+    }
+
     func testLegacyGamePathDecodesAsMigrationRequiredWithoutAuthorization() throws {
         let legacy = """
         {"id":"GenshinImpact","type":"GenshinImpact","installPath":"/Games/Genshin","state":"Installed"}
@@ -120,6 +142,111 @@ import XCTest
 
         let persisted = try await store.readAppData()
         XCTAssertEqual(persisted.games.first(where: { $0.type == .genshinImpact })?.state, .notInstalled)
+    }
+
+    func testGameRegistryEventSubscribersReceiveCommittedLaunchStateAndDiagnostic() async throws {
+        let baseURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+        let fileSystem = GameFileSystemRepository(appSupportDirectory: try makeTemporaryDirectory())
+        let store = PersistenceStore(baseURL: baseURL)
+        let registry = GameRegistry(
+            persistenceStore: store,
+            fileSystemRepository: fileSystem,
+            stateMachine: GameStateMachine(),
+            systemDetector: SystemEnvironmentDetector(),
+            logWriter: LogWriter(fileSystemRepository: fileSystem)
+        )
+        await registry.initialize()
+        let stream = await registry.makeEventStream()
+        try await registry.updateGamePath(id: GameType.genshinImpact.rawValue, newPath: "/Games/Genshin")
+        try await registry.recordLaunchFailure(
+            id: GameType.genshinImpact.rawValue,
+            detail: "Wine 未能加载 HoYoKProtect/WDFLDR 内核驱动"
+        )
+
+        var events: [GameRegistry.RegistryEvent] = []
+        for await event in stream {
+            events.append(event)
+            if event.game.lastLaunchFailure != nil { break }
+        }
+        XCTAssertEqual(events.last?.game.lastLaunchFailure, "Wine 未能加载 HoYoKProtect/WDFLDR 内核驱动")
+        let persisted = try await store.readAppData()
+        XCTAssertEqual(
+            persisted.games.first(where: { $0.id == GameType.genshinImpact.rawValue })?.lastLaunchFailure,
+            "Wine 未能加载 HoYoKProtect/WDFLDR 内核驱动"
+        )
+    }
+
+    func testProcessExitCommitPersistsKnownWineDriverDiagnostic() async throws {
+        let baseURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+        let fileSystem = GameFileSystemRepository(appSupportDirectory: try makeTemporaryDirectory())
+        let store = PersistenceStore(baseURL: baseURL)
+        let gameID = GameType.genshinImpact.rawValue
+        let game = Game(
+            id: gameID,
+            type: .genshinImpact,
+            location: GameLocation(
+                gameID: gameID,
+                bookmarkData: Data([1]),
+                lastKnownPath: "/Games/Genshin",
+                resolutionState: .resolvable
+            ),
+            state: .installed,
+            version: nil,
+            lastLaunchDate: nil,
+            solutionApplications: []
+        )
+        try await store.writeAppData(AppData(games: [game]))
+        let registry = GameRegistry(
+            persistenceStore: store,
+            fileSystemRepository: fileSystem,
+            stateMachine: GameStateMachine(),
+            systemDetector: SystemEnvironmentDetector(),
+            logWriter: LogWriter(fileSystemRepository: fileSystem)
+        )
+        await registry.initialize()
+        try await registry.transitionGame(id: gameID, to: .launching)
+        try await registry.recordLaunchConfirmed(id: gameID, date: Date())
+        try await registry.commitProcessExit(
+            gameID: gameID,
+            processID: UUID(),
+            statusCode: 1,
+            terminatedBySignal: false,
+            output: "Library WDFLDR.SYS HoYoKProtect.sys not found"
+        )
+
+        let updatedGame = await registry.getGame(by: gameID)
+        XCTAssertEqual(updatedGame?.state, .installed)
+        let persistedExit = try await store.readAppData()
+        XCTAssertEqual(persistedExit.games.first(where: { $0.id == gameID })?.state, .installed)
+        XCTAssertEqual(
+            updatedGame?.lastLaunchFailure,
+            "游戏进程异常退出（退出码 1）；本次日志显示反作弊驱动加载失败，可能存在 Wine 兼容问题"
+        )
+
+        // 即使本次日志出现驱动错误，终止信号和缺失状态也不能归因于反作弊。
+        for (code, signalled, expected) in [(Int32(9), true, "被强制终止"), (6, true, "崩溃"), (-1, false, "无法区分")] {
+            try await registry.transitionGame(id: gameID, to: .launching)
+            try await registry.recordLaunchConfirmed(id: gameID, date: Date())
+            try await registry.commitProcessExit(
+                gameID: gameID, processID: UUID(), statusCode: code,
+                terminatedBySignal: signalled, output: "Library WDFLDR.SYS HoYoKProtect.sys not found"
+            )
+            let exited = await registry.getGame(by: gameID)
+            XCTAssertEqual(exited?.state, .installed)
+            XCTAssertTrue(exited?.lastLaunchFailure?.contains(expected) == true)
+            XCTAssertFalse(exited?.lastLaunchFailure?.contains("反作弊") == true)
+        }
+
+        try await registry.transitionGame(id: gameID, to: .launching)
+        try await registry.recordLaunchConfirmed(id: gameID, date: Date())
+        try await registry.commitProcessExit(
+            gameID: gameID, processID: UUID(), statusCode: 0, terminatedBySignal: false
+        )
+        let normalExit = await registry.getGame(by: gameID)
+        XCTAssertEqual(normalExit?.state, .installed)
+        XCTAssertNil(normalExit?.lastLaunchFailure)
     }
 
     func testPersistenceRejectsUnsupportedSchemaAndInvalidFilename() async throws {
@@ -190,20 +317,25 @@ import XCTest
     func testWineRuntimeProviderRejectsMissingBinaryAndBuildsStablePrefixPath() async throws {
         let runtimeDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
-        let fileSystem = GameFileSystemRepository()
+        let runtimeRoot = runtimeDirectory
+            .appendingPathComponent("WineVersions", isDirectory: true)
+            .appendingPathComponent(WineVersionManager.fixedRuntimeTag, isDirectory: true)
+        let binaryDirectory = runtimeRoot.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binaryDirectory, withIntermediateDirectories: true)
+        let fileSystem = GameFileSystemRepository(appSupportDirectory: runtimeDirectory)
         let provider = WineRuntimeProvider(processManager: ProcessManager(), fileSystemRepository: fileSystem)
         let gameID = "QA-\(UUID().uuidString)"
         let prefix = await provider.getPrefixPath(for: gameID)
 
         do {
-            _ = try await provider.load(runtimePath: runtimeDirectory.path)
+            _ = try await provider.load(runtimePath: binaryDirectory.path)
             XCTFail("Expected missing Wine binary")
         } catch let error as WineRuntimeProvider.WineError {
             guard case .wineBinaryNotFound = error else {
                 return XCTFail("Unexpected Wine error: \(error)")
             }
         }
-        XCTAssertTrue(prefix.contains("WinePrefixes/\(gameID)"))
+        XCTAssertTrue(prefix.hasSuffix("WinePrefixes/shared"))
     }
 
     func testSolutionEngineOnlyExposesPublishedManifestAndFailsBeforeSideEffect() async throws {
@@ -225,7 +357,7 @@ import XCTest
         )
 
         let published = await engine.getSolutions(for: game)
-        XCTAssertEqual(Set(published.map(\.id)), ["modify_hostname"])
+        XCTAssertTrue(published.isEmpty)
 
         do {
             _ = try await engine.applySolution(solutionId: "block_network_anticheat", for: game)
@@ -270,6 +402,108 @@ import XCTest
                 return XCTFail("Unexpected solution error: \(error)")
             }
         }
+    }
+
+    // MARK: - Unified Wine runtime and shared prefix
+
+    func testUnifiedWineRuntimeIgnoresLegacyPerGameOverrides() async throws {
+        let appSupport = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let store = PersistenceStore(baseURL: try makeTemporaryDirectory())
+        let pair = try makeFixedWineRuntimePair(appSupport: appSupport)
+        try await store.writeAppData(AppData(
+            selectedWineVersion: "wine-devel-9.0",
+            installedWineVersions: ["wine-devel-9.0"],
+            perGameSettings: [
+                GameType.genshinImpact.rawValue: PerGameSettings(
+                    gameID: GameType.genshinImpact.rawValue,
+                    wineVersionOverride: "wine-devel-9.0"
+                )
+            ],
+            managedWineRuntime: pair.runtime,
+            sharedWinePrefix: pair.prefix
+        ))
+        let manager = try makeWineManager(appSupport: appSupport, store: store)
+        await manager.initialize()
+
+        let global = await manager.globalWineVersion()
+        let override = await manager.wineVersionOverride(for: GameType.genshinImpact.rawValue)
+        let genshinEffective = await manager.effectiveVersion(for: GameType.genshinImpact.rawValue)
+        let starRailEffective = await manager.effectiveVersion(for: GameType.honkaiStarRail.rawValue)
+        XCTAssertEqual(global, WineVersionManager.fixedRuntimeTag)
+        XCTAssertNil(override)
+        XCTAssertEqual(genshinEffective, WineVersionManager.fixedRuntimeTag)
+        XCTAssertEqual(starRailEffective, WineVersionManager.fixedRuntimeTag)
+
+        let persisted = try await store.readAppData()
+        XCTAssertNil(persisted.selectedWineVersion)
+        XCTAssertTrue(persisted.installedWineVersions.isEmpty)
+        XCTAssertNil(persisted.perGameSettings[GameType.genshinImpact.rawValue]?.wineVersionOverride)
+    }
+
+    func testAllGamesUseTheSameValidatedSharedWinePrefix() async throws {
+        let appSupport = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let store = PersistenceStore(baseURL: try makeTemporaryDirectory())
+        let pair = try makeFixedWineRuntimePair(appSupport: appSupport)
+        try await store.writeAppData(AppData(
+            managedWineRuntime: pair.runtime,
+            sharedWinePrefix: pair.prefix
+        ))
+        let manager = try makeWineManager(appSupport: appSupport, store: store)
+        await manager.initialize()
+
+        guard case .ready = await manager.checkReadiness() else {
+            return XCTFail("Expected the fixed runtime/shared prefix pair to be ready")
+        }
+        let validatedPrefix = await manager.validatedSharedPrefix()
+        let genshinEffective = await manager.effectiveVersion(for: GameType.genshinImpact.rawValue)
+        let starRailEffective = await manager.effectiveVersion(for: GameType.honkaiStarRail.rawValue)
+        let zzzEffective = await manager.effectiveVersion(for: GameType.zenlessZoneZero.rawValue)
+        XCTAssertEqual(validatedPrefix?.path, pair.prefix.absolutePath)
+        XCTAssertEqual(genshinEffective, WineVersionManager.fixedRuntimeTag)
+        XCTAssertEqual(starRailEffective, WineVersionManager.fixedRuntimeTag)
+        XCTAssertEqual(zzzEffective, WineVersionManager.fixedRuntimeTag)
+    }
+
+    func testFixedWineRuntimeDoesNotProvideADeletionPath() async throws {
+        let appSupport = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let store = PersistenceStore(baseURL: try makeTemporaryDirectory())
+        let manager = try makeWineManager(appSupport: appSupport, store: store)
+        await manager.initialize()
+
+        do {
+            try await manager.deleteVersion(tagName: WineVersionManager.fixedRuntimeTag)
+            XCTFail("Expected the fixed runtime deletion path to be unavailable")
+        } catch let error as WineVersionManager.VersionManagerError {
+            guard case .recoveryRequired = error else {
+                return XCTFail("Unexpected delete error: \(error)")
+            }
+        }
+    }
+
+    private func makeWineManager(
+        appSupport: URL,
+        store: PersistenceStore
+    ) throws -> WineVersionManager {
+        let fileSystem = GameFileSystemRepository(appSupportDirectory: appSupport)
+        let logger = LogWriter(fileSystemRepository: fileSystem)
+        let process = ProcessManager()
+        let provider = WineRuntimeProvider(processManager: process, fileSystemRepository: fileSystem)
+        return WineVersionManager(
+            networkProvider: NetworkDownloadProvider(),
+            fileSystemRepository: fileSystem,
+            persistenceStore: store,
+            wineVersionDownloader: WineVersionDownloader(
+                networkProvider: NetworkDownloadProvider(),
+                fileSystemRepository: fileSystem,
+                processManager: process,
+                logWriter: logger
+            ),
+            logWriter: logger,
+            wineRuntimeProvider: provider
+        )
     }
 
 }

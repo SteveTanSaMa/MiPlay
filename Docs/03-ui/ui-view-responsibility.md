@@ -97,3 +97,12 @@
 - **负责展示**：环形或不定进度指示；下载速度；当前阶段描述；阶段列表（已确认完成/进行中/待处理）；文件大小信息；预计剩余时间；网络状态指示；可取消任务的标准取消 Button 和失败后的重试 Button。
 - **不负责**：不负责 Wine 实际下载的执行；不负责 Wine 获取完成后的状态转换。
 - **关联业务状态**：WineRuntime（WineAcquiring — 获取进度；WineAcquisitionFailed — 失败原因；WineReady — 依赖准备完成）。WineReady 不等于游戏 `Running`，也不要求显示游戏成功提示。
+
+---
+
+### RecoveryOverlay
+
+- **服务对象**：MainWindow。用于显示重启恢复（`persistedRunningNoProcess`）和路径授权刷新（`locationStaleRefreshing`）等系统恢复任务。
+- **负责展示**：恢复阶段描述（“上次游戏状态未完成同步，正在恢复”）、恢复进度指示、恢复状态文本、恢复失败事实；不显示常规游戏状态或主操作文字。
+- **不负责**：不负责具体恢复逻辑执行；不负责状态转换；恢复期间不处理用户其他交互。
+- **关联业务状态**：`RestartRecoveryFact`（重启恢复）；`LocationRecoveryFact`（路径授权刷新）。

@@ -2,7 +2,8 @@
 
 > **文档状态**：活跃（Active）
 > **UX 阶段**：Task Analysis
-> **更新日期**：2026-08-03
+> **更新日期**：2026-08-27
+> **修订（I-2/I-3/I-4/I-5）**：2026-08-27 保留背景 hover 与“此 Mac”语义，覆盖旧 Wine 作用域任务，冻结统一 runtime 与共享 prefix 任务
 > **继承自**：Product Domain、Product Features、UX Principles
 
 ## 任务分析约定
@@ -78,13 +79,15 @@
 
 ## 7. 运行环境准备（P0）
 
-- **用户目标**：在无需理解 Wine 的情况下让游戏具备启动条件。
-- **过程**：检测需要的运行环境 → 获取或复用版本 → 校验下载内容 → 准备环境 → 将结果交给启动任务。
-- **成功门槛**：所需版本获取完成、内容校验通过、运行环境准备完成。获取请求发出或下载完成但未校验，均不能显示就绪。
-- **失败恢复**：网络/来源失败时显示运行环境准备失败，用户可在网络恢复后重试；不完整或损坏的临时版本不能参与启动。
-- **终态**：成功为当前 Game ID 的 `WineReady`；失败时 Task 为 `failed`，并带原因明确的 `RuntimeUnavailable`、`InstallFailed` 或 `RecoveryRequired` 业务事实；用户取消仅在清理完成后为 Task `cancelled`。失败或取消都不能显示启动成功。
+- **用户目标**：在无需理解 Wine 的情况下，让三款游戏共用的运行环境具备启动条件。
+- **固定目标**：唯一 runtime 为 `wine-crossover-11.0-1-signed`；唯一 prefix 为 MiPlay 管理的共享 prefix。用户不选择版本、来源、prefix 或游戏级 Wine。
+- **过程**：检查固定 runtime → 下载并校验 Release → 安装并验证托管 executable → 初始化并验证共享 prefix → 分别读取三款游戏 readiness。
+- **成功门槛**：固定 runtime 安装事实、共享 prefix 就绪事实和目标 Game ID 游戏前置均通过。下载完成、目录存在、`wine --version` 有输出或 prefix 目录存在都不能单独表示成功。
+- **取消语义**：未产生副作用时可取消；产生副作用后必须先清理或恢复并重读确认。未确认时为 `failed + RecoveryRequired`，不能报告干净取消。
+- **失败恢复**：网络/固定资源失败只影响获取任务；安装身份或提交失败只影响固定 runtime；prefix 初始化失败影响三款游戏；路径、manifest、兼容方案或启动进程失败只影响目标游戏。任何失败都不切换系统 Wine、CrossOver、Whisky 或其他 prefix。
+- **终态**：公共环境可为 `NoManagedRuntime`、`Installed`、`PrefixUnset`、`PrefixPreparing`、`PrefixReady`、`PrefixNotReady` 或 `RecoveryRequired`；目标游戏只有在公共环境和自身前置都通过时才为 `WineReady`。
 
-> **2026-08-05 回溯口径**：本节的运行环境结果必须按当前 Game ID 解释。可用版本、已安装版本、当前选中版本和 `WineReady` 分开投影；详见 [ux-runtime-revision-2026-08-05.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/02-ux/ux-runtime-revision-2026-08-05.md)。
+> 详细状态和刷新规则见 [ux-runtime-revision-2026-08-05.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/02-ux/ux-runtime-revision-2026-08-05.md) 与 [ux-state-flow.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/02-ux/ux-state-flow.md)。
 
 ## 8. TaskScheduler 任务管理（P0/P1）
 
@@ -105,20 +108,28 @@
 - **无可用备份**：不得静默覆盖原文件或伪造空数据已恢复。仅在用户明确选择重新开始后，使用默认空数据；该选择必须说明会失去哪些本地配置和历史。
 - **恢复失败**：终态为不可用，提供再次读取、选择备份恢复或重新开始的路径；在数据未通过读取校验前，不允许把游戏、方案历史或运行环境选择显示为已确认。
 
-## 10. 检测可用 Wine 版本与准备运行环境（P0 / P1-UV-001 / P1-UV-002）
+## 10. 统一 Wine 与共享 prefix 设置任务（P0 / R-1/R-2/R-4）
 
-- **用户目标**：在设置或启动前知道 MiPlay 是否能提供可用的托管运行环境；用户不需要选择外部 Wine。
-- **查询前提**：版本源策略已由 MiPlay 版本内置，用户不填写 GitHub URL、不导入系统 Wine；用户可以从预置可信镜像 allowlist 中选择一个来源，但不能输入任意镜像地址。
-- **查询过程**：检查已托管版本 → 查询批准来源/批准镜像 → 校验版本身份、架构和资源 → 返回目录结果。
-- **四类查询结果**：
-  - `noAvailableManagedVersion`：来源请求有效，但没有符合 allowlist、架构或当前游戏需求的托管版本。文案为“没有可用的托管运行环境”，恢复为等待 MiPlay 支持版本或稍后重试，不显示“网络错误”。
-  - `networkFailure`：当前选定的官方 GitHub 或预置镜像无法连接、超时、被限流或返回不可用服务。文案为“无法连接所选运行环境版本源”，恢复为检查网络后重试或主动改选其他预置来源。
-  - `sourceConfigurationError`：MiPlay 内置的来源 allowlist、URL、镜像配置或版本策略无法通过配置校验。文案为“运行环境版本源配置错误”，恢复为更新 MiPlay 或等待修复，不要求用户自行改 URL。
-  - **403**：选定官方 GitHub 或预置镜像明确拒绝访问时，文案为“所选运行环境版本源拒绝访问（403）”，归入来源配置/认证失败；不得显示为空目录、普通网络失败或要求用户提供 token。
-  - `catalogLoading`/下载中的 `running`：正在查询或下载，不能显示“没有可用版本”或“已安装”。下载中明确说明当前目标版本和阶段。
-- **镜像语义**：镜像是用户可以明确选择的批准来源。用户选择镜像后，目录查询和下载必须保留该镜像身份；不能把官方 GitHub 失败静默改写为镜像成功，也不能因镜像返回条目就跳过 artifact 校验和安装验证。
-- **成功门槛**：远程目录有条目不等于版本已可用；只有 MiPlay 取得 allowlist 内 artifact、完成内容校验、安装提交、重读验证和运行环境准备后才为 `WineReady`。
-- **系统 Wine 边界**：MiPlay 不检测系统 Wine、Whisky 或 CrossOver；它们不进入可用版本列表，不触发启动回退，也不能把当前 Game ID 的 `NoSelectedRuntime`、`SelectedNotReady` 或 `RuntimeUnavailable` 改成 `WineReady`。
+- **用户目标**：在一个简化的设置流程中检查、下载、安装并恢复唯一统一 Wine，使三款游戏共享同一个 prefix。
+- **进入后的信息**：固定 runtime 身份和安装状态、共享 prefix 状态与占用事实、三款游戏各自 readiness、当前任务阶段和唯一恢复动作。
+- **用户过程**：进入设置 → 读取当前事实 → 若未安装则获取固定 Release → 校验资源 → 安装并重读 → 若 prefix 未就绪则初始化/验证共享 prefix → 分别检查三款游戏。
+- **成功门槛**：
+  - 固定 runtime：资源身份、内容校验、托管 executable、安装提交和持久化重读均通过。
+  - 共享 prefix：由固定 Wine 初始化，身份和内容验证通过；三款游戏都引用同一个 prefix。
+  - 游戏 readiness：目标路径、manifest、兼容方案和启动前置均通过；不能用另一款游戏的 Ready 替代。
+- **下载与安装**：只对应 `wine-crossover-11.0-1-signed`。没有版本目录、来源选择、用户 URL、外部 Wine、prefix 选择或删除当前固定 runtime 的产品任务。
+- **prefix 被占用**：显示“共享运行环境正在使用中”，等待当前使用结束；不并发初始化、不重复排队、不清理正在使用的内容、不创建替代 prefix。
+- **prefix 初始化失败**：显示公共环境失败，三款游戏均不报告 `WineReady`；用户可重试或进入恢复。若副作用未确认，先进入 `RecoveryRequired`。
+- **游戏自身失败**：runtime/prefix 已就绪但目标游戏路径、manifest、兼容方案或进程失败时，只标记目标 Game ID 的 `GamePreflightFailed`/启动失败；不得把它归因于 Wine，也不得通过切换 Wine 或 prefix 规避。
+- `GamePreflightFailed` 是 UX 归因，不是新增 Wine runtime 状态；如实现沿用 `RuntimeNotReady`，必须携带“游戏自身前置失败”范围，不能与公共 runtime/prefix 失败共用恢复动作。
+- **风险边界**：Wine 已安装不等于三款游戏均已就绪；prefix 已就绪也不等于任一游戏路径或启动前置已经通过。
+
+### 10.1 旧 per-game override 的迁移后表现
+
+- 旧 `selectedWineVersion` 不再作为用户选择。与固定身份一致的记录仅作为待验证安装证据；其他值或空值不能成为当前运行时。
+- 旧 `wineVersionOverride` 全部忽略并清除其产品选择含义，不迁移为共享设置，也不保留为新的游戏级设置。
+- 旧按游戏 prefix 不继续使用；迁移后必须重新验证唯一共享 prefix。无法确认时显示未就绪或需要恢复。
+- 迁移完成后，用户只看到一个固定 runtime、一个共享 prefix 和三款游戏的 readiness，不看到历史的游戏级 Wine 选择结果。
 
 ## 11. 游戏版本、渠道与完整性证据（P1-UV-003）
 
@@ -146,4 +157,37 @@
 - **游戏卡片**：一个可激活对象必须同时提供游戏名、动作（切换到该游戏）、选中状态、业务状态和当前可用下一步。状态圆点、背景颜色和 hover 不单独成为事实来源。
 - **启动阶段与进度**：可读对象必须提供目标游戏、任务类型、当前 phase、`pending/running` 状态和真实 progress；进程确认、权限读取、后置验证、回滚验证等不可估算阶段使用“进度未知”，不读出猜测百分比。
 - **错误与恢复**：可读对象必须按“目标 → 阶段 → 事实 → 副作用 → 终态 → 恢复动作”提供信息。`recoveryRequired` 必须说明当前不能重试；`Applied` 必须说明游戏尚未启动；`RolledBack` 必须说明应用未成功但原状态已恢复。
-- **设置版本目录**：版本源查询中提供“正在检查版本源”；合法空目录提供“没有可用托管版本”；网络、配置和下载中分别提供对应状态，不把空列表或 spinner 推断为同一状态。
+- **统一 Wine 设置**：读出固定 runtime 的检查、下载、校验和安装状态，以及共享 prefix 的未准备、准备中、已准备、被占用、失败或需要恢复状态；不提供版本、来源或 prefix 选择，也不把空状态或 spinner 推断为已安装。
+
+## 14. 背景组 hover 预览与选择（P1 / I-2 冻结）
+
+- **用户目标**：在不改变持久化选择的前提下快速预览候选背景组；只有用户明确提交才切换当前背景。
+- **过程**：鼠标进入顶部区域 → 显示候选圆点 → hover 候选组 → 已缓存时直接预览，未缓存时启动可取消的预览加载 → 离开圆点或顶部区域后恢复当前选中组 → 用户明确提交后执行持久化选择。
+- **成功门槛**：预览显示已可用资源；持久化选择只有在目标组资源全部验证、选择写回并重读通过后才进入 `selected(groupID)`。
+- **失败与取消语义**：预览加载失败或取消只结束预览，当前选中组保持不变，不删除任何背景缓存，不写持久化；失败可重试或直接离开。
+- **状态驱动边界**：`hoverPreview`、`previewLoading`、`previewFailed` 不改变 `selectedBackgroundGroupID`，不新增业务任务；只有 `selected(groupID)` 是持久化选中终态。
+- **无障碍边界**：hover 不是交互前提；键盘 Return/Space 和 VoiceOver 激活调用同一提交动作，且不得把“正在预览”播报为“已切换”。
+- **终态**：`selected(groupID)`、当前选中组保持、预览失败或预览取消。
+
+## 15. 统一 Wine 设置的用户任务验收（P0 / I-4 回溯）
+
+- **用户目标**：不理解 Wine 内部版本管理，也能完成统一 runtime 和共享 prefix 的检查、安装、初始化或恢复。
+- **设置入口**：进入后直接看到固定 `wine-crossover-11.0-1-signed`，不需要先选择作用范围、版本、来源或 prefix。
+- **正常流程**：读取固定 runtime → 必要时下载并验证资源 → 安装并确认 executable → 初始化并验证共享 prefix → 查看三款游戏分别的 readiness。
+- **下载/安装失败**：说明失败阶段和“当前有效环境是否保持”；临时资源不能变成安装事实，旧的可信固定 runtime/prefix 不被覆盖。
+- **占用流程**：prefix 被占用时只等待当前使用结束；用户不能通过另一个 prefix 或 Wine 绕过占用保护。
+- **恢复流程**：初始化、安装、取消或清理副作用未确认时，显示 `RecoveryRequired`，先恢复、重读并重新验证，完成前不允许启动任一游戏。
+- **启动失败归因**：
+  - Wine runtime 失败：资源、安装、托管 executable、共享 prefix 或恢复失败，影响公共环境。
+  - 游戏自身失败：路径授权、manifest、兼容方案、游戏 executable 或目标进程失败，只影响目标 Game ID。
+- **迁移后**：旧 per-game override 不再展示、不再参与选择；历史数据无法证明当前固定 runtime/prefix 时，按未就绪或需要恢复处理。
+- **终态**：设置任务结束时，用户必须能区分“统一 Wine 已安装”“共享 prefix 已就绪”“{游戏名}已就绪”“{游戏名}自身前置失败”和“公共环境需要恢复”。
+
+## 16. 查看“此 Mac”设备信息（P1 / I-5 冻结）
+
+- **用户目标**：按“关于本机”的表达层级查看机型、芯片、内存和 macOS 版本；未知字段如实显示，不做技术推断。
+- **过程**：进入通用设置“此 Mac” → 读取系统报告 → 展示主层级字段 → 任一字段未提供或读取失败时显示该字段的未知/失败事实 → 单独读取 Wine 目标卷空间。
+- **成功门槛**：主层级字段全部来自系统报告，未推断 model identifier、架构或旧缓存；读取时间与来源可记录。
+- **失败语义**：字段未知显示“{字段}未知”，不推断；读取失败显示不可用，不用旧值、0 或空值伪装当前值；刷新失败保留上一次已确认值并标记过期。
+- **边界**：model identifier 与 build number 只作为详情字段；设备信息读取失败不改变 Wine 版本状态，也不允许或阻止启动。
+- **终态**：`fieldConfirmed`、`fieldUnknown`、`fieldFailed`、`fieldStale` 或 `diskSpaceUnavailable`。

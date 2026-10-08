@@ -8,7 +8,7 @@ import Foundation
 // Source: Architecture Design -> Service Contract -> WineVersionManager
 // Source: Architecture Design -> Domain Model -> ManagedWineRuntime
 
-/// Wine 版本信息（GitHub Release）
+/// Fixed runtime catalog information retained for the setup projection.
 public struct WineVersionInfo: Sendable, Identifiable, Hashable {
     public let id: String
     public let tagName: String
@@ -60,7 +60,7 @@ public struct WineVersionInfo: Sendable, Identifiable, Hashable {
 // A runtime identity is produced by WineVersionManager after the managed
 // record, allowlist, canonical root and executable have been checked. Callers
 // cannot construct one from an arbitrary user path through the public API.
-public struct ManagedWineRuntime: Sendable, Equatable {
+nonisolated public struct ManagedWineRuntime: Sendable, Equatable {
     public let tagName: String
     public let rootURL: URL
 
@@ -71,6 +71,34 @@ public struct ManagedWineRuntime: Sendable, Equatable {
 
     nonisolated public var binaryURL: URL {
         rootURL.appendingPathComponent("bin/wine", isDirectory: false)
+    }
+
+    nonisolated public var identity: String { tagName }
+}
+
+// Source: Architecture Design -> Domain Model -> SharedWinePrefix
+nonisolated public struct SharedWinePrefix: Sendable, Equatable {
+    public let identity: String
+    public let url: URL
+    public let runtimeIdentity: String
+
+    internal init(identity: String, url: URL, runtimeIdentity: String) {
+        self.identity = identity
+        self.url = url
+        self.runtimeIdentity = runtimeIdentity
+    }
+
+    nonisolated public var path: String { url.path }
+}
+
+// Source: Architecture Design -> ADR 039 -> shared prefix exclusive lease
+nonisolated public struct SharedWinePrefixLease: Sendable, Equatable {
+    public let id: UUID
+    public let prefix: SharedWinePrefix
+
+    nonisolated internal init(id: UUID = UUID(), prefix: SharedWinePrefix) {
+        self.id = id
+        self.prefix = prefix
     }
 }
 

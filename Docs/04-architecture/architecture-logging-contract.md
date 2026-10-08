@@ -232,12 +232,12 @@ UserIntent(LogExport)
 
 | Issue | 日志覆盖要求 | 不可替代的业务证据 |
 |---|---|---|
-| `P1-REV-001` | Wine asset cancel propagation、URLSession/解压/清理各阶段和最终 cleanup fact | Task cancelled/recoveryRequired 的 Domain 提交 |
-| `P1-REV-002` | artifact staged、installed record write/readback、completed 被拒绝或提交 | `installedWineVersions` 持久化和重读 |
+| `P1-REV-001` | WineRuntimeSetup 固定目标、URLSession/解压/Wine 子进程/共享 prefix lease 的取消传播和最终 cleanup fact | Task cancelled/recoveryRequired 的 Domain 提交 |
+| `P1-REV-002` | runtime/prefix pair staged、记录 write/readback、completed 被拒绝或提交 | 固定 runtime 与 shared prefix 记录的持久化和重读 |
 | `P1-REV-003` | Process exit、termination identity、退出终态提交失败、guard/recovery/retry | GameRegistry 终态和 restart reconciliation |
 | `P1-REV-004` | 五个 bookmark 消费者的 stale resolve、writeback、readback、scope release 和失败 | 新 bookmark 持久化和消费者 outcome |
 | `P1-UV-001` | Managed Wine policy rejection/absence 可诊断，但不创建外部 Wine 事实 | 无 system Wine detection/fallback |
-| `P1-UV-002` | source ID、API/asset 403、429、空列表、网络、镜像失败和主动改选 | Catalog/asset 内容与来源验证 |
+| `P1-UV-002` | 固定 source/entry 的 API/asset 403、429、网络和内容失败；无自动换源或用户改选 | fixed catalog entry、asset 内容与来源验证 |
 | `P1-UV-003` | metadata parse、manifest association、unknown/conflict 分类；禁止原始 config/pkg 值 | `GameMetadata` evidence 和 IntegrityManifest |
 | `P1-UV-006` | 记录 AX 相关 Domain 状态事实是否可投影；不把日志当 AX tree 证据 | ViewModel AccessibilityProjection 和真实 AX 验证 |
 | `DOC-REV-001` | 导出内容不得包含旧的成功口径或敏感值；事件字段必须引用当前术语 | Architecture/Domain/QA 完成口径 |

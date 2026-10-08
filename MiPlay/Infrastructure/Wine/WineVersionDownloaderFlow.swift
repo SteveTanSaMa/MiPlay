@@ -95,7 +95,10 @@ extension WineVersionDownloader {
                         archive: URL(fileURLWithPath: archivePath, isDirectory: false),
                         staging: staging,
                         wineTag: asset.tagName,
-                        taskID: sessionID.uuidString
+                        taskID: sessionID.uuidString,
+                        onExtractionProgress: { fraction in
+                            continuation.yield(.extracting(progress: fraction))
+                        }
                     )
                     let sessionCancelled = await self.wasCancelled(sessionID: sessionID)
                     if Task.isCancelled || sessionCancelled {

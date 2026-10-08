@@ -330,25 +330,33 @@ public actor NetworkDownloadProvider {
             }
 
             // Source: QA Report → F-004 — 基于时间差分的下载速度计算
-            // Observe download progress
+            //
+            // 进度来源：轮询 `URLSessionTask.countOfBytesReceived/ExpectedToReceive`。
+            // 实测两种"官方"途径都拿不到持续进度：
+            // - `NSProgress` 的 KVO（fractionCompleted）只会给出 `5/100` → `100/100`
+            //   → 真实字节三个值，界面因此长时间停在 5%；
+            // - 带完成回调的任务不会回调 `URLSessionDownloadDelegate.didWriteData`。
+            // 轮询字节计数与完成回调兼容，且字节数是真实值（不是百分比单位）。
             let progressState = DownloadProgressState()
-            let progressObserver = task.progress.observe(\.fractionCompleted) { progress, _ in
-                let bytesReceived = Int64(progress.completedUnitCount)
-                let totalBytes = progress.totalUnitCount > 0
-                    ? Int64(progress.totalUnitCount)
-                    : (expectedSize ?? 0)
-                let now = Date()
-                let speed = progressState.speed(for: bytesReceived, at: now)
-                continuation.yield(DownloadProgress(
-                    bytesReceived: bytesReceived,
-                    totalBytes: totalBytes,
-                    speed: speed
-                ))
+            let progressMonitor = Task {
+                while !Task.isCancelled {
+                    let received = task.countOfBytesReceived
+                    let expected = task.countOfBytesExpectedToReceive
+                    if received > 0 {
+                        let speed = progressState.speed(for: received, at: Date())
+                        continuation.yield(DownloadProgress(
+                            bytesReceived: received,
+                            totalBytes: expected > 0 ? expected : (expectedSize ?? 0),
+                            speed: speed
+                        ))
+                    }
+                    try? await Task.sleep(for: .milliseconds(150))
+                }
             }
 
             // Cleanup on finish
             continuation.onTermination = { @Sendable _ in
-                progressObserver.invalidate()
+                progressMonitor.cancel()
                 task.cancel()
                 Task { await self.removeDownloadTask(sessionID: sessionID) }
             }

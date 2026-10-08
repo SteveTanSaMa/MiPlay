@@ -134,3 +134,19 @@ MiPlay 采用**独立设置窗口 + Sheet 模态层**的混合架构。主要辅
 | **缩放** | 不可缩放 | 窗口尺寸恒定 1280×688 px，缩放控制禁用 |
 | **全屏模式** | 支持（Enter Full Screen） | 全屏时背景素材按 aspect-fill 展开至全屏尺寸，UI 控件位置不变，两侧或上下补充暗色边缘遮罩 |
 | **窗口恢复** | 记住窗口位置 | 仅记住窗口在屏幕上的位置（不记忆尺寸，因尺寸固定） |
+
+## 2026-10-08 设置导航修订
+
+设置保持 800 × 448pt、240pt 侧栏与 560pt 详情。六个页面按「应用」「游戏」「关于」组织；应用组为通用与 Wine，游戏组保留三款游戏固定顺序。详情顶部显示标题和范围说明，表单仍可滚动；切换页面通过 `.id(selectedItem)` 重建表单，避免不同游戏共享参数草稿。游戏标题使用 `GameType.displayName`。窗口定位、main/key 焦点行为与 ⌘, 路径沿用现有实现。
+
+主窗口尺寸和底部定位保持不变。系统启用「减少动态效果」时，游戏/设置图标不缩放、不播放自定义 spring/hover 动画，主题切换不播放自定义 crossfade。
+
+## 2026-10-09 原生导航修订
+
+删除手工设置 NSOpenPanel origin 与 runModal，目录定位采用原生 window-modal Sheet；无所属窗口时使用异步 begin。UI 仍将用户选择的 URL 交给原有 ViewModel/Domain 授权流程。启动准备期间，底层主操作区域禁用并从 Accessibility Tree 隐藏。
+
+游戏/设置/主按钮支持系统 focusable；Space、Return 仅在 key-down 激活，避免按住按键重复触发。背景 crossfade 仅由 BackgroundView 管理，Reduce Motion 时关闭；移除图标自定义缩放与 spring。设置删除重复子视图宽度 frame 及副标题，仍保留 240/560pt column 约束和既有固定窗口规格。
+
+## 2026-10-09 背景几何局部回退
+
+恢复 BackgroundView 的固定 1280 × 688pt frame，移除新增 clipped。背景/视频/theme 的 -16pt 偏移是用户基于 720 总高度、隐藏 titlebar 和 688 内容区居中关系测得的补偿，保持不变。不得将该值作为无依据的装饰偏移清理。此回退仅涉及背景布局，详见 [原生 UI 审查修订](../03-ui/ui-native-review-2026-10-09.md)。

@@ -149,8 +149,55 @@
   - 解锁机制本身对部分用户可能不可发现
   - 增加维护成本——解锁条件（连击次数、时间窗口）可能需要在用户反馈后调整
 
+### 原则 14：固定 Wine 零感知（MiPlay 对应产品定义）
+- **来源：** MiPlay Product Vision (`Docs/00-product/product-vision.md`)、MiPlay Product Features (`Docs/00-product/product-features.md` 第 2.6 节)
+- **描述：** 完全隐藏 Wine 版本选择和路径管理，使用唯一固定托管 Wine (`wine-crossover-11.0-1-signed`)，所有 Wine 相关操作（下载、校验、安装、恢复）由应用自动处理，不向用户暴露 Wine 细节。与 YAAGL 直接暴露 Wine Distribution 配置项不同，MiPlay 设计目标是完全透明的 Wine 体验。
+- **适用场景：** 目标用户为非技术玩家（不了解 Wine/转译概念）的 macOS 桌面应用；确保环境一致性和可预测性。
+- **Trade-off（选择此原则的代价）：**
+  - 完全隐藏 Wine 意味着当出现 Wine 特定问题时用户无法自助排查
+  - 高级用户无法自主选择 Wine 版本或配置
+  - 自动管理 Wine 版本增加了应用下载量，但简化了用户认知负担
+  - 「零感知」成功标准：≤5% 需要用户干预的启动比例
+
+### 原则 15：共享 prefix 统一管理（MiPlay 对应产品定义）
+- **来源：** MiPlay Product Features (`Docs/00-product/product-features.md` 第 2.6 节)
+- **描述：** 三款游戏共用同一个 MiPlay 托管的共享 prefix，不按 Game ID 创建独立 prefix，确保跨游戏兼容性并节省磁盘空间。这是 2026-08-27 用户硬修订的重要决策，覆盖此前所有 Wine 多版本相关设计。
+- **适用场景：** 多款同类游戏共用同一 Wine 环境的场景；强调环境一致性和资源效率。
+- **Trade-off（选择此原则的代价）：**
+  - 无法针对单个游戏定制 Wine 配置
+  - 一个游戏的崩溃或配置问题可能影响其他游戏
+  - 无法为特定游戏选择最新 Wine 版本
+  - 但确保了环境可预测性和简化管理
+
+### 原则 16：游戏就绪状态分层（MiPlay 对应产品定义）
+- **来源：** MiPlay Product Features (`Docs/00-product/product-features.md` 第 2.6 节)
+- **描述：** 明确区分 Wine 就绪、prefix 就绪、游戏就绪三层状态，精确表达当前游戏可启动的完整前置条件。状态分层对应固定 Wine 生命周期中的不同阶段（获取→校验→安装→prefix 准备→游戏验证）。
+- **适用场景：** 分阶段准备运行环境；需要精确诊断启动失败原因的复杂场景。
+- **Trade-off（选择此原则的代价）：**
+  - 状态判断逻辑复杂，需要精确的验证流程
+  - 用户可能需要理解中间状态（Wine 已安装但游戏路径未指定）
+  - 四个维度（固定发布-RM1-用户修订-验证结果）需要明确的产品术语体系
+
+### 原则 17：受控修复恢复机制（MiPlay 对应产品定义）
+- **来源：** MiPlay Product Features (`Docs/00-product/product-features.md` 第 2.6 节)
+- **描述：** 固定 Wine 和共享 prefix 损坏时进入受控恢复流程，用户不提供手动删除入口。与常见的「删除 - 重装」模式不同，MiPlay 采用「恢复/升级」而非「回退」的哲学。
+- **适用场景：** 破坏性配置容易遭到误操作；确保环境始终符合产品冻结状态。
+- **Trade-off（选择此原则的代价）：**
+  - 恢复过程可能比手动重装复杂
+  - 用户无法完全清空环境
+  - 但保证了环境始终处于产品受控状态
+
+### 原则 18：兼容方案发布清单约束（MiPlay 对应产品定义）
+- **来源：** MiPlay Product Features (`Docs/00-product/product-features.md` 第 2.1-2.3 节)
+- **描述：** 仅当前版本发布清单中的方案（当前仅 CS-01 修改 Hostname 条件可用）才标志为"可应用"。C-02、CS-03、CS-04 为 Deferred 状态，CS-05 为 Out of Scope。所有方案必须真实执行、完成后置验证、提供回滚能力，静态定义或代码入口不等于可应用状态。
+- **适用场景：** 确保兼容方案真实可用；避免展示不完整或伪能力。
+- **Trade-off（选择此原则的代价）：**
+  - 兼容方案数量有限，可能不足以覆盖所有启动问题
+  - 但避免了用户看到列表面无法实际应用的挫败感
+
 ### 当前项目方案标注
 
 - **已采用：** 当前 MiPlay 使用 `glassEffect` / `GlassEffectContainer`，主窗口采用 ZStack 沉浸式布局，设置采用独立 `Settings` Scene，状态采用 ViewModel 驱动。
 - **不应误写为当前实现：** `.regularMaterial`、`.ultraThinMaterial`、`.buttonGlass()`、右上角设置按钮、居中主按钮、主窗口设置 Sheet。
 - **研究建议：** Apple Liquid Glass 的 API、材质层级与 macOS 窗口规范继续作为参考；具体组件和窗口布局以当前代码与冻结 UI/Architecture 文档为准。
+

@@ -6,33 +6,36 @@
 //
 
 import SwiftUI
+import AppKit
 
 // Source: UI Design → 组件树 → GameSelectionView → GameSelectionRail
 // Source: UI Design → UI-11/UI-12 — 材质按钮 + hover 效果
+// Source: 用户指令（2026-10-08）— 侧栏改用获取到的官方游戏 icon，替代简单符号
 
 /// 游戏选择栏视图（垂直布局）。固定在窗口左下角。
 struct GameSelectionRailView: View {
     let games: [Game]
     @Binding var selectedId: String?
     @Binding var selectedPlaceholderType: GameType?
-    let onRemoveGame: ((String) -> Void)?
     let onLocateGame: ((GameType) -> Void)?
     let onPreload: ((GameType) -> Void)?
+    /// 官方游戏图标缓存路径（由 `LibraryViewModel.gameIconURLs` 提供）。
+    let iconURLs: [GameType: URL]
 
     init(
         games: [Game],
         selectedId: Binding<String?>,
         selectedPlaceholderType: Binding<GameType?> = .constant(nil),
-        onRemoveGame: ((String) -> Void)? = nil,
         onLocateGame: ((GameType) -> Void)? = nil,
-        onPreload: ((GameType) -> Void)? = nil
+        onPreload: ((GameType) -> Void)? = nil,
+        iconURLs: [GameType: URL] = [:]
     ) {
         self.games = games
         self._selectedId = selectedId
         self._selectedPlaceholderType = selectedPlaceholderType
-        self.onRemoveGame = onRemoveGame
         self.onLocateGame = onLocateGame
         self.onPreload = onPreload
+        self.iconURLs = iconURLs
     }
 
     /// 根据 GameType 查找是否已在库中
@@ -45,32 +48,20 @@ struct GameSelectionRailView: View {
         game(for: type)?.state
     }
 
+    private func isSelected(_ type: GameType) -> Bool {
+        if let game = game(for: type) { return selectedId == game.id }
+        return selectedPlaceholderType == type
+    }
+
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.colorSchemeContrast) private var contrast
 
     var body: some View {
-            GlassEffectContainer {
+        GlassEffectContainer(spacing: 8) {
             VStack(alignment: .center, spacing: 0) {
                 VStack(spacing: 12) {
                     ForEach(GameType.allCases, id: \.rawValue) { type in
-                        Button {
-                            handleTap(type: type)
-                        } label: {
-                            iconView(for: type)
-                                .frame(width: 56, height: 56)
-                        }
-                        .buttonStyle(.plain)
-                        .frame(width: 64, height: 64)
-                        .contentShape(Rectangle())
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityAddTraits(.isButton)
-                        .onKeyPress(.return) {
-                            handleTap(type: type)
-                            return .handled
-                        }
-                        .accessibilityLabel("切换到\(type.displayName)")
-                        .accessibilityValue(accessibilityValue(for: type))
-                        .accessibilityHint("选择后显示\(type.displayName)的背景和可用操作")
-                        .help("切换到\(type.displayName)")
+                        gameIconButton(for: type)
                     }
                 }
 
@@ -80,22 +71,94 @@ struct GameSelectionRailView: View {
             }
             .padding(.vertical, 10)
         }
+        // 状态描边放在玻璃容器外，避免被合成覆盖；固定几何无需缩放同步。
+        .overlay(alignment: .top) {
+            statusOutlines
+                .allowsHitTesting(false)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("游戏选择与设置")
     }
 
-    /// 单图标视图（SF Symbol 48×48 + 右下角状态点）
-    private func iconView(for type: GameType) -> some View {
-        let isActive: Bool = {
-            if let g = game(for: type) { return selectedId == g.id }
-            return selectedPlaceholderType == type
-        }()
+    /// 单个游戏图标按钮；状态描边在容器外的叠加层。
+    private func gameIconButton(for type: GameType) -> some View {
+        Button {
+            handleTap(type: type)
+        } label: {
+            iconView(for: type)
+                .frame(width: 56, height: 56)
+        }
+        .buttonStyle(.borderless)
+        .focusable()
+        .frame(width: 64, height: 64)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            if hovering { onPreload?(type) }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityAddTraits(isSelected(type) ? [.isButton, .isSelected] : [.isButton])
+        .onKeyPress(keys: [.return, .space], phases: .down) { _ in
+            handleTap(type: type)
+            return .handled
+        }
+        .accessibilityLabel("切换到\(type.displayName)")
+        .accessibilityValue(accessibilityValue(for: type))
+        .accessibilityHint("选择后显示\(type.displayName)的背景和可用操作")
+        .help("切换到\(type.displayName)")
+    }
 
+    /// 镜像固定图标布局，状态描边在玻璃容器之外，命中区域保持 64pt。
+    private var statusOutlines: some View {
+        VStack(spacing: 12) {
+            ForEach(GameType.allCases, id: \.rawValue) { type in
+                Color.clear
+                    .frame(width: 64, height: 64)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16)
+                            .strokeBorder(
+                                statusColor(state(for: type) ?? .notInstalled),
+                                lineWidth: contrast == .increased ? 3 : 2
+                            )
+                            .frame(width: 56, height: 56)
+                            .shadow(color: .black.opacity(0.65), radius: 1)
+                            .accessibilityHidden(true)
+                    }
+                    .overlay(alignment: .leading) {
+                        if isSelected(type) {
+                            Capsule()
+                                .fill(.white)
+                                .frame(width: 3, height: 20)
+                                .shadow(color: .black.opacity(0.6), radius: 2)
+                                .offset(x: -5)
+                                .accessibilityHidden(true)
+                        }
+                    }
+            }
+            Color.clear
+                .frame(width: 64, height: 64)
+                .overlay { glassOutline(selected: false) }
+                // 本层 VStack 已有 12pt spacing；补 4pt 对齐设置入口的 16pt 顶距。
+                .padding(.top, 4)
+        }
+        .padding(.vertical, 10)
+    }
+
+    private func glassOutline(selected: Bool) -> some View {
+        RoundedRectangle(cornerRadius: 16)
+            .strokeBorder(
+                .white.opacity(selected ? 0.9 : (contrast == .increased ? 0.55 : 0.2)),
+                lineWidth: selected ? 1.5 : 0.75
+            )
+            .frame(width: 56, height: 56)
+            .accessibilityHidden(true)
+    }
+
+    /// 单图标视图（官方 icon 或 SF Symbol 回退）
+    private func iconView(for type: GameType) -> some View {
         return GameIconContent(
             type: type,
-            isActive: isActive,
-            state: self.state(for: type),
-            statusColor: statusColor,
-            gameIcon: gameIcon(for:),
-            onPreload: onPreload
+            iconURL: iconURLs[type],
+            gameIcon: gameIconFallback(for:)
         )
     }
 
@@ -131,7 +194,8 @@ struct GameSelectionRailView: View {
         }
     }
 
-    private func gameIcon(for type: GameType) -> Image {
+    /// 单游戏图标：优先官方 icon，缺失时回退到 SF Symbol + 玻璃面板。
+    private func gameIconFallback(for type: GameType) -> Image {
         switch type {
         case .genshinImpact:  return Image(systemName: "wind")
         case .honkaiStarRail: return Image(systemName: "star")
@@ -139,35 +203,27 @@ struct GameSelectionRailView: View {
         }
     }
 
-    @State private var isSettingsHovered = false
-
     private var settingsIconView: some View {
         Button {
             openSettings()
         } label: {
-            ZStack {
-                Image(systemName: "gearshape")
-                    .font(.title)
-                    .foregroundStyle(.primary)
-                    .scaleEffect(isSettingsHovered ? 1.04 : 1.0)
-                    .brightness(isSettingsHovered ? 0.1 : 0)
-                    .animation(.easeOut(duration: 0.15), value: isSettingsHovered)
-            }
-            .frame(width: 56, height: 56)
-            .glassEffect(in: RoundedRectangle(cornerRadius: 16))
-            .onHover { isSettingsHovered = $0 }
+            Image(systemName: "gearshape")
+                .font(.title)
+                .foregroundStyle(.white)
+                .frame(width: 56, height: 56)
+                .modifier(DarkGlassSurface())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
+        .focusable()
         .frame(width: 64, height: 64)
         .contentShape(Rectangle())
-        .onKeyPress(.return) {
+        .onKeyPress(keys: [.return, .space], phases: .down) { _ in
             openSettings()
             return .handled
         }
         .accessibilityLabel("设置")
-        .accessibilityValue("设置窗口未打开")
         .accessibilityHint("打开设置窗口")
-        .help("设置")
+        .help("设置（⌘,）")
     }
 
     private func statusColor(_ state: GameBusinessState) -> Color {
@@ -180,48 +236,49 @@ struct GameSelectionRailView: View {
     }
 }
 
-// Source: UI Design → UI-11/UI-12 — 材质按钮 + hover 效果
+/// 官方图标读取随 URL 生命周期执行，body 不进行文件 I/O。
 private struct GameIconContent: View {
     let type: GameType
-    let isActive: Bool
-    let state: GameBusinessState?
-    let statusColor: (GameBusinessState) -> Color
+    /// 官方图标缓存路径；nil（或读取失败）时回退到 SF Symbol。
+    let iconURL: URL?
     let gameIcon: (GameType) -> Image
-    let onPreload: ((GameType) -> Void)?
-    @State private var isHovered = false
+    @State private var iconImage: NSImage?
+
+    private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: 16) }
 
     var body: some View {
-        ZStack(alignment: .bottomTrailing) {
-            ZStack {
+        ZStack {
+            if let iconImage {
+                // 用户指令：侧栏显示官方游戏 icon（圆角方块，与玻璃面板同形）。
+                Image(nsImage: iconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFill()
+                    .frame(width: 56, height: 56)
+                    .clipShape(shape)
+                    .shadow(color: .black.opacity(0.25), radius: 6, y: 2)
+            } else {
                 gameIcon(type)
                     .font(.title)
-                    .foregroundStyle(isActive ? Color.accentColor : .primary)
-                    // Source: UI-6 — 只缩放 glyph，保持玻璃面板和命中框稳定
-                    .scaleEffect(isActive ? 1.08 : (isHovered ? 1.04 : 1.0))
-                    .brightness(isHovered ? 0.1 : 0)
-                    .animation(.spring(response: 0.3, dampingFraction: 0.6), value: isActive)
-                    .animation(.easeOut(duration: 0.15), value: isHovered)
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.45), radius: 1, y: 1)
+                    .frame(width: 56, height: 56)
+                    // Source: Liquid Glass — P0 .glassEffect()
+                    // Source: macOS 26 规范 §7.9 — 圆角标准化
+                    .modifier(DarkGlassSurface())
             }
-            .frame(width: 56, height: 56)
-            // Source: Liquid Glass — P0 .glassEffect()
-            // Source: macOS 26 规范 §7.9 — 圆角标准化
-            .glassEffect(in: RoundedRectangle(cornerRadius: 16))
-
-                // Source: UI-7 — 圆点置于 ZStack 顶层，脱离 glass 合成层
-                if let state = state {
-                    Circle()
-                        .fill(statusColor(state))
-                        .frame(width: 10, height: 10)
-                        .overlay(Circle().stroke(.quaternary, lineWidth: 1.5))
-                        .offset(x: 3, y: 3)
-                }
         }
         .frame(width: 56, height: 56)
-        .onHover { hovering in
-            isHovered = hovering
-            if hovering { onPreload?(type) }
-        }
         .contentShape(Rectangle())
+        // 图标由启动流程异步补齐：先按缓存渲染，缓存稍后出现时再补上。
+        .task(id: iconURL) {
+            guard let iconURL else { iconImage = nil; return }
+            let data = await Task.detached(priority: .utility) {
+                try? Data(contentsOf: iconURL)
+            }.value
+            guard !Task.isCancelled else { return }
+            iconImage = data.flatMap { NSImage(data: $0) }
+        }
     }
 }
 

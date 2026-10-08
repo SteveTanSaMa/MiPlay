@@ -8,28 +8,27 @@
 import Foundation
 
 // Source: Architecture Design → Service Contract → WineVersionManager
-// Source: Architecture Design → ADR 011 → Domain + Infrastructure 双层分离
-// Source: Product Definition → Feature List → Must: Wine 版本管理
+// Source: Architecture Design -> ADR 037/038/040 -> fixed runtime setup
 // Source: QA Report → F-003 — GitHub API 认证策略 (ADR-017)
 // Source: QA Report → F-006 — GitHub API 模型重复定义
 // Source: Architecture Design → ADR-018 — WineVersionManager 为统一决策者
 
 // MARK: - Wine 版本管理器（Domain 层）
 
-/// Wine 版本管理器。负责运行时环境版本的全生命周期管理。
+/// Wine runtime manager for the one fixed runtime/shared-prefix pair.
 ///
 /// 职责范围（Domain 层业务编排，ADR-018 统一决策者）：
-/// - 版本发现（从 GitHub Release API 获取可用版本列表，含缓存和可选认证）
-/// - 版本下载编排（委托 WineVersionDownloader 执行实际下载和解压）
-/// - 版本选中/删除
-/// - 版本就绪状态报告
-/// - 生效运行时路径决策（仅返回已验证的 MiPlay 托管版本）
+/// - fixed catalog validation and setup orchestration
+/// - shared prefix readiness and recovery
+/// - validated runtime/prefix facts for launch consumers
 ///
 /// 依赖的 Infrastructure 层：
 /// - WineVersionDownloader（下载和解压）
 /// - GameFileSystemRepository（版本存储目录管理）
-/// - PersistenceStore（持久化选中版本和已安装版本列表）
+/// - PersistenceStore (authoritative runtime/prefix records)
 public actor WineVersionManager {
+    public static let fixedRuntimeTag = BuiltInWineVersions.fixedTag
+    public static let sharedPrefixIdentity = "sharedWinePrefix"
     public enum VersionManagerError: Error, LocalizedError {
         case apiUnavailable(String)
         case apiForbidden(sourceID: String, detail: String)
@@ -91,17 +90,22 @@ public actor WineVersionManager {
 
     // MARK: - Cache
 
-    /// 可用版本列表缓存（60 分钟有效期）
+    /// Fixed catalog cache (metadata only; never a user selection).
     internal var cachedVersions: [WineVersionInfo]?
     internal var cacheTimestamp: Date?
 
     // MARK: - Persisted State
 
-    /// 当前选中的版本标识（持久化）
+    /// Legacy compatibility state. It is derived only from the canonical record.
     internal var selectedVersionTag: String?
+    /// Kept empty after schema 4 migration. It must never participate in runtime
+    /// resolution.
+    internal var perGameOverrides: [String: String] = [:]
     internal var selectedSourceID: String = BuiltInWineVersions.officialSource.sourceID
-    /// 已安装版本列表（持久化）
+    /// Legacy compatibility state, containing at most the fixed identity.
     internal var installedVersionTags: Set<String> = []
+    internal var runtimeRecord: ManagedWineRuntimeRecord?
+    internal var prefixRecord: SharedWinePrefixRecord?
 
     // MARK: - Dependencies
 
@@ -111,9 +115,7 @@ public actor WineVersionManager {
     internal let wineVersionDownloader: WineVersionDownloader
     internal let logWriter: LogWriter
     internal let wineRuntimeProvider: WineRuntimeProvider?
-    internal nonisolated static let managedWineTags: Set<String> = Set(
-        BuiltInWineVersions.allSources().map(\.tagName)
-    )
+    internal nonisolated static let managedWineTags: Set<String> = [fixedRuntimeTag]
     internal var activeDownloadTasks: [UUID: Task<Void, Never>] = [:]
     internal var activeDownloadTags: [UUID: String] = [:]
 
@@ -139,23 +141,26 @@ public actor WineVersionManager {
     public func initialize() async {
         do {
             let appData = try await persistenceStore.readAppData()
-            selectedVersionTag = appData.selectedWineVersion.flatMap {
-                Self.managedWineTags.contains($0) ? $0 : nil
-            }
-            selectedSourceID = BuiltInWineVersions.sourceDescriptor(
-                for: appData.selectedWineSource ?? BuiltInWineVersions.officialSource.sourceID
-            )?.sourceID ?? BuiltInWineVersions.officialSource.sourceID
-            installedVersionTags = Set(appData.installedWineVersions.filter { Self.managedWineTags.contains($0) })
-            await logWriter.info("Wine 版本管理器已初始化: \(installedVersionTags.count) 个已安装, 选中: \(selectedVersionTag ?? "无")", module: "WineVersionManager")
+            selectedSourceID = BuiltInWineVersions.officialSource.sourceID
+            runtimeRecord = appData.managedWineRuntime?.identity == Self.fixedRuntimeTag
+                ? appData.managedWineRuntime
+                : nil
+            prefixRecord = appData.sharedWinePrefix?.identity == Self.sharedPrefixIdentity
+                ? appData.sharedWinePrefix
+                : nil
+            selectedVersionTag = runtimeRecord?.identity
+            installedVersionTags = runtimeRecord == nil ? [] : [Self.fixedRuntimeTag]
+            perGameOverrides = [:]
+            await logWriter.info("Wine 运行时管理器已初始化: \(runtimeRecord == nil ? "未安装" : "已安装")，共享 prefix: \(prefixRecord == nil ? "未准备" : "已准备")", module: "WineVersionManager")
             await logWriter.record(.init(
                 level: .info,
                 module: "WineVersionManager",
                 eventName: "wine.manager.initialized",
-                wineTag: selectedVersionTag,
+                wineTag: runtimeRecord?.identity,
                 phase: "initialized",
                 result: "completed",
                 messageCode: "wine.manager.initialized",
-                fields: ["installedCount": String(installedVersionTags.count), "sourceID": selectedSourceID]
+                fields: ["runtimeIdentity": Self.fixedRuntimeTag, "prefixIdentity": Self.sharedPrefixIdentity]
             ))
         } catch {
             await logWriter.warning("Wine 版本管理器初始化失败: \(error.localizedDescription)", module: "WineVersionManager")
@@ -176,5 +181,56 @@ public actor WineVersionManager {
         let dir = baseDir.appendingPathComponent("WineVersions", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    // MARK: - 游戏运行设置（Metal HUD / 帧率 / Retina / 左 Command）
+
+    /// 持久化的应用级游戏运行设置。
+    public func gameEnvironmentSettings() async -> GameEnvironmentSettings {
+        (try? await persistenceStore.readAppData())?.gameEnvironmentSettings ?? GameEnvironmentSettings()
+    }
+
+    /// 更新并持久化设置。注册表项在下一次准备 prefix / 启动游戏时写入
+    /// （与 YAAGL 每次启动前 `setProps` 的时机一致）；Metal HUD 等环境变量在下一次启动游戏时注入。
+    public func updateGameEnvironmentSettings(_ settings: GameEnvironmentSettings) async throws {
+        do {
+            try await persistenceStore.updateAppData { data in
+                data.gameEnvironmentSettings = settings
+            }
+        } catch {
+            throw VersionManagerError.persistenceFailed(error.localizedDescription)
+        }
+    }
+
+    /// Completes setup for a valid runtime already staged under MiPlay's own
+    /// managed directory. This avoids an unnecessary catalog/API dependency
+    /// when a previous download completed but the app was interrupted before
+    /// prefix preparation or AppData commit.
+    public func setupExistingManagedRuntimeIfPresent() async throws -> Bool {
+        guard let wineRuntimeProvider else {
+            throw VersionManagerError.recoveryRequired("缺少固定 Wine runtime provider")
+        }
+        let versionsDir = await wineVersionsDirectory()
+        let rootURL = versionsDir
+            .appendingPathComponent(Self.fixedRuntimeTag, isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let canonicalVersionsDir = versionsDir.resolvingSymlinksInPath().standardizedFileURL
+        guard FileManager.default.fileExists(atPath: rootURL.path) else {
+            return false
+        }
+        guard rootURL.path.hasPrefix(canonicalVersionsDir.path + "/"),
+              Self.isDirectory(atPath: rootURL.path),
+              FileManager.default.isExecutableFile(
+                atPath: rootURL.appendingPathComponent("bin/wine").path
+              ) else {
+            throw VersionManagerError.recoveryRequired("MiPlay 托管的 Wine 目录存在，但 binary 不完整")
+        }
+
+        let runtime = ManagedWineRuntime(tagName: Self.fixedRuntimeTag, rootURL: rootURL)
+        _ = try await wineRuntimeProvider.load(runtime: runtime)
+        try await markVersionInstalled(tagName: Self.fixedRuntimeTag)
+        try await prepareAndCommitSharedPrefix(runtime: runtime)
+        return true
     }
 }

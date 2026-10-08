@@ -58,10 +58,15 @@ public enum GameType: String, Codable, CaseIterable, Sendable {
         switch self {
         case .genshinImpact: return [
             "Genshin Impact Game/GenshinImpact.exe",
+            "Genshin Impact Game/YuanShen.exe",
             "YuanShen.exe",
+            "GenshinImpact.exe",
         ]
         case .honkaiStarRail: return ["StarRail.exe"]
-        case .zenlessZoneZero: return ["ZenlessZoneZero.exe"]
+        case .zenlessZoneZero: return [
+            "ZenlessZoneZero Game/ZenlessZoneZero.exe",
+            "ZenlessZoneZero.exe",
+        ]
         }
     }
 
@@ -74,18 +79,58 @@ public enum GameType: String, Codable, CaseIterable, Sendable {
         }
     }
 
-    /// 在指定安装目录中查找第一个存在的可执行文件路径
+    /// 在指定安装目录中查找第一个存在的可执行文件路径。
+    /// 支持用户选择直接游戏目录或包含游戏子目录的安装根目录。
     /// - Parameter installPath: 游戏安装目录
     /// - Returns: 找到的第一个可执行文件完整路径，均不存在则返回 nil
-    internal func firstExistingExecutable(at installPath: String) -> String? {
+    nonisolated internal func firstExistingExecutable(at installPath: String) -> String? {
         let baseURL = URL(fileURLWithPath: installPath)
         for relativePath in executableRelativePaths {
             let fullPath = baseURL.appendingPathComponent(relativePath).path
-            if FileManager.default.fileExists(atPath: fullPath) {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDirectory),
+               !isDirectory.boolValue {
                 return fullPath
             }
         }
+        let expectedNames = Set(executableNames.map { $0.lowercased() })
+        guard FileManager.default.fileExists(atPath: baseURL.path) else { return nil }
+        guard let enumerator = FileManager.default.enumerator(
+            at: baseURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return nil }
+        let baseDepth = baseURL.pathComponents.count
+        for case let candidate as URL in enumerator {
+            let depth = candidate.pathComponents.count - baseDepth
+            if depth > 3 {
+                enumerator.skipDescendants()
+                continue
+            }
+            let values = try? candidate.resourceValues(forKeys: [.isRegularFileKey])
+            if values?.isRegularFile == true,
+               candidate.pathExtension.caseInsensitiveCompare("exe") == .orderedSame,
+               expectedNames.contains(candidate.lastPathComponent.lowercased()) {
+                return candidate.path
+            }
+        }
         return nil
+    }
+
+    /// Normalizes either a selected executable or an installation root to the
+    /// directory that directly contains the game executable.
+    nonisolated internal func resolvedInstallationDirectory(at url: URL) -> URL? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return nil
+        }
+        let baseURL = isDirectory.boolValue ? url : url.deletingLastPathComponent()
+        guard let executablePath = firstExistingExecutable(at: baseURL.path) else {
+            return nil
+        }
+        return URL(fileURLWithPath: executablePath, isDirectory: false)
+            .deletingLastPathComponent()
+            .standardizedFileURL
     }
 
     /// 最小磁盘空间要求（字节）- 估算值
@@ -95,6 +140,13 @@ public enum GameType: String, Codable, CaseIterable, Sendable {
         case .honkaiStarRail: return 100 * 1024 * 1024 * 1024 // 100GB
         case .zenlessZoneZero: return 120 * 1024 * 1024 * 1024 // 120GB
         }
+    }
+
+    /// Launching an already-installed game does not require the free space
+    /// needed to download or patch the game itself. This smaller guard covers
+    /// Wine prefix growth, shader caches, logs and normal launcher writes.
+    nonisolated public var launchDiskSpaceRequired: UInt64 {
+        4 * 1024 * 1024 * 1024
     }
 }
 
@@ -153,25 +205,22 @@ public enum SolutionRiskLevel: String, Codable, Sendable, CaseIterable {
 /// 性能选项类型
 public enum PerformanceOptionType: String, Codable, Sendable, CaseIterable {
     case metalHUD = "MetalHUD"
-    case retinaMode = "RetinaMode"
-    case gameResolution = "GameResolution"
     case fpsUnlock = "FpsUnlock"
+    case metalFXUpscale = "MetalFXUpscale"
 
     public var displayName: String {
         switch self {
         case .metalHUD: return "Metal HUD"
-        case .retinaMode: return "Retina 模式"
-        case .gameResolution: return "游戏运行分辨率"
-        case .fpsUnlock: return "帧率解锁"
+        case .fpsUnlock: return "解锁帧率"
+        case .metalFXUpscale: return "MetalFX 空间缩放"
         }
     }
 
     public var description: String {
         switch self {
-        case .metalHUD: return "显示 Metal 性能 HUD（FPS 和 GPU 信息）"
-        case .retinaMode: return "启用 Retina 分辨率渲染"
-        case .gameResolution: return "设置游戏运行时的屏幕分辨率"
-        case .fpsUnlock: return "解除游戏帧率上限（需游戏支持）"
+        case .metalHUD: return "在画面上显示帧率（纯 FPS、最小缩放）"
+        case .fpsUnlock: return "解除帧率上限（等待解锁工具接入后生效）"
+        case .metalFXUpscale: return "以较低分辨率渲染并由 MetalFX 放大"
         }
     }
 }

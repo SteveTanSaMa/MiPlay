@@ -3,12 +3,11 @@
 
 import Foundation
 
-// Source: Architecture Design -> WineVersionManager -> catalog and source selection
+// Source: Architecture Design -> ADR 037 -> fixed catalog entry
 extension WineVersionManager {
     // MARK: - 获取可用版本列表
 
-    /// 从当前用户选择的、产品批准来源获取目录。
-    /// API/Release metadata 失败不会切换来源，也不会改变已安装运行时。
+    /// Reads and validates the single product-approved catalog entry.
     public func fetchAvailableVersions() async throws -> [WineVersionInfo] {
         // Source: QA Report → F-003 — 60 分钟内存缓存
         if let cached = cachedVersions, let timestamp = cacheTimestamp {
@@ -18,8 +17,8 @@ extension WineVersionManager {
             }
         }
 
-        guard let source = BuiltInWineVersions.sourceDescriptor(for: selectedSourceID) else {
-            throw VersionManagerError.sourceInvalid(selectedSourceID)
+        guard let source = BuiltInWineVersions.sourceDescriptor(for: BuiltInWineVersions.officialSource.sourceID) else {
+            throw VersionManagerError.sourceInvalid("缺少固定 Wine 来源")
         }
         let operationID = UUID()
         await logWriter.record(.init(
@@ -42,7 +41,7 @@ extension WineVersionManager {
 
             let versionsDir = await wineVersionsDirectory()
             let versions = releases.compactMap { release -> WineVersionInfo? in
-                guard Self.managedWineTags.contains(release.tagName) else { return nil }
+                guard release.tagName == Self.fixedRuntimeTag else { return nil }
                 guard let asset = release.assets.first(where: {
                     $0.name.hasSuffix(".tar.xz") && source.supportsAssetName($0.name)
                 }) else { return nil }
@@ -69,7 +68,7 @@ extension WineVersionManager {
                     policyRevision: source.policyRevision,
                     assetName: asset.name,
                     isDownloaded: isDownloaded,
-                    isSelected: selectedVersionTag == release.tagName
+                    isSelected: runtimeRecord?.identity == release.tagName
                 )
             }
 
@@ -171,28 +170,62 @@ extension WineVersionManager {
         cachedVersions ?? []
     }
 
-    // MARK: - 版本选中
-
-    /// 选中指定版本为当前生效版本
-    /// - Parameter tagName: 版本标签名
-    public func selectVersion(tagName: String) async throws {
-        guard Self.managedWineTags.contains(tagName) else {
-            throw VersionManagerError.versionNotFound(tagName)
-        }
-        guard installedVersionTags.contains(tagName) else {
-            throw VersionManagerError.versionNotFound(tagName)
-        }
-
-        selectedVersionTag = tagName
-        var appData = try await persistenceStore.readAppData()
-        appData.selectedWineVersion = tagName
-        try await persistenceStore.writeAppData(appData)
-        await logWriter.info("Wine 版本已选中: \(tagName)", module: "WineVersionManager")
+    /// Clears only in-memory catalog metadata. It never deletes a runtime,
+    /// prefix, or cache file.
+    public func clearCatalogCache() {
+        cachedVersions = nil
+        cacheTimestamp = nil
     }
 
-    /// 获取当前选中的版本标识
+    // MARK: - 版本选中
+
+    /// Compatibility entry point. The fixed runtime has no selectable version;
+    /// this succeeds only when the fixed runtime is already installed.
+    public func selectVersion(tagName: String) async throws {
+        guard tagName == Self.fixedRuntimeTag else {
+            throw VersionManagerError.versionNotFound(tagName)
+        }
+        guard runtimeRecord != nil else {
+            throw VersionManagerError.versionNotFound("固定 Wine 尚未安装")
+        }
+        selectedVersionTag = tagName
+    }
+
+    public func globalWineVersion() -> String? {
+        runtimeRecord?.identity
+    }
+
+    /// 获取当前选中的全局版本标识（无 Game 上下文语义）。
     public func getSelectedVersionTag() -> String? {
-        return selectedVersionTag
+        runtimeRecord?.identity
+    }
+
+    public func wineVersionOverride(for gameID: String) -> String? {
+        nil
+    }
+
+    /// Resolves every game to the same fixed runtime. Legacy overrides are
+    /// intentionally ignored, including values decoded from older AppData.
+    public func effectiveVersion(for gameID: String) -> String? {
+        _ = gameID
+        return globalWineVersion()
+    }
+
+    /// The per-game Wine product path was removed. Keep this compatibility seam
+    /// explicit so old callers cannot silently reintroduce it.
+    public func setWineVersionOverride(gameID: String, tagName: String) async throws {
+        _ = gameID
+        _ = tagName
+        throw VersionManagerError.sourceInvalid("按游戏选择 Wine 已移除")
+    }
+
+    /// Removes only the target Game's override so it falls back to global.
+    public func removeWineVersionOverride(gameID: String) async throws {
+        _ = gameID
+    }
+
+    public func selectVersion(tagName: String, for gameID: String) async throws {
+        try await setWineVersionOverride(gameID: gameID, tagName: tagName)
     }
 
     public func getSelectedSourceID() -> String {
@@ -200,30 +233,14 @@ extension WineVersionManager {
     }
 
     public func availableSourceDescriptors() -> [BuiltInWineVersions.SourceDescriptor] {
-        BuiltInWineVersions.approvedSources
+        [BuiltInWineVersions.officialSource]
     }
 
-    /// Changes only the source identity. The previous source remains active if
-    /// persistence or policy validation fails.
+    /// Source selection was removed. The fixed approved source is the only
+    /// accepted value and changing it is never persisted.
     public func selectSource(sourceID: String) async throws {
-        guard let source = BuiltInWineVersions.sourceDescriptor(for: sourceID) else {
-            throw VersionManagerError.sourceInvalid(sourceID)
-        }
-        let previous = selectedSourceID
-        do {
-            var appData = try await persistenceStore.readAppData()
-            appData.selectedWineSource = source.sourceID
-            try await persistenceStore.writeAppData(appData)
-            let verified = try await persistenceStore.readAppData()
-            guard verified.selectedWineSource == source.sourceID else {
-                throw VersionManagerError.persistenceFailed("Wine 来源写回后重读不一致")
-            }
-            selectedSourceID = source.sourceID
-            cachedVersions = nil
-            cacheTimestamp = nil
-        } catch {
-            selectedSourceID = previous
-            throw error
+        guard sourceID == BuiltInWineVersions.officialSource.sourceID else {
+            throw VersionManagerError.sourceInvalid("Wine 来源选择已移除")
         }
     }
 

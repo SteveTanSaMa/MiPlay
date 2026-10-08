@@ -1,285 +1,447 @@
 # MiPlay 领域模型
 
-> **文档状态**：已冻结（Phase 3；当前修订基线见 `architecture-revision-2026-08-03.md`）
-> **更新日期**：2026-08-03
-> **原则**：领域对象表达业务事实；任务、权限、执行过程和持久化恢复不能互相冒充。
+> **文档状态**：活跃（Active）
+> **领域阶段**：Domain Model
+> **更新日期**：2026-08-27
+> **继承自**：UX Information Model、Product Domain
 
-## 1. 聚合边界
+## 1. 领域模型原则
 
-```text
-GameLibrary
-├── Game × 3
-│   ├── GameLocation
-│   ├── GameMetadata
-│   ├── PerGameSettings
-│   ├── BackgroundGroup selection
-│   ├── IntegrityCheckResult
-│   └── SolutionApplication × N
-└── Game business state
+本领域模型描述 MiPlay 的业务实体、它们之间的关系、状态转换规则和生命周期约束。**本模型不定义任何 Swift 代码实现**，而是为 Implementation Agent 提供领域面的契约。
 
-RuntimeCatalog
-├── ManagedWineRuntime × N
-├── RuntimeSourcePolicy / RuntimeSourceResult
-└── selected managed runtime / source selection
+### 1.1 实体与值对象
 
-TaskCatalog
-└── Task × N
+- **实体（Entity）**：具有唯一标识（ID），且对象意义在其生命周期中持续存在，例如 `Game`、`Task`、`SolutionApplication`。
+- **值对象（Value Object）**：没有独立标识，其意义由属性值决定，例如 `GameLocation`、`VersionCode`、`PermissionAccess`。
+- **聚合（Aggregate）**：若干领域对象组成的边界，保证所在边界内的状态变更在一个事务里。当前核心聚合有 `GameAggregate`、`RuntimeAggregate`。
 
-AppDataRecovery
-└── schema, settings, bookmark records, task recovery metadata
+### 1.2 不变性约束
+
+- 所有**持久化实体**必须处于 `persisted` 状态后才对外可见。
+- 状态为 `recoveryRequired`、`recoveryCommitPending` 等遇到未消除副作用时，不得发布 `running`、`installed`、`WineReady` 等成功事实。
+- 任何**不可信数据源**出现冲突，不能覆盖可信数据源。
+
+## 2. 核心领域对象
+
+### 2.1 Game (游戏)
+
+- `gameId`：String，三位固定游戏标识（`genshin`、`hkrpg`、`zzz`）
+- `displayName`：String，显示名称（原神、星穹铁道、绝区零）
+- `executablePath`：GameLocation，可执行的授权路径（游戏目录）
+- `manifest`：IntegrityManifest？可选，游戏完整性清单
+- `installationStatus`：GameInstallStatus，安装状态枚举
+- `launchStatus`：GameLaunchStatus，启动状态枚举
+- `readiness`：RuntimeReadiness，运行环境就绪度
+
+**重要**：一个 Game 实体对应用对应一个可执行的 `Domain service` 与 `GameStateMachine`。
+
+### 2.2 GameLocation (游戏路径授权)
+
+**值对象**，表示用户对游戏目录的选择和授权事实。
+
+- `securityScopedBookmark`：Data，security-scoped resource 的持久化凭据
+- `establishedPath`：String，已解析的实际文件系统的绝对路径（仅在当前访问作用域内有效）
+- `expirationDate`：Date？可选，用于检查 stale 需要刷新（当前通过 `stopAccessingSecurityScopedResource` 的窗口）
+- `lastKnownPath`：String？可选，仅用于错误提示和迁移，不是授权证据。
+
+**安全边界**：任何时候都需要在作用域内 `startAccessingSecurityScopedResource`，工作完成后 `stopAccessing...()`。
+
+### 2.3 Task (任务)
+
+任务表示一次耗时的异步操作的生命周期。它与 `UserIntent` 关联但并不等同。
+
+- `taskId`：UUID
+- `userIntentId`：UUID? 可选，用户发起意图的引用
+- `kind`：TaskKind，任务类型（`GameLaunch`, `IntegrityVerification`, `VersionCheck`, `SolutionApply`, `SolutionRevert`, `WineRuntimeSetup` 等）
+- `projectId`：String? 可选，标识相关的项目或游戏
+- `status`：TaskStatus（`pending`, `running`, `completed`, `failed`, `cancelled`）
+- `phase`：String, 当前执行阶段（如“检查游戏文件”、“下载 runtime”、“应用方案”、“安装 wine”等）
+- `progress`：TaskProgress？可选，如果有确定数值
+- `startedAt`：Date?，实际开始时间
+- `endedAt`：Date?，实际结束时间（仅当 `completed/failed/cancelled`）
+- `outcome`：TaskOutcome? 任务产生的业务结果（需要与 `status` 分开读取）
+- `error`：TaskError? 失败原因和面向用户的解释
+- `recovery`：TaskRecovery? 当前推荐动作、可重试条件和是否已验证
+
+**Task 状态语义**：
+- `pending`：已接受请求但尚未开始执行。不得使用“正在应用”“已启动”或“已完成”。
+- `running`：已开始执行，必须能说明正在处理的阶段。
+- `completed`：任务达到定义的成功门槛，或对“校验/比较”任务已经获得可信结果；业务结果仍需单独读取。
+- `failed`：请求目标未达成，或无法获得可信结果。不得把目标对象提升为成功状态。
+- `cancelled`：取消请求已处理，且需要的清理或回滚已验证；未验证时使用 `failed`。
+
+### 2.4 LaunchOutcome (启动结果)
+
+游戏启动任务的结果，不把进程创建当作成功。
+
+**可能的值**：
+- `runningConfirmed`：进程存在且达到可运行判定，“游戏已启动”
+- `preflightRejected`：文件、权限、完整性或环境前置不满足，“启动尚未执行”
+- `runtimePreparationFailed`：运行环境获取或准备失败，“游戏未启动”
+- `processStartFailed`：未创建可运行进程，“启动失败”
+- `processTimeout`：在确认期限内未确认进程，“启动超时，清理状态待确认”
+- `processExitedAbnormally`：进程异常退出，“游戏因异常退出结束”
+- `cancelledCleanly`：取消后无残留且清理验证通过，“启动已取消”
+
+**注意**：此结果与 `GameLaunch` task 同时存在，`task.status` 为 `completed`，但 `outcome` 可能是不同的失败事实。
+
+### 2.5 PermissionAccess (权限访问事实)
+
+描述 MiPlay 对用户选择路径或系统资源的访问事实。
+
+- `granted`：当前任务可以读取/修改声明的资源
+- `expired`：曾经允许，但当前授权不能继续使用
+- `denied`：用户或系统拒绝访问
+- `unavailable`：目标资源或授权能力不存在
+- `verifiedAfterReauthorization`：重新授权后实际读写验证通过
+
+### 2.6 IntegrityCheckResult (完整性校验结果)
+
+- `IntegrityPassed`：非空、版本对应 manifest，全部条目通过
+- `IntegrityFailed`：有效 manifest 中出现缺失或内容不匹配
+- `IntegrityUnsupported`：manifest 缺失、为空、版本不对应或无法验证
+- `executionFailed`：路径权限、I/O 或读取错误阻止校验
+- `cancelled`：用户在完成前取消
+
+### 2.7 VersionCheckResult (版本检测结果)
+
+- `current`：本地和官方版本均获得且相等
+- `updateAvailable`：本地和官方版本均获得且不同
+- `unknown`：没有足够数据判断
+- `failed`：网络、官方服务、本地文件或解析失败
+
+### 2.8 SolutionApplication (方案应用)
+
+描述一次兼容方案应用的生命周期。
+
+状态：
+- `Unavailable`：资源、适用范围或权限能力不满足
+- `Applying`：已确认，正在快照、修改或验证
+- `Applied`：修改、后置验证、记录保存和恢复快照均满足
+- `Failed`：执行/验证失败，或回滚未确认
+- `RolledBack`：恢复到应用前状态且读回一致
+
+**核心规则**：`Applied` 不表示游戏已启动；`RolledBack` 不表示应用成功；备份成功不改变上述状态。
+
+### 2.9 RuntimeReadiness (运行环境就绪度)
+
+面向用户使用“运行环境”，技术细节可进入日志。当前唯一 runtime 是 `wine-crossover-11.0-1-signed`，三款游戏共用同一个 MiPlay 管理的 prefix。
+
+#### 2.9.1 BackgroundGroupSelectionState（背景组选择状态）
+
+记录用户背景预览的临时事实，不影响持久化选择。
+
+状态：
+- `idle`：无 hover 任何候选组
+- `dotsHidden`：顶部区域无指针，圆点隐藏
+- `dotsVisible`：指针进入顶部区域，候选圆点可见
+- `hoverPreview(groupID)`：hover 候选组
+- `previewLoading(groupID)`：未缓存且允许加载
+- `previewFailed(groupID)`：预览加载失败
+- `selected(groupID)`：用户明确提交且资源验证、选择写回、重读通过
+
+**重要**：`hoverPreview`、`previewLoading` 和 `previewFailed` 不得改变 `selectedBackgroundGroupID`，不得写持久化，不得删除任何背景缓存。只有 `selected(groupID)` 是持久化选中终态。
+
+#### 2.9.2 ManagedWineState（托管 Wine 状态）
+
+固定 runtime 的安装事实与共享 prefix 的运行事实是两个独立状态对象。
+
+**固定 runtime 安装事实**：
+- `NoManagedRuntime`：固定 runtime 未形成可复核安装事实
+- `Downloading`：固定 Release 正在获取
+- `ArtifactReady`：固定 Release 已完整获取并通过校验
+- `Installing`：托管安装、executable 验证或提交正在进行
+- `Installed`：安装提交、身份复核和持久化重读均通过
+- `InstallFailed`：安装身份、提交、重读或清理失败
+- `RuntimeUnavailable`：固定资源、批准来源、架构或托管事实无法确认
+- `RecoveryRequired`：产生副作用但清理/恢复尚未确认
+
+**共享 prefix 事实**：
+- `PrefixUnset`：固定 runtime 已安装但唯一 prefix 尚未初始化
+- `PrefixPreparing`：初始化、更新或验证正在进行
+- `PrefixReady`：唯一 prefix 的身份、内容和准备结果均通过
+- `PrefixNotReady`：初始化、更新或验证失败
+- `RecoveryRequired`：prefix 副作用或状态无法确认
+
+**prefixOccupancy**：独立保护事实：`free`、`busy` 或 `unknown`。`busy` 表示等待当前 Wine 使用结束。
+
+**目标游戏 readiness**：
+- `WineReady`：固定 runtime 已安装、共享 prefix 已就绪、目标游戏路径/manifest/启动前置通过
+- `RuntimeNotReady`：固定 runtime 或共享 prefix 未通过门槛
+- `GamePreflightFailed`：runtime/prefix 已就绪，但目标游戏自身路径、manifest、兼容方案或启动前置失败
+- `RecoveryRequired`：共享 runtime/prefix 的恢复未确认
+
+**注意**：`WineReady` 不是"Wine 已安装"的别名。共享 prefix 已就绪后，三款游戏仍须分别取得自己的游戏 readiness。
+
+#### 2.9.3 DeviceInfo（设备信息）
+
+- 机型、芯片、内存、macOS 版本（主层级字段）
+- model identifier、build number（详情字段）
+- Wine 目标卷空间（独立只读行）
+
+字段状态：
+- `fieldConfirmed`：字段为系统报告值
+- `fieldUnknown`：系统报告未提供
+- `fieldFailed`：无法读取字段
+- `fieldStale`：显示上一次已确认值
+- `diskSpaceUnavailable`：无法读取 Wine 目标卷空间
+
+### 2.10 AppDataRecovery（应用数据恢复）
+
+描述应用数据恢复过程的结果。
+
+状态：
+- `readable`：应用数据可读取
+- `backupCreated`：原始数据已保护
+- `restoreAvailable`：找到可读备份
+- `restoredAndVerified`：备份恢复后重新读取通过
+- `migrationRequired`：旧格式可读但需迁移
+- `migratedAndVerified`：迁移后重新读取和结构校验通过
+- `recoveryFailed`：恢复/迁移后仍无法验证
+- `freshStartConfirmed`：用户明确放弃不可恢复数据并确认重新开始
+
+### 2.11 ErrorRecord（错误记录）
+
+每条 P0/P1 错误至少应表达以下信息：
+
+- 目标：哪款游戏、哪项方案、哪个路径或哪份数据
+- 阶段：排队、校验、授权、执行、进程确认、后置验证或恢复
+- 原因类别：网络、权限、文件、manifest、运行环境、进程、数据或用户取消
+- 副作用事实：是否已写入、是否创建进程、是否有残留或是否未改变目标
+- 当前结果：业务结果和任务状态
+- 恢复动作：唯一推荐的下一步及前置条件
+- 验证事实：恢复/清理是否已读回确认
+
+### 2.12 ManagedWineAcquisitionResult（托管 Wine 获取结果）
+
+固定 runtime 的资源检查是对一个产品固定目标的获取结果。
+
+状态：
+- `checking`：正在检查固定 Release 资源
+- `artifactAvailable`：固定身份、批准来源、架构和资源映射可验证
+- `artifactUnavailable`：固定资源暂时不可达、服务失败或资源不存在
+- `artifactInvalid`：资源身份、重定向、格式或校验不匹配
+- `artifactDownloaded`：固定资源完整获取并通过内容校验
+- `installationVerified`：托管安装、executable 身份、持久化提交和重读均通过
+- `prefixVerified`：唯一共享 prefix 初始化和验证通过
+- `recoveryRequired`：清理、安装或 prefix 状态无法确认
+
+### 2.13 LocalGameEvidence（本地游戏证据）
+
+- `pkg_version`：经格式、目标游戏、安装位置和版本语义验证后的本地版本候选
+- `config.ini`：经格式验证的渠道/来源/配置元数据候选
+- `IntegrityManifest`：游戏身份、客户端版本、必需条目和内容校验依据
+- 官方远程版本：官方最新版本候选
+
+**组合结果**：
+- 本地版本可验证 + 远程版本可验证 → `VersionCheck completed + current/updateAvailable`
+- manifest 可验证且全条目通过 → `IntegrityPassed`
+- 任一来源缺失或无法解析 → `VersionCheck failed` 或 `IntegrityUnsupported`
+- 来源之间冲突 → 不得发布 `current`、`IntegrityPassed` 或 `Running`
+
+### 2.14 LocationRecoveryFact（路径恢复事实）
+
+- `locationFresh`：游戏路径授权有效
+- `locationStaleRefreshing`：正在刷新游戏路径授权
+- `locationRefreshCommitted`：游戏路径授权已刷新并保存
+- `locationRefreshPersistenceFailed`：路径授权已刷新但尚未保存，本次操作未完成
+- `locationAccessDenied`：无法访问所选游戏路径
+- `recoveryRequired`：路径授权恢复未完成，暂时不能继续
+
+### 2.15 RestartRecoveryFact（重启恢复事实）
+
+- `persistedRunningNoProcess`：重启发现 Game 持久 `Running`，但无可信活动进程
+- `recoveryCommitPending`：退出事实已知但目标终态尚未提交
+- `recoveryCommitted`：进程退出确认、目标终态和记录均重读通过
+- `recoveryPersistenceFailed`：AppData 和恢复记录都无法提交
+
+### 2.16 AccessibilityProjection（辅助功能投影）
+
+从 Domain/ViewModel 状态生成的语义对象，不是视觉层推断结果。
+
+- `role`：button、progressIndicator、status、group 或其他标准角色
+- `label`：稳定的对象和动作
+- `value`：选中态、业务状态、任务状态、阶段、真实进度或“进度未知”
+- `hint`：激活后的结果或当前可执行动作
+- `enabled`：当前动作是否可执行
+- `busy`：是否仍在查询、执行、验证或恢复
+- `recoveryAction`：当前唯一适合的恢复动作及前置条件
+- `announcement`：状态从 pending/running 到可信终态时的完整事实
+
+## 3. 领域关系图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        GameAggregate                         │
+│  gameId, displayName, installStatus, launchStatus, readiness│
+│  + GameLocation (value object)                               │
+│  + IntegrityManifest (value object)?                        │
+└─────────────────────────────────────────────────────────────┘
+                           ↕ composed
+┌─────────────────────────────────────────────────────────────┐
+│                       RuntimeAggregate                       │
+│  ManagedWineState + PrefixState + ReadinessGen                │
+└─────────────────────────────────────────────────────────────┘
+                           ↕ associated
+┌─────────────────────────────────────────────────────────────┐
+│                          Task                                 │
+│  taskId, kind, status, phase, progress, outcome, error        │
+└─────────────────────────────────────────────────────────────┘
+
+关联：
+- Game 可以有多个 Task 生命周期的记录
+- Game 有一个当前的 RuntimeReadiness
+- Task 有一个 consider ability 的结果事实 LaunchOutcome / IntegrityCheckResult 等
+- 某些专用事实如 LocationRecoveryFact、RestartRecoveryFact、SolutionApplication 与特定 Task 或 Game 紧密相关
 ```
 
-- `GameRegistry` 是 GameLibrary 的唯一业务状态所有者。
-- `WineVersionManager` 是 RuntimeCatalog 的唯一决策者。
-- `TaskScheduler` 是 TaskCatalog 的唯一状态所有者。
-- `PersistenceStore` 只拥有持久化字节，不拥有上述业务状态；Domain 在读取后验证并恢复聚合。
-- 聚合之间通过稳定 ID 和不可变值关联，不持有对方的可变对象引用。
+## 4. 聚合边界与不变性
 
-## 2. Game
+### 4.1 GameAggregate (游戏聚合)
 
-### 2.1 身份和属性
+**根实体**：`Game`
 
-三款固定 Game 的稳定 ID 为 `GenshinImpact`、`HonkaiStarRail`、`ZenlessZoneZero`。Game 的业务字段如下：
+**边界内对象**：
+- `GameLocation`
+- `CurrentReadiness` (RuntimeReadiness)
+- `LaunchOutcome` (最近启动的结果)
+- `SolutionApplication` (最近一次方案应用)
+- `IntegrityCheckResult` (最近一次完整性校验)
 
-| 字段 | 语义 | 持久化 |
-|---|---|---|
-| `id/type` | 唯一游戏身份和固定游戏类型 | 是 |
-| `location` | bookmark 授权、最后已知路径和授权状态 | 是；bookmark 为权威 |
-| `businessState` | `PathUnset`、`NotInstalled`、`Installed`、`UpdateAvailable`、`Launching`、`Running`、`LaunchFailed` | 是；`Launching/Running` 重启时不直接恢复 |
-| `version` | 已验证的本地客户端版本 | 是 |
-| `lastIntegrity` | 最近一次完整性事实及时间 | 是 |
-| `lastLaunchDate` | 最近一次被确认启动的时间 | 是 |
-| `solutionApplications` | 方案应用记录 ID 和状态 | 是 |
+**不变性约束**：
+- 一个 `Game` 在同一时间只能有一个“未清除副作用”的任务状态（例如 `recoveryRequired`）
+- `launchStatus` 不能直接跳转到 `Running`，必须经过 `launchOutcome.runningConfirmed`
+- 游戏路径（`GameLocation`）失效应阻止 `installed` 和 `launchable` 状态
 
-`Game` 不保存任务的 `pending/running` 作为自身状态。启动任务正在排队只表示 Task 状态，不能把 Game 提前改为 `Launching`；进入启动执行阶段后才允许转换为 `Launching`。
+### 4.2 RuntimeAggregate (运行环境聚合)
 
-### 2.2 业务状态不变量
+**根实体**：`ManagedWineState`（包含安装事实与共享 prefix）
 
-- 没有可用 `GameLocation` 时只能是 `PathUnset` 或 `NotInstalled`，不能是 `Installed`、`Launching` 或 `Running`。
-- `Installed` 至少需要路径可访问和启动前已知前提满足；完整性 `Unsupported` 不可伪装成 `IntegrityPassed`。
-- `Launching` 只由已开始执行的 `GameLaunch` 任务进入。
-- `Running` 只由进程确认事件进入；创建 `Process` 或 `wine` 返回不够。
-- 正常退出回到重新评估后的 `Installed`/`UpdateAvailable`；异常退出进入 `LaunchFailed`，除非后置检查得出其他可信结果。
-- 启动前失败不提升 Game；它只保存失败事实和恢复动作。
+**边界内对象**：
+- `RunningEnvironmentState`（安装事实）
+- `SharedPrefixState`（共享 prefix 状态）
+- `GameReadiness`（每个 Game 的 readiness）
+- `BackgroundGroupSelection`（当前选中的背景组）
 
-### 2.3 GameMetadata
+**不变性约束**：
+- `WineReady` 必须同时满足：`Runtime.installed == true` 且 `PrefixState.ready == true` 且 `GamePreflightPassed`
+- 任何 `RecoveryRequired` 状态会阻止发布任何成功事实
 
-`GameMetadata` 归属单一 Game ID，是 scoped 读取后的不可变 evidence snapshot，而不是一个可自由填写的版本对象。它保存 location revision、读取时间、原始 `config.ini` section/key/value、`pkg_version` JSON Lines 条目、关联 manifest/远程版本证据、解析状态和冲突原因。
+## 5. 领域服务职责
 
-- `config.ini` 只保留原始字段和值；不得推断 `channel`、`cps` 或 `sub_channel` 的友好含义。
-- `pkg_version` 只保留 `remoteName/fileSize/md5` 和解析状态；不单独产生完整性或官方版本结论。
-- 非空且与 Game/client version 对应的 manifest 是 `IntegrityPassed` 的必要门槛。
-- 未知字段、`wpf_version`、单独的 `game_version` 或空 manifest 不产生可信事实；冲突时保留上一可信结果并记录 `versionEvidenceConflict`。
+### 5.1 GameRegistry（游戏注册中心）
 
-### 2.4 PerGameSettings 与 BackgroundGroup
+- 维护三款固定 Game 实体
+- 管理 GameLocation 的持久化和 scoped 访问
+- 提供只读的 read-only snapshot 给其他服务
 
-`PerGameSettings` 按 Game ID 保存 metadata 展示状态、性能/兼容入口状态、当前背景组 ID 和失败/恢复事实引用。全局 Wine source selection 不得写入此记录。读取、保存、取消和失败均保留上一已提交值，不能用默认值覆盖旧事实。
+### 5.2 GameStateMachine（游戏状态机）
 
-`BackgroundGroup` 绑定 Game ID、组 ID、版本、source identity、图片/视频/theme/装饰资源身份、资源验证和缓存状态。目标组加载或选择提交失败时保留上一有效组，不静默切到其他组；背景结果不改变 Game 的安装、完整性、运行或启动状态。单组不形成无意义的选择状态。
+- 定义 `GameInstallStatus` 和 `GameLaunchStatus` 及合法转换
+- 校验从 Infrastructure 返回的结果是否符合转换规则
+- 发送领域事件通知状态变更
 
-## 3. GameLocation 与 security-scoped bookmark
+### 5.3 LaunchOrchestrator（启动编排器）
 
-### 3.1 持久化记录
+- 协调 PreLaunchValidator、ProcessManager、WineRuntimeProvider
+- 记录 `LaunchOutcome`
+- 处理启动失败后的恢复（clean up，recovery）
 
-每款游戏最多一个当前定位记录。记录包含：
+### 5.4 SolutionEngine（方案引擎）
 
-| 字段 | 规则 |
-|---|---|
-| `gameID` | 关联固定 Game |
-| `bookmarkData` | 使用读写 scope 创建时的 bookmark `Data`；JSON 编码为标准 Codable 数据表示 |
-| `lastKnownPath` | 最近一次解析出的路径，仅用于显示、诊断和迁移，不可单独授权 |
-| `scope` | `readOnly` 或 `readWrite`，反映实际创建的授权范围 |
-| `resolutionState` | `missing`、`resolvable`、`stale`、`accessDenied`、`resourceUnavailable`、`migrationRequired` |
-| `lastResolvedAt` | 最近一次解析时间 |
-| `bookmarkVersion` | 记录格式版本，不等同于 AppData schema 版本 |
+- 检查方案能力（Resource、权限、适用范围）
+- 执行方案应用流程（snapshot → modify → verify → commit）
+- 处理失败回滚（不可取消）
 
-裸 `installPath` 只存在于旧 schema 迁移输入中。新 schema 不把它作为可用 GameLocation。
+### 5.5 TaskScheduler（任务调度器）
 
-### 3.2 生命周期
+- 接收任务请求
+- 管理任务排队、互斥执行
+- 跟踪任务状态、进度、取消
+- 发布任务事件
 
-```text
-用户选择目录
-  → 创建 bookmark
-  → 原子保存 bookmark + lastKnownPath
-  → 解析并 startAccessing
-  → 在 scope 内验证目录和可执行文件
-  → 产生路径/完整性业务结果
-  → stopAccessing
+## 6. 领域事件流
+
+### 6.1 启动事件流
+
+```
+UserIntent → Task created (pending)
+TaskScheduler: assigned → running → phase update
+LaunchOrchestrator: prepares runtime, calls ProcessManager
+ProcessManager: start process → running process
+LaunchOrchestrator: confirm process within TTL
+GameStateMachine: transition to Running
+TaskScheduler: completed + outcome.runningConfirmed
+AccessibilityProjection: announce success
 ```
 
-- 解析返回 stale 时，可以在有效 scope 内完成内部读取以判断是否需要恢复，但必须在本次作用域结束前重新创建并持久化 bookmark；刷新提交未验证前，不得发布新的完整性、版本或启动成功结果。
-- 解析失败、用户撤销权限、卷不可用或目录被删除均保留最近路径用于提示，但不允许文件操作。
-- scope 只覆盖当前异步操作。不得在 App 启动时无限期保持访问，也不得把 path 字符串传给下游替代 scope。
-- 方案涉及游戏目录读写时，快照、修改、验证和回滚必须在同一个有效读写 scope 内完成。
+### 6.2 启动失败事件流
 
-### 3.3 旧 path 迁移
-
-旧数据被视为 schema 1：`Game.installPath` 是裸路径，没有可验证的持久授权。
-
-1. 读取旧数据后创建 `.bak`，不覆盖原文件。
-2. 将每个裸路径转换为 `migrationRequired` 记录，并保留 `lastKnownPath`；不自动生成 bookmark，不把文件存在当成授权。
-3. UI 要求用户重新选择对应目录。用户选择成功后创建 bookmark，在 scope 内确认游戏可识别，再原子写入 schema 2。
-4. 新数据重新读取并验证通过后，才移除旧 `installPath` 的业务作用；原始备份保留到下一次成功写入策略定义的轮换点。
-5. 任一迁移失败都保留旧文件和备份，Game 不变为已接入；用户可以重试、选择其他备份或明确重新开始。
-
-### 3.4 消费者统一提交
-
-解析结果不是只读 URL，而是一次 `ScopedGameLocationAccess`：包含解析 URL、更新后的 `GameLocation`、是否检测到 stale、scope lease 和刷新提交状态。定位、完整性、版本检查、启动前校验和启动编排都必须消费这一结果。
-
-- stale bookmark 在有效 scope 内重新创建 bookmark，并把新 Data 作为候选 location。
-- `GameRegistry` 在消费者发布自己的业务结果前提交候选 location；写入和重读成功后，候选 location 才成为新的持久授权事实。
-- 刷新提交失败时，旧 location 保留为 `stale`，附加 `recoveryRequired` 记录；本次消费者结果不得升级为 completed、IntegrityPassed、current/updateAvailable、Installed 或 Running。
-- 重试是新的 UserIntent/Task。若反复无法刷新，恢复动作是重新选择目录，不允许回退到 `lastKnownPath`。
-
-## 4. WineRuntime 与启动命令
-
-### 4.1 RuntimeCatalog
-
-`ManagedWineRuntime` 记录版本 ID、来源身份、归档校验事实、安装目录、`bin/wine` 可用性和就绪状态。当前版本只有 MiPlay 托管副本可以进入 RuntimeCatalog 的可用集合。
-
-`RuntimeSourcePolicy` 记录 Product allowlist、目标架构、来源身份、API/Release metadata/asset URL 规则、版本/asset 身份和认证模式。官方 GitHub 是默认 source；用户可以主动选择 allowlist 中的预置镜像。来源失败不自动切换，用户 URL、token 和未知 redirect 不进入策略。
-
-`RuntimeSourceResult` 是版本目录查询结果，不是 Task.status 或 `WineReady`：
-
-- `availableManagedVersions`：目录、allowlist、架构和 asset 身份均验证通过；
-- `noAvailableManagedVersion`：来源响应有效但没有匹配版本；
-- `networkFailure`：当前用户选择的来源不可达、超时或限流；
-- `sourceConfigurationError`：allowlist、URL、认证策略或镜像配置无效；
-- `catalogInvalid`：响应格式、来源身份或资源映射无法验证；
-- `sourceForbidden`：API 或 asset 被当前来源拒绝，记录 source/status，不产生可用 runtime。
-
-生效路径决策固定为：
-
-1. 用户选中的、由 MiPlay 托管且校验通过的版本存在，并且 `bin/wine` 可执行；
-2. 否则为 `WineNotReady`；不得使用系统 Wine、Whisky、CrossOver 或任意用户路径回退。
-
-`WineVersionManager` 负责 source selection、API/Release metadata 目录、独立 asset 下载、托管版本选择和就绪判定；`WineRuntimeProvider` 只执行给定的托管路径，不能自行扫描或覆盖选择。
-
-### 4.2 LaunchCommand
-
-`LaunchCommand` 是一次启动前的不可变值，必须包含：
-
-| 字段 | 冻结规则 |
-|---|---|
-| `wineBinary` | 已验证的绝对 Wine binary 路径 |
-| `gameExecutable` | 已解析的绝对 Windows exe 路径，作为 Wine 参数第一项 |
-| `arguments` | 固定游戏参数和已启用性能选项产生的数组；不经过 shell 拼接 |
-| `workingDirectory` | 游戏目录的解析 URL/path，scope 由调用方持有 |
-| `environment` | 受控基础环境 + `WINEPREFIX` + 固定 DLL override + 允许的性能环境变量 |
-| `prefix` | `Application Support/MiPlay/WinePrefixes/<stableGameID>` |
-| `confirmationDeadline` | 由启动服务设定的确认期限，超时必须进入清理/失败流程 |
-
-冻结环境键：
-
-```text
-WINEPREFIX=<MiPlay Application Support>/WinePrefixes/<stableGameID>
-WINEDLLOVERRIDES=winemenubuilder.exe=d
+```
+Task created (pending) → running
+LaunchOrchestrator: preflight fails
+GameStateMachine: keeps original status (no change)
+TaskScheduler: failed + error details
+AccessibilityProjection: error + recovery action
 ```
 
-游戏进程的可执行文件不是 `Process.executableURL`；`Process` 执行的是 `wineBinary`，参数为 `[gameExecutable] + arguments`。prefix 准备使用同一 Wine binary 和 `WINEPREFIX`，以 `wineboot -u` 完成并验证 `drive_c` 存在。
+### 6.3 方案应用事件流
 
-## 5. CompatibilitySolution 与 SolutionApplication
-
-### 5.1 发布清单
-
-当前版本只有 `modify_hostname`（CS-01）进入条件能力检查。hosts 屏蔽（A-06/CS-02）、旧版反作弊替换（A-03/CS-03）和 Steam 白名单（A-02/CS-04）本轮 Deferred；`use_legacy_patch`（CS-05）为 Out of Scope。Deferred/Out of Scope 不得显示可应用、入队或进入 `Applied`。
-
-### 5.2 应用记录
-
-每次应用记录至少包含方案 ID、Game ID、应用前快照、目标资源、执行阶段、后置验证、回滚状态和时间。
-
-状态规则：
-
-```text
-Unavailable
-  → Applying
-      → Applied                 （修改、验证、记录保存、可恢复快照均确认）
-      → Failed + RolledBack     （失败且恢复读回一致）
-      → Failed + RecoveryUnknown（失败且恢复未确认）
+```
+UserIntent → Task created (Applying)
+SolutionEngine: check capability
+SolutionEngine: apply (snapshot then modify)
+SolutionEngine: verify
+Server: commit
+GameStateMachine: update SolutionApplication.AnApplied
+TaskScheduler: completed + outcome.Applied
 ```
 
-`Applied` 不表示游戏启动；备份成功、命令返回或任务 `completed` 都不能单独产生 `Applied`。修改开始后用户取消必须转入不可取消的恢复流程。
+## 7. 错误传播模型
 
-## 6. IntegrityCheckResult
+**Infrastructure Level**：返回 error enum，例如 `IOError.FileNotFound`。
 
-完整性结果由有效 manifest、游戏版本和 scoped 文件读取共同决定：
+**Domain Level**：将 Infrastructure error 封装为领域 error，例如 `LaunchFailed(reason: .runtimeNotReady)`。
 
-| 结果 | 进入条件 | 是否允许提升 Game |
-|---|---|---|
-| `IntegrityPassed` | manifest 非空、版本对应、全部条目通过 | 允许作为启动前提 |
-| `IntegrityFailed` | 有效 manifest 中有缺失/不匹配 | 不允许 |
-| `IntegrityUnsupported` | manifest 缺失、为空、版本不对应或无法确认 | 不允许 |
-| `ExecutionFailed` | 授权/I/O/读取阻止结论 | 不改变既有可信结果 |
-| `Cancelled` | 用户取消且没有新结论 | 保留上一次可信结果 |
+**ViewModel Level**：保持错误模型不变，只改变用户文案。
 
-完整性校验本身不修改游戏文件，不需要兼容方案式回滚。
+**UI Level**：展示错误事实 + 恢复动作，不猜测错误原因。
 
-## 7. Task 与 UserIntent
+**恢复流**：状态 `recoveryRequired` → 执行恢复 → 恢复验证 → 重回正常状态或 `failed`。
 
-`UserIntent` 表示用户提出的目标；`Task` 表示调度器接受并执行的过程。一个意图可以因冲突或权限失败没有产生成功结果，但不能把意图当作业务事实。
+## 8. 数据持久化契约
 
-Task 必须记录 task ID、intent ID、kind、Game/方案目标、优先级、创建/开始/结束时间、状态、阶段、可选进度、独立 outcome、错误、恢复动作、取消策略和持久化 revision。
+### 8.1 持久化的字段
 
-`TaskReceipt` 是任务被持久接受的证明，包含 task ID、intent ID、target、`pending`、事件 cursor、资源锁、取消策略和 `persistence=committed`。pending 持久化失败时不返回 Receipt，也不开始执行。
+- Game 的基本信息（displayName、gameId）
+- GameLocation（bookmark）
+- RuntimeReadiness 的持久化事实
+- 方案应用记录（Applied time, state）
+- 版本检测结果（缓存）
+- 设备信息（只读）
+- 通用的 AppData 配置
 
-当前任务类型为 `GameLaunch`、`SolutionApply`、`SolutionRevert`、`IntegrityVerification`、`VersionCheck`、`WineCatalogQuery`、`WineAssetDownload`、`BackgroundMediaLoad`、`LogExport`。API/Release metadata discovery 属于 `WineCatalogQuery`，asset bytes 属于 `WineAssetDownload`。`LogExport` 只生成已脱敏诊断 bundle，不产生任何 Game/Wine/solution 业务状态。路径定位不是独立业务成功状态；它由域命令记录授权和完整性事实，并可触发 `IntegrityVerification`。
+### 8.2 不持久化的临时状态
 
-## 7.2 LocalGameEvidence
+- `SymbolContext.Session`（调试）
+- `BackgroundGroupSelectionState` 的 `hoverPreview` / `previewLoading` 等临时状态
+- 任务的 `phase`、`progress`（可重新计算或从事件重放）
+- `recoveryRequired` 等保护性状态仅在内存+持久化表中短暂存在
 
-`LocalGameEvidence` 是一次有效 scoped access 内对本地元数据的不可变读取结果，不是 Game 业务状态。它必须带 Game ID、location revision、读取时间、解析状态和来源摘要。
+## 9. 约束与边界
 
-| 证据 | 领域字段 | 允许表达 | 禁止表达 |
-|---|---|---|---|
-| `pkg_version` | JSON Lines 条目：`remoteName`、`fileSize`、`md5`；非空/格式/映射结果 | 在目标 Game、安装位置和版本映射均验证后，作为文件条目和可选本地版本候选 | 单独证明完整性、官方最新版本或渠道 |
-| `config.ini` | `[General]` 的 `game_version`、`channel`、`sub_channel`、`cps`、可选 `sdk_version` | 本地版本候选、渠道/来源证据 | 单独证明文件完整性、官方最新版本或可启动 |
-| `IntegrityManifest` | Game、客户端版本、必需文件及字段声明的摘要 | 完整性校验的权威依据 | 官方服务器当前最新版本 |
+- 当前版本只管理三款固定游戏，不新增游戏类型的动态扩展
+- Wine 只有固定版本和共享 prefix，不允许用户选择
+- 不包含游戏安装、完整更新、任意参数修改、帧率解锁
+- `GameInstall`、`GameUpdate` 不是当前版本的调度任务
 
-`pkg_version` 的文件摘要算法按条目声明和既有事实使用文件大小 + MD5；不能把其他任务的 SHA-256/xxhash 代入。`config.ini` 的 `wpf_version` 没有当前批准语义，不读取为业务事实，也不生成该字段。
+## 10. 与 UI 的关系
 
-版本关联规则：先分别解析和记录来源，再用 Game ID、location revision、支持的渠道/版本映射和 manifest 进行关联。`config.ini.game_version`、可映射的 `pkg_version.remoteName`、manifest 版本和官方远程版本必须一致或满足明确的兼容规则；冲突时输出 `versionEvidenceConflict`，不得发布 `current`、`IntegrityPassed` 或 `Running`。`pkg_version` 为空/损坏或无法映射时保留诊断事实，但不能制造版本候选。
+- ViewModel 通过 `Game`、`Task`、`RuntimeReadiness`、`SolutionApplication` 等对象构建投影
+- UI 不创造状态，只从这些领域对象中读取事实
+- Accessibility Projection 从领域对象生成，不直接访问 UI 元素
 
-## 7.1 ProcessExitRecoveryRecord
+---
 
-这是持久化的恢复事实，不是新的 Game 业务状态，也不是额外的 Task.status。它至少包含 Game ID、launch session ID、Process identity（PID、启动时间和可验证的 executable/prefix 摘要）、退出码/信号（若有）、termination-confirmed、恢复来源（ProcessExit 或 restart reconciliation）、期望终态、已知副作用、恢复阶段、重试次数和最近错误。
+> **注意**：领域模型是静态的结构描述，具体状态转换规则和事务语义见 `architecture-state-ownership.md` 与 `architecture-communication.md`。
 
-生命周期：
-
-```text
-ProcessExitEvent
-  → termination record pending
-  → Game target state + termination record committed and re-read
-  → recovery cleared
-
-commit failure
-  → recoveryRequired + same-game lifecycle guard
-  → retry idempotent termination commit
-  → verified → new GameLaunch allowed
-```
-
-应用重启时，持久 `Running` 不能直接恢复为可用 Running：必须先以 Process identity 验证活动进程并重新接管，或确认进程不存在后建立 `restart reconciliation` recovery record。没有可用退出事实时，恢复提交采用保守的 `LaunchFailed`/`interruptedAfterRestart` 结果，不推断正常退出，也不自动启动。恢复记录或终态提交失败时，磁盘上的旧 Running 只能与持久 recovery record 一起保留，并继续阻止启动；不能只把内存投影改成其他状态。
-
-恢复命令只确认进程已退出并提交目标终态，不重新创建 Wine 进程。重复退出事件以 session ID 幂等。
-
-## 8. DomainEvent
-
-DomainEvent 是只追加、可排序、Sendable 的事实信封：
-
-| 字段 | 含义 |
-|---|---|
-| `sequence` | Domain 服务内单调递增序列 |
-| `occurredAt` | 领域事实产生时间 |
-| `kind` | `gameChanged`、`taskChanged`、`integrityChanged`、`solutionChanged`、`runtimeChanged`、`permissionChanged`、`recoveryChanged` |
-| `targetID` | Game、Task、方案或恢复会话 ID |
-| `revision` | 相关聚合版本 |
-| `payload` | 不可变结果值，不含 UI 文案或 ViewModel |
-| `persistence` | `committed`、`memoryOnly`、`recoveryRequired` |
-
-对需要持久化的业务改变，只有 `committed` 事件才能驱动“已应用/已接入”等持久状态投影。`memoryOnly` 只允许表达短暂运行事实，并在退出时重新评估。
-
-## 9. 领域不变量
-
-1. 任务状态和业务结果永不合并为一个布尔值。
-2. 授权事实、文件事实、进程事实、修改事实和恢复事实分别记录。
-3. 所有外部副作用都有可验证的完成门槛；无法读回即失败或恢复未确认。
-4. 领域对象只包含业务值，不包含 UI 文案、SwiftUI 类型、`Process` 或裸的非 Sendable 系统对象。
-5. 任何状态恢复失败都会阻止需要该状态的后续任务，而不是静默使用默认值。

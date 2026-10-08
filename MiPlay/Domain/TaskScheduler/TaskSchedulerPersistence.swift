@@ -12,11 +12,25 @@ extension TaskScheduler {
         if let gameID = task.gameId {
             switch task.type {
             case .solutionApply, .solutionRevert: keys.insert("game:\(gameID):files")
+            // Read-only evidence scans (version/integrity) keep their own
+            // domain: they must not hold the game's lifecycle key while a
+            // multi-minute pkg_version validation runs, or the game's launch
+            // and background-media tasks would wait behind them.
+            case .versionCheck, .integrityVerification: keys.insert("game:\(gameID):evidence")
+            // Media loading reads and writes only the app-owned media cache
+            // (per-game directories) and never touches game files or lifecycle
+            // state. Loads for different games run in parallel and overlap
+            // their download/transcode phases; repeated loads for the same
+            // game still deduplicate on the per-game key.
+            case .backgroundMediaLoad: keys.insert("game:\(gameID):media")
             default: keys.insert("game:\(gameID):lifecycle")
             }
         }
         if task.type == .solutionApply || task.type == .solutionRevert { keys.insert("systemModification") }
-        if task.type == .wineVersionDownload { keys.insert("wineRuntime") }
+        if task.type == .wineRuntimeSetup {
+            keys.insert("wineRuntime")
+            keys.insert("sharedWinePrefix")
+        }
         if task.type == .wineCatalogQuery {
             let source = task.context["sourceID"] ?? "officialGitHub"
             let policy = task.context["policyRevision"] ?? "2026-08-03"
@@ -101,28 +115,31 @@ extension TaskScheduler {
     }
 
     internal func persist(_ task: ScheduledTask) async throws {
-        var appData = try await persistenceStore.readAppData()
-        let record = PersistedTaskRecord(
-            id: task.id.id,
-            type: task.type.rawValue,
-            gameID: task.gameId,
-            status: task.state.rawValue,
-            phase: task.phaseDescription,
-            progress: task.progress,
-            outcome: task.outcome,
-            error: task.error,
-            recovery: task.recovery,
-            createdAt: task.createdAt,
-            startedAt: task.startedAt,
-            endedAt: task.endedAt,
-            intentID: task.intentID,
-            context: task.context,
-            resourceKeys: Array(resourceKeys(for: task)).sorted()
-        )
-        if let index = appData.taskHistory.firstIndex(where: { $0.id == record.id }) { appData.taskHistory[index] = record }
-        else { appData.taskHistory.append(record) }
         do {
-            try await persistenceStore.writeAppData(appData)
+            let record = PersistedTaskRecord(
+                id: task.id.id,
+                type: task.type.rawValue,
+                gameID: task.gameId,
+                status: task.state.rawValue,
+                phase: task.phaseDescription,
+                progress: task.progress,
+                outcome: task.outcome,
+                error: task.error,
+                recovery: task.recovery,
+                createdAt: task.createdAt,
+                startedAt: task.startedAt,
+                endedAt: task.endedAt,
+                intentID: task.intentID,
+                context: task.context,
+                resourceKeys: Array(resourceKeys(for: task)).sorted()
+            )
+            try await persistenceStore.updateAppData { appData in
+                if let index = appData.taskHistory.firstIndex(where: { $0.id == record.id }) {
+                    appData.taskHistory[index] = record
+                } else {
+                    appData.taskHistory.append(record)
+                }
+            }
             let verified = try await persistenceStore.readAppData()
             guard let persisted = verified.taskHistory.first(where: { $0.id == record.id }),
                   persisted.status == record.status,

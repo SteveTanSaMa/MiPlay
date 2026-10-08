@@ -158,8 +158,39 @@ UI 同时读取三类输入，不能用其中一类替代另一类：
 
 `BackgroundView`、视频、图片、状态圆点、玻璃材质和装饰性 focus 背景均不单独进入 VoiceOver 顺序。详细节点、label/value/hint 和键盘顺序见 `ui-validation-and-accessibility.md`。
 
-## 9. Task 4 几何约束
+---
+
+## 10. 重启恢复与旧路径授权刷新  
+(涵盖 P1-REV-003 重启恢复 / P1-REV-004 stale bookmark / 路径授权刷新)
+
+| 恢复事实 | UI 呈现 | 交互 |
+|---------|---------|------|
+| `persistedRunningNoProcess` | “上次游戏状态未完成同步，正在恢复” + 恢复进度指示 | 无；等待恢复提交 |
+| `recoveryCommitPending` | “正在保存游戏退出状态” + 进度指示 | 无；等待确认 |
+| `recoveryCommitted` | “游戏状态已恢复” | 允许新启动 |
+| `recoveryPersistenceFailed` | “游戏状态恢复未完成，暂时不能启动” | 重试恢复或导出日志 |
+| `locationFresh` | 绿色对勾标识或无额外提示 | 继续当前操作 |
+| `locationStaleRefreshing` | “正在刷新游戏路径授权” + 进度指示 | 等待 |
+| `locationRefreshCommitted` | “游戏路径授权已刷新并保存” | 继续发布结果 |
+| `locationRefreshPersistenceFailed` | “路径授权已刷新但尚未保存，本次操作未完成” | 重试保存或重新选择路径 |
+
+**关键约束**：恢复期间主操作区显示恢复事实，不显示常规状态文字；恢复确认后才允许新启动任务。
+
+---
+
+## 11. Task 4 几何约束
 
 - `GameIconButton` 命中框固定 `64 × 64pt`，玻璃面板固定 `56 × 56pt`，游戏 Button 间距为 `12pt`。
 - hover 最大 `1.04`、选中最大 `1.08` 只作用于 glyph；玻璃面板和 Button 命中框不缩放。
 - `PrimaryActionButton` 最小尺寸为 `220 × 64pt`；disabled 的静态 `Running` 不显示伪进度动画。
+
+## 2026-10-08 视觉状态补充
+
+- 游戏图标的彩色描边表达业务状态；左侧白色短条独立表达选中状态，并为 Button 添加 `.isSelected` 辅助技术 trait。颜色不再是选择的唯一线索。
+- 主按钮按已有 `PrimaryAction` 显示定位、播放、更新符号；不从文案生成新操作。禁用与启动中的业务判断保持原样。
+- `MainTaskFeedbackView` 仅呈现真实 `LaunchProgress` 与 `RecoveryRecord`；百分比不生成、不插值。恢复记录已解决后隐藏。
+- 无任务、无未解决恢复记录时不生成反馈面板；减少透明度时反馈面板使用不透明深色底。
+
+## 2026-10-09 原生状态补充
+
+主窗口恢复提示仅取当前 selectedGameId 对应、resolvedAt 为 nil 的记录。准备遮罩优先展示 failure；Wine 和媒体阶段均使用对应失败标题。白色背景局部固定 light scheme，系统 Dark Mode 下文字仍按浅色语义渲染。正常玻璃保留 clear 黑 tint；Increase Contrast 或 Reduce Transparency 使用不透明深色 fallback。Disabled 主按钮仅降低文字强度，保留可读文案，不整体淡出面板。

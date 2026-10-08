@@ -57,6 +57,7 @@ public actor GameRegistry {
     public let eventStream: AsyncStream<RegistryEvent>
 
     internal var eventContinuation: AsyncStream<RegistryEvent>.Continuation?
+    internal var eventSubscribers: [UUID: AsyncStream<RegistryEvent>.Continuation] = [:]
     internal var sequence: UInt64 = 0
     internal var inMemoryRecoveryRecords: [String: RecoveryRecord] = [:]
 
@@ -149,13 +150,26 @@ public actor GameRegistry {
         (games, sequence, libraryState)
     }
 
+    /// Creates an independent subscription for each UI projection.
+    public func makeEventStream() -> AsyncStream<RegistryEvent> {
+        let subscriptionID = UUID()
+        var continuation: AsyncStream<RegistryEvent>.Continuation!
+        let stream = AsyncStream<RegistryEvent> { continuation = $0 }
+        continuation.onTermination = { @Sendable [weak self] _ in
+            Task { await self?.removeEventSubscriber(subscriptionID) }
+        }
+        eventSubscribers[subscriptionID] = continuation
+        return stream
+    }
+
     // MARK: - Persistence and events
 
     internal func persistLibrary() async throws {
         do {
-            var appData = try await persistenceStore.readAppData()
-            appData.games = games
-            try await persistenceStore.writeAppData(appData)
+            let gamesSnapshot = games
+            try await persistenceStore.updateAppData { appData in
+                appData.games = gamesSnapshot
+            }
         } catch {
             await logWriter.error("游戏库持久化失败: \(error.localizedDescription)", module: "GameRegistry")
             throw RegistrationError.persistenceFailed(error.localizedDescription)
@@ -164,7 +178,15 @@ public actor GameRegistry {
 
     internal func emit(_ game: Game) {
         sequence += 1
-        eventContinuation?.yield(RegistryEvent(sequence: sequence, game: game))
+        let event = RegistryEvent(sequence: sequence, game: game)
+        eventContinuation?.yield(event)
+        for continuation in eventSubscribers.values {
+            continuation.yield(event)
+        }
+    }
+
+    internal func removeEventSubscriber(_ id: UUID) {
+        eventSubscribers.removeValue(forKey: id)
     }
 
     internal nonisolated static func defaultGames() -> [Game] {

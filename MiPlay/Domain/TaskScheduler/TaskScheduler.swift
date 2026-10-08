@@ -44,6 +44,8 @@ public actor TaskScheduler {
     internal var progressSubscribers: [UUID: AsyncStream<TaskProgress>.Continuation] = [:]
     internal var eventSubscribers: [UUID: AsyncStream<TaskEvent>.Continuation] = [:]
     internal var tasks: [ScheduledTaskID: ScheduledTask] = [:]
+    /// 进度 tick 的落盘节流时间戳（见 `phase(_:_:progress:downloadProgress:)`）。
+    internal var lastProgressPersistAt: [ScheduledTaskID: ContinuousClock.Instant] = [:]
     internal var queue: [ScheduledTaskID] = []
     internal var activeForeground: ScheduledTaskID?
     internal var activeBackground: Set<ScheduledTaskID> = []
@@ -67,6 +69,7 @@ public actor TaskScheduler {
     internal let integrityVerifier: FileIntegrityVerifier
     internal let versionChecker: VersionChecker?
     internal let wineVersionManager: WineVersionManager?
+    internal let backgroundMediaService: BackgroundMediaService?
     internal let persistenceStore: PersistenceStore
     internal let logWriter: LogWriter
 
@@ -78,7 +81,8 @@ public actor TaskScheduler {
         versionChecker: VersionChecker? = nil,
         persistenceStore: PersistenceStore? = nil,
         logWriter: LogWriter,
-        wineVersionManager: WineVersionManager? = nil
+        wineVersionManager: WineVersionManager? = nil,
+        backgroundMediaService: BackgroundMediaService? = nil
     ) {
         self.launchOrchestrator = launchOrchestrator
         self.solutionEngine = solutionEngine
@@ -86,6 +90,7 @@ public actor TaskScheduler {
         self.integrityVerifier = integrityVerifier
         self.versionChecker = versionChecker
         self.wineVersionManager = wineVersionManager
+        self.backgroundMediaService = backgroundMediaService
         self.persistenceStore = persistenceStore ?? PersistenceStore()
         self.logWriter = logWriter
 
@@ -163,14 +168,18 @@ public actor TaskScheduler {
                     if let index = data.taskHistory.firstIndex(where: { $0.id == record.id }) {
                         data.taskHistory[index] = repaired
                     }
-                    if type == .wineVersionDownload {
+                    if type == .wineRuntimeSetup {
                         data.recoveryRecords.append(RecoveryRecord(
-                            kind: "wineInstall",
+                            kind: "wineRuntimeSetup",
                             taskID: record.id,
-                            target: record.context["tagName"],
+                            target: WineVersionManager.fixedRuntimeTag,
                             phase: "interrupted",
-                            detail: "应用退出时 Wine 下载未完成，未自动重试",
-                            payload: ["stagingPath": record.context["stagingPath"] ?? ""]
+                            detail: "应用退出时固定 Wine runtime setup 未完成，未自动重试",
+                            payload: [
+                                "runtimeIdentity": WineVersionManager.fixedRuntimeTag,
+                                "prefixIdentity": WineVersionManager.sharedPrefixIdentity,
+                                "stagingPath": record.context["stagingPath"] ?? ""
+                            ]
                         ))
                     }
                     interruptedTasks.append(task)
@@ -208,11 +217,17 @@ public actor TaskScheduler {
         intentID: UUID = UUID()
     ) async throws -> TaskReceipt {
         await initialize()
-        guard type == .gameLaunch || type == .solutionApply || type == .solutionRevert || type == .versionCheck || type == .integrityVerification || type == .wineVersionDownload || type == .wineCatalogQuery || type == .logExport else {
+        guard type == .gameLaunch || type == .solutionApply || type == .solutionRevert || type == .versionCheck || type == .integrityVerification || type == .wineRuntimeSetup || type == .backgroundMediaLoad || type == .logExport else {
             throw SchedulerError.unsupported(type)
         }
-        guard type == .wineVersionDownload || type == .wineCatalogQuery || type == .logExport || gameId != nil else {
-            throw SchedulerError.invalidRequest("任务缺少 Game ID")
+        if type == .wineRuntimeSetup || type == .logExport {
+            guard gameId == nil else {
+                throw SchedulerError.invalidRequest("全局任务不应包含 Game ID")
+            }
+        } else {
+            guard gameId != nil else {
+                throw SchedulerError.invalidRequest("任务缺少 Game ID")
+            }
         }
         if type == .gameLaunch, let gameId {
             let pendingRecovery = await gameRegistry.pendingRecoveryRecords(gameID: gameId)
@@ -222,32 +237,56 @@ public actor TaskScheduler {
                 )
             }
         }
-        if type == .wineCatalogQuery {
-            guard wineVersionManager != nil else { throw SchedulerError.invalidRequest("Wine 版本管理器未配置") }
+        if type == .gameLaunch {
+            if let existing = tasks.values.first(where: {
+                ($0.state == .pending || $0.state == .running)
+                    && resourceKeys(for: $0).contains("sharedWinePrefix")
+            }) {
+                throw SchedulerError.conflict(
+                    taskId: ScheduledTaskID(),
+                    conflictingTaskId: existing.id,
+                    reason: "sharedWinePrefix 正在被占用"
+                )
+            }
         }
-        if type == .wineVersionDownload {
+        if type == .wineRuntimeSetup {
             guard wineVersionManager != nil else { throw SchedulerError.invalidRequest("Wine 版本管理器未配置") }
-            guard let tagName = context["tagName"], !tagName.isEmpty else {
-                throw SchedulerError.invalidRequest("Wine 下载任务缺少版本标签")
+            if let runtimeIdentity = context["runtimeIdentity"],
+               runtimeIdentity != WineVersionManager.fixedRuntimeTag {
+                throw SchedulerError.invalidRequest("Wine runtime 不是当前固定目标")
             }
             if let existing = tasks.values.first(where: {
-                $0.type == .wineVersionDownload &&
+                $0.type == .wineRuntimeSetup &&
                 ($0.state == .pending || $0.state == .running)
             }) {
-                if existing.context["tagName"] == tagName {
+                if existing.context["runtimeIdentity"].map({ $0 == WineVersionManager.fixedRuntimeTag }) ?? true {
                     return makeReceipt(existing)
                 }
                 throw SchedulerError.conflict(
                     taskId: ScheduledTaskID(),
                     conflictingTaskId: existing.id,
-                    reason: "wineRuntime 正在处理另一个版本"
+                    reason: "wineRuntime/sharedWinePrefix 正在处理固定 setup"
                 )
             }
-            let blocked = (try await persistenceStore.readAppData()).recoveryRecords.first {
-                $0.kind == "wineInstall" && $0.resolvedAt == nil && $0.target == tagName
-            }
-            if blocked != nil {
-                throw SchedulerError.recoveryRequired("Wine 版本 \(tagName) 存在未完成恢复事实")
+            do {
+                let data = try await persistenceStore.readAppData()
+                let guards = try await persistenceStore.readRecoveryGuards()
+                let blocked = data.recoveryRecords.contains {
+                    $0.resolvedAt == nil
+                        && ($0.target == WineVersionManager.fixedRuntimeTag
+                            || $0.target == WineVersionManager.sharedPrefixIdentity)
+                } || guards.contains {
+                    $0.resolvedAt == nil
+                        && ($0.target == WineVersionManager.fixedRuntimeTag
+                            || $0.target == WineVersionManager.sharedPrefixIdentity)
+                }
+                if blocked {
+                    throw SchedulerError.recoveryRequired("固定 Wine runtime/shared prefix 存在未完成恢复事实")
+                }
+            } catch let error as SchedulerError {
+                throw error
+            } catch {
+                throw SchedulerError.recoveryRequired("无法读取固定 Wine 恢复状态: \(error.localizedDescription)")
             }
         }
         if type == .solutionApply || type == .solutionRevert, context["solutionId"] == nil && context["applicationId"] == nil {
@@ -314,10 +353,14 @@ public actor TaskScheduler {
             // Let LaunchOrchestrator return its concrete cancellation/recovery
             // result so cleanup failure cannot be reported as cancelled.
             await launchOrchestrator.cancelLaunch()
-        } else if task.type == .wineVersionDownload {
+        } else if task.type == .wineRuntimeSetup {
             if let sessionID = wineSessionIDs[taskId] {
                 await wineVersionManager?.cancelDownload(taskID: sessionID)
             }
+            // The setup task can still be fetching catalog metadata before its
+            // downloader session is registered. Cancel the scheduler execution
+            // as well so cancellation covers the complete setup lifecycle.
+            executionTasks[taskId]?.cancel()
         } else {
             executionTasks[taskId]?.cancel()
         }

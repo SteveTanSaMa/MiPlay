@@ -14,10 +14,24 @@ public enum ScheduledTaskType: String, Codable, Sendable, CaseIterable {
     case solutionRevert = "SolutionRevert"
     case versionCheck = "VersionCheck"
     case integrityVerification = "IntegrityVerification"
+    /// Legacy task name retained only for decoding old task history.
+    @available(*, deprecated, message: "Use WineRuntimeSetup")
     case wineVersionDownload = "WineVersionDownload"
+    case wineRuntimeSetup = "WineRuntimeSetup"
     case wineCatalogQuery = "WineCatalogQuery"
     case backgroundMediaLoad = "BackgroundMediaLoad"
     case logExport = "LogExport"
+
+    nonisolated public static let allCases: [ScheduledTaskType] = [
+        .gameLaunch,
+        .solutionApply,
+        .solutionRevert,
+        .versionCheck,
+        .integrityVerification,
+        .wineRuntimeSetup,
+        .backgroundMediaLoad,
+        .logExport
+    ]
 
     nonisolated var isBackground: Bool {
         self == .versionCheck || self == .integrityVerification || self == .backgroundMediaLoad || self == .wineCatalogQuery
@@ -28,7 +42,7 @@ public enum ScheduledTaskType: String, Codable, Sendable, CaseIterable {
     nonisolated var priority: ScheduledPriority {
         switch self {
         case .gameLaunch: return .userBlocking
-        case .solutionApply, .solutionRevert, .wineVersionDownload, .logExport: return .userInitiated
+        case .solutionApply, .solutionRevert, .wineVersionDownload, .wineRuntimeSetup, .logExport: return .userInitiated
         case .versionCheck, .integrityVerification, .backgroundMediaLoad, .wineCatalogQuery: return .background
         }
     }
@@ -84,7 +98,7 @@ public struct ScheduledTask: Codable, Sendable, Identifiable, Equatable {
     nonisolated public var cancellationPolicy: TaskCancellationPolicy {
         switch type {
         case .solutionRevert: return .notCancellable
-        case .gameLaunch, .solutionApply, .wineVersionDownload: return .cleanupAfterSideEffect
+        case .gameLaunch, .solutionApply, .wineVersionDownload, .wineRuntimeSetup: return .cleanupAfterSideEffect
         case .versionCheck, .integrityVerification, .backgroundMediaLoad, .wineCatalogQuery, .logExport: return .beforeSideEffect
         }
     }

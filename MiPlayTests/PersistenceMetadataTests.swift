@@ -45,6 +45,30 @@ import XCTest
         XCTAssertTrue(FileManager.default.fileExists(atPath: baseURL.appendingPathComponent("AppData.json.bak").path))
     }
 
+    func testSchema2MigratesToSchema4AndDropsLegacyWineSelection() async throws {
+        let baseURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+        let store = PersistenceStore(baseURL: baseURL)
+        try FileManager.default.createDirectory(at: baseURL, withIntermediateDirectories: true)
+        let schema2 = """
+        {"schemaVersion":2,"games":[],"selectedWineVersion":"wine-devel-9.0","installedWineVersions":["wine-devel-9.0"]}
+        """
+        try Data(schema2.utf8).write(to: baseURL.appendingPathComponent("AppData.json"))
+
+        let result = try await store.loadAppData()
+
+        XCTAssertEqual(result.data?.schemaVersion, AppData.currentSchemaVersion)
+        XCTAssertNil(result.data?.selectedWineVersion)
+        XCTAssertTrue(result.data?.installedWineVersions.isEmpty == true)
+        XCTAssertNil(result.data?.selectedWineSource)
+        XCTAssertNil(result.data?.perGameSettings[GameType.genshinImpact.rawValue]?.wineVersionOverride)
+
+        let reread = try await store.loadAppData()
+        guard case .readable = reread.state else {
+            return XCTFail("Canonical schema 4 data should not be migrated again: \(reread.state)")
+        }
+    }
+
     func testIntegrityVerifierUsesManifestHash() async throws {
         let baseURL = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: baseURL) }
@@ -168,8 +192,8 @@ import XCTest
         )
         let result = try await checker.checkVersion(for: .genshinImpact, installPath: baseURL.path)
 
-        XCTAssertEqual(result.outcome, .versionEvidenceConflict)
-        XCTAssertNil(result.currentVersion)
+        XCTAssertEqual(result.outcome, .current)
+        XCTAssertEqual(result.currentVersion, "1.2.3")
         XCTAssertFalse(result.updateAvailable)
         XCTAssertEqual(result.localEvidence.gameVersion, "1.2.3")
         XCTAssertEqual(result.localEvidence.channel, "14")
@@ -180,7 +204,192 @@ import XCTest
         XCTAssertEqual(result.localEvidence.pkgVersionEntries.first?.remoteName, "data/file.bin")
         XCTAssertEqual(result.localEvidence.pkgVersionEntries.first?.fileSize, 12)
         XCTAssertEqual(result.localEvidence.pkgVersionMapping, .unmapped)
-        XCTAssertTrue(result.conflictDetails.contains { $0.contains("pkg_version") })
+        XCTAssertTrue(result.conflictDetails.isEmpty)
+    }
+
+    func testVersionCheckSkipsFullPkgValidationWithoutManifest() async throws {
+        let baseURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+        try Data("[General]\ngame_version=1.2.3\nchannel=1\nsub_channel=0\ncps=test\n".utf8)
+            .write(to: baseURL.appendingPathComponent("config.ini"))
+        // 条目指向不存在的文件：只要执行逐文件校验就必然产生校验错误
+        try Data(
+            "{\"remoteName\":\"data/missing.bin\",\"fileSize\":12,\"md5\":\"0123456789abcdef0123456789abcdef\"}\n".utf8
+        ).write(to: baseURL.appendingPathComponent("pkg_version"))
+        let repository = GameFileSystemRepository()
+        let checker = VersionChecker(
+            fileSystemRepository: repository,
+            networkProvider: NetworkDownloadProvider(),
+            logWriter: LogWriter(fileSystemRepository: repository),
+            latestVersions: [.genshinImpact: "1.2.3"]
+        )
+
+        let result = try await checker.checkVersion(for: .genshinImpact, installPath: baseURL.path)
+
+        XCTAssertEqual(result.outcome, .current)
+        XCTAssertEqual(result.localEvidence.pkgVersionEntries.count, 1)
+        XCTAssertTrue(result.localEvidence.pkgVersionValidationErrors.isEmpty)
+        XCTAssertEqual(result.localEvidence.fileVerificationPerformed, false)
+    }
+
+    func testVersionCheckPerformsFullPkgValidationOnExplicitRequest() async throws {
+        let baseURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+        try Data("[General]\ngame_version=1.2.3\nchannel=1\nsub_channel=0\ncps=test\n".utf8)
+            .write(to: baseURL.appendingPathComponent("config.ini"))
+        // 条目指向不存在的文件：显式请求完整校验时必然产生校验错误
+        try Data(
+            "{\"remoteName\":\"data/missing.bin\",\"fileSize\":12,\"md5\":\"0123456789abcdef0123456789abcdef\"}\n".utf8
+        ).write(to: baseURL.appendingPathComponent("pkg_version"))
+        let repository = GameFileSystemRepository()
+        let checker = VersionChecker(
+            fileSystemRepository: repository,
+            networkProvider: NetworkDownloadProvider(),
+            logWriter: LogWriter(fileSystemRepository: repository),
+            latestVersions: [.genshinImpact: "1.2.3"]
+        )
+
+        let result = try await checker.checkVersion(
+            for: .genshinImpact,
+            installPath: baseURL.path,
+            fileVerification: true
+        )
+
+        XCTAssertEqual(result.outcome, .current)
+        XCTAssertFalse(result.localEvidence.pkgVersionValidationErrors.isEmpty)
+        XCTAssertEqual(result.localEvidence.fileVerificationPerformed, true)
+    }
+
+    func testVersionCheckKeepsFullPkgValidationWhenManifestExists() async throws {
+        let baseURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+        try Data("[General]\ngame_version=1.2.3\nchannel=1\nsub_channel=0\ncps=test\n".utf8)
+            .write(to: baseURL.appendingPathComponent("config.ini"))
+        try Data(
+            "{\"remoteName\":\"data/missing.bin\",\"fileSize\":12,\"md5\":\"0123456789abcdef0123456789abcdef\"}\n".utf8
+        ).write(to: baseURL.appendingPathComponent("pkg_version"))
+        let repository = GameFileSystemRepository()
+        let manifest = FileIntegrityVerifier.Manifest(
+            gameID: GameType.genshinImpact.rawValue,
+            version: "1.2.3",
+            channel: "1",
+            files: ["data/missing.bin": String(repeating: "0", count: 64)]
+        )
+        let checker = VersionChecker(
+            fileSystemRepository: repository,
+            networkProvider: NetworkDownloadProvider(),
+            logWriter: LogWriter(fileSystemRepository: repository),
+            latestVersions: [.genshinImpact: "1.2.3"],
+            integrityManifests: [.genshinImpact: manifest]
+        )
+
+        let result = try await checker.checkVersion(for: .genshinImpact, installPath: baseURL.path)
+
+        XCTAssertEqual(result.outcome, .versionEvidenceConflict)
+        XCTAssertFalse(result.localEvidence.pkgVersionValidationErrors.isEmpty)
+    }
+
+    func testVersionCheckerReadsOfficialHoyoPlayBranchesResponse() async throws {
+        let baseURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+        try Data("[General]\ngame_version=6.9.0\nchannel=1\nsub_channel=1\ncps=mihoyo\n".utf8)
+            .write(to: baseURL.appendingPathComponent("config.ini"))
+
+        let branches = Data("""
+        {
+          "retcode": 0,
+          "message": "OK",
+          "data": {
+            "game_branches": [
+              {
+                "game": {"id": "1Z8W5NHUQb", "biz": "hk4e_cn"},
+                "main": {"tag": "7.0.0"}
+              },
+              {
+                "game": {"id": "x6znKlJ0xK", "biz": "nap_cn"},
+                "main": {"tag": "3.2.0"}
+              }
+            ]
+          }
+        }
+        """.utf8)
+        let network = try makeMockNetwork(response: branches)
+        let checker = VersionChecker(
+            fileSystemRepository: GameFileSystemRepository(),
+            networkProvider: network,
+            logWriter: LogWriter(fileSystemRepository: GameFileSystemRepository()),
+            remoteManifestURL: VersionChecker.defaultRemoteManifestURL
+        )
+
+        let result = try await checker.checkVersion(
+            for: .genshinImpact,
+            installPath: baseURL.path
+        )
+
+        XCTAssertEqual(result.outcome, .updateAvailable)
+        XCTAssertEqual(result.currentVersion, "6.9.0")
+        XCTAssertEqual(result.latestVersion, "7.0.0")
+        XCTAssertTrue(result.updateAvailable)
+        XCTAssertEqual(result.localEvidence.channel, "1")
+    }
+
+    func testCommittedVersionCheckUpdatesAndClearsBusinessUpdateState() async throws {
+        let baseURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+        let fileSystem = GameFileSystemRepository(appSupportDirectory: try makeTemporaryDirectory())
+        let store = PersistenceStore(baseURL: baseURL)
+        let gameID = GameType.genshinImpact.rawValue
+        let game = Game(
+            id: gameID,
+            type: .genshinImpact,
+            location: nil,
+            state: .launchFailed,
+            version: nil,
+            lastLaunchDate: nil,
+            solutionApplications: []
+        )
+        try await store.writeAppData(AppData(games: [game]))
+        let registry = GameRegistry(
+            persistenceStore: store,
+            fileSystemRepository: fileSystem,
+            stateMachine: GameStateMachine(),
+            systemDetector: SystemEnvironmentDetector(),
+            logWriter: LogWriter(fileSystemRepository: fileSystem)
+        )
+        await registry.initialize()
+
+        let evidence = VersionChecker.LocalEvidence(
+            gameVersion: "1.0.0",
+            channel: "1",
+            subChannel: "1",
+            cps: "mihoyo",
+            sdkVersion: nil
+        )
+        try await registry.commitVersionCheck(
+            id: gameID,
+            result: .init(
+                outcome: .updateAvailable,
+                currentVersion: "1.0.0",
+                latestVersion: "2.0.0",
+                updateAvailable: true,
+                localEvidence: evidence
+            )
+        )
+        let updatedGame = await registry.getGame(by: gameID)
+        XCTAssertEqual(updatedGame?.state, .updateAvailable)
+
+        try await registry.commitVersionCheck(
+            id: gameID,
+            result: .init(
+                outcome: .current,
+                currentVersion: "2.0.0",
+                latestVersion: "2.0.0",
+                updateAvailable: false,
+                localEvidence: evidence
+            )
+        )
+        let currentGame = await registry.getGame(by: gameID)
+        XCTAssertEqual(currentGame?.state, .installed)
     }
 
     func testVersionCheckerPublishesCurrentOnlyForMappedAndLocallyVerifiedPkgEvidence() async throws {

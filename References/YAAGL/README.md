@@ -2,8 +2,8 @@
 
 ## Current Supported Game Version:
 ### GI: 5.3.0+ OS/CN **
-### HSR: 4.3.0 OS/CN
-### ZZZ: 3.0.0 OS/CN
+### HSR: 4.3.0+ OS/CN
+### ZZZ: 3.0.0+ OS/CN
 
 #### **: Starting from release 0.3.12 using DXMT 0.74, you need to update to Sequoia or later. Sonoma is getting old and is lacking technical features to improve the translation.
 
@@ -73,7 +73,11 @@ node ./build-app.js
 
 ## Uninstall (completely)
 1. Drag app to the bin
-2. Delete folder `~/Library/Application Support/Yaagl` or `~/Library/Application Support/Yaagl OS` if you are using oversea version. (For HSR and ZZZ the name of folder is slightly different)
+2. Open Terminal and run:
+   ```sh
+   open ~/Library/Application\ Support/
+   ```
+   From there, locate and delete the `Yaagl` folder (or `Yaagl OS` if you are using overseas/global version). (For HSR and ZZZ the name of folder is slightly different)
 
 ## Related projects
 

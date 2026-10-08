@@ -47,8 +47,25 @@ extension GameRegistry {
         let nextState = try stateMachine.transition(from: old.state, to: .running)
         games[index].state = nextState
         games[index].lastLaunchDate = date
+        games[index].lastLaunchFailure = nil
         do { try await persistLibrary() }
         catch { games[index] = old; throw error }
+        emit(games[index])
+    }
+
+    /// Retains a bounded, user-readable launch diagnostic.
+    public func recordLaunchFailure(id: String, detail: String) async throws {
+        guard let index = games.firstIndex(where: { $0.id == id }) else {
+            throw RegistrationError.gameNotFound(id)
+        }
+        let old = games[index]
+        games[index].lastLaunchFailure = detail
+        do {
+            try await persistLibrary()
+        } catch {
+            games[index] = old
+            throw error
+        }
         emit(games[index])
     }
 
@@ -85,8 +102,11 @@ extension GameRegistry {
         games[index].lastMetadata = metadata
         games[index].metadataFailure = nil
         games[index].version = currentVersion
-        if result.updateAvailable, games[index].state == .installed {
+        if result.updateAvailable,
+           games[index].state == .installed || games[index].state == .launchFailed {
             games[index].state = try stateMachine.transition(from: games[index].state, to: .updateAvailable)
+        } else if !result.updateAvailable, games[index].state == .updateAvailable {
+            games[index].state = try stateMachine.transition(from: games[index].state, to: .installed)
         }
         do {
             try await persistLibrary()
@@ -105,15 +125,16 @@ extension GameRegistry {
         let old = games[index]
         games[index].metadataFailure = detail
         do {
-            var appData = try await persistenceStore.readAppData()
-            appData.games = games
-            appData.recoveryRecords.append(RecoveryRecord(
-                kind: "metadata",
-                gameID: id,
-                phase: "evidenceConflict",
-                detail: detail
-            ))
-            try await persistenceStore.writeAppData(appData)
+            let gamesSnapshot = games
+            try await persistenceStore.updateAppData { appData in
+                appData.games = gamesSnapshot
+                appData.recoveryRecords.append(RecoveryRecord(
+                    kind: "metadata",
+                    gameID: id,
+                    phase: "evidenceConflict",
+                    detail: detail
+                ))
+            }
         } catch {
             games[index] = old
             throw RegistrationError.persistenceFailed(error.localizedDescription)
@@ -203,9 +224,7 @@ extension GameRegistry {
                     return
                 }
             }
-            let executableFound = gameType.executableRelativePaths.contains {
-                FileManager.default.fileExists(atPath: access.url.appendingPathComponent($0).path)
-            }
+            let executableFound = gameType.firstExistingExecutable(at: access.url.path) != nil
             let previous = games[index]
             let stateChanged = (executableFound && games[index].state == .notInstalled) ||
                 (!executableFound && games[index].state != .notInstalled)
@@ -294,10 +313,7 @@ extension GameRegistry {
 
     internal func validateGamePath(gameType: GameType, path: String) async -> PathValidationResult {
         guard fileSystemRepository.validatePath(path) else { return .pathNotAccessible(path) }
-        for relativePath in gameType.executableRelativePaths {
-            let fullPath = URL(fileURLWithPath: path).appendingPathComponent(relativePath).path
-            if fileSystemRepository.validatePath(fullPath) { return .valid }
-        }
+        if gameType.firstExistingExecutable(at: path) != nil { return .valid }
         return .executableNotFound(URL(fileURLWithPath: path).appendingPathComponent(gameType.executableRelativePaths[0]).path)
     }
 

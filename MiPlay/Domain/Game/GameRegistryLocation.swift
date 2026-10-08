@@ -38,23 +38,55 @@ extension GameRegistry {
         var isDirectory: ObjCBool = false
         let isExisting = FileManager.default.fileExists(atPath: selectedURL.path, isDirectory: &isDirectory)
         guard isExisting else { throw RegistrationError.invalidPath(selectedURL.path) }
-        let directoryURL = isDirectory.boolValue ? selectedURL : selectedURL.deletingLastPathComponent()
-        let location: GameLocation
+        guard isDirectory.boolValue else {
+            throw RegistrationError.invalidPath("请直接选择 \(gameType.displayName) 的游戏安装目录")
+        }
+
+        // NSOpenPanel grants a temporary security scope for the selected URL.
+        // Start it before creating the temporary bookmark; otherwise
+        // URL.bookmarkData can fail for a sandboxed nested directory.
+        guard selectedURL.startAccessingSecurityScopedResource() else {
+            throw RegistrationError.permissionRequired("无法取得所选游戏目录的安全访问权限")
+        }
+        defer { selectedURL.stopAccessingSecurityScopedResource() }
+
+        // NSOpenPanel grants sandbox access to the URL the user actually
+        // selected. Resolve nested game directories only while that scope is
+        // active; creating a bookmark for the nested directory before this
+        // point can fail with "The file ... couldn't be opened".
+        let selectionLocation: GameLocation
         do {
-            location = try fileSystemRepository.makeGameLocation(gameID: gameID, for: directoryURL)
+            selectionLocation = try fileSystemRepository.makeGameLocation(
+                gameID: gameID,
+                for: selectedURL,
+                scope: .readWrite
+            )
         } catch {
             throw RegistrationError.permissionRequired(error.localizedDescription)
         }
 
         let validation: (PathValidationResult, GameLocation)
         do {
-            validation = try await fileSystemRepository.withSecurityScopedAccess(location) { resolvedURL, resolvedLocation in
-                let found = gameType.executableRelativePaths.contains { relativePath in
-                    FileManager.default.fileExists(atPath: resolvedURL.appendingPathComponent(relativePath).path)
+            validation = try await fileSystemRepository.withSecurityScopedAccess(selectionLocation) { resolvedSelectionURL, _ in
+                guard let directoryURL = gameType.resolvedInstallationDirectory(at: resolvedSelectionURL) else {
+                    let baseURL = resolvedSelectionURL
+                    let first = baseURL.appendingPathComponent(gameType.executableRelativePaths[0]).path
+                    return (.executableNotFound(first), selectionLocation)
                 }
-                if found { return (.valid, resolvedLocation) }
-                let first = resolvedURL.appendingPathComponent(gameType.executableRelativePaths[0]).path
-                return (.executableNotFound(first), resolvedLocation)
+
+                // The selected scope is still active here, so the final
+                // bookmark can safely target a nested game directory.
+                let location = try fileSystemRepository.makeGameLocation(
+                    gameID: gameID,
+                    for: directoryURL,
+                    scope: .readWrite
+                )
+                return try await fileSystemRepository.withSecurityScopedAccess(location) { resolvedURL, resolvedLocation in
+                    let found = gameType.firstExistingExecutable(at: resolvedURL.path) != nil
+                    if found { return (.valid, resolvedLocation) }
+                    let first = resolvedURL.appendingPathComponent(gameType.executableRelativePaths[0]).path
+                    return (.executableNotFound(first), resolvedLocation)
+                }
             }
         } catch {
             throw RegistrationError.permissionRequired(error.localizedDescription)
@@ -141,15 +173,26 @@ extension GameRegistry {
         gameID: String,
         processID: UUID,
         statusCode: Int32,
-        terminatedBySignal: Bool
+        terminatedBySignal: Bool,
+        output: String = ""
     ) async throws {
         guard let index = games.firstIndex(where: { $0.id == gameID }) else {
             throw RegistrationError.gameNotFound(gameID)
         }
-        let target: GameBusinessState = statusCode == 0 && !terminatedBySignal ? .installed : .launchFailed
+        // 进程已经退出即可重新启动；退出码和信号只用于诊断，不改变可启动状态。
+        let target: GameBusinessState = .installed
         let old = games[index]
         if old.state != target {
             games[index].state = try stateMachine.transition(from: old.state, to: target)
+        }
+        if statusCode != 0 || terminatedBySignal {
+            games[index].lastLaunchFailure = GameExitDiagnostic.summary(
+                statusCode: statusCode,
+                terminatedBySignal: terminatedBySignal,
+                output: output
+            )
+        } else {
+            games[index].lastLaunchFailure = nil
         }
         do {
             try await persistLibrary()
@@ -170,7 +213,7 @@ extension GameRegistry {
         terminatedBySignal: Bool,
         detail: String
     ) async throws -> RecoveryRecord {
-        let target = statusCode == 0 && !terminatedBySignal ? GameBusinessState.installed : .launchFailed
+        let target = GameBusinessState.installed
         let record = RecoveryRecord(
             kind: "processExit",
             gameID: gameID,
@@ -184,14 +227,22 @@ extension GameRegistry {
             ]
         )
         do {
-            var data = try await persistenceStore.readAppData()
-            if let existing = data.recoveryRecords.first(where: {
+            let existing = try await persistenceStore.readAppData().recoveryRecords.first(where: {
                 $0.kind == "processExit" && $0.payload["processID"] == processID.uuidString && $0.resolvedAt == nil
-            }) {
+            })
+            if let existing {
                 return existing
             }
-            data.recoveryRecords.append(record)
-            try await persistenceStore.writeAppData(data)
+            try await persistenceStore.updateAppData { data in
+                if data.recoveryRecords.contains(where: {
+                    $0.kind == "processExit" &&
+                    $0.payload["processID"] == processID.uuidString &&
+                    $0.resolvedAt == nil
+                }) {
+                    return
+                }
+                data.recoveryRecords.append(record)
+            }
         } catch {
             // Keep a retryable in-process fact when the store itself is down.
             // The process/scope guard remains owned by LaunchOrchestrator until
@@ -266,7 +317,32 @@ extension GameRegistry {
         }
         return unique.values
             .filter { gameID == nil || $0.gameID == gameID }
-            .sorted { $0.createdAt < $1.createdAt }
+            .sorted { Self.precedesInRecoveryCommitOrder($0, $1) }
+    }
+
+    /// 恢复记录的提交顺序（严格确定性）。
+    ///
+    /// AppData 的 ISO8601 时间戳**只有秒级精度**，同一秒内创建的记录 `createdAt` 相等。
+    /// 仅按时间排序时顺序由 Swift 排序实现决定，最终业务状态会随机落在保守结论
+    /// （`restartReconciliation`，启动时无法验证旧进程）或具体退出事实
+    /// （`processExit`，带真实退出码/信号）上。这里补两级 tie-break：
+    /// 先按"结论强弱"排序（保守结论在前、具体事实在后 → 具体事实最终生效），
+    /// 再按 kind、id 排序保证完全确定。
+    nonisolated static func precedesInRecoveryCommitOrder(_ lhs: RecoveryRecord, _ rhs: RecoveryRecord) -> Bool {
+        if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+        let leftRank = recoveryCommitRank(lhs.kind)
+        let rightRank = recoveryCommitRank(rhs.kind)
+        if leftRank != rightRank { return leftRank < rightRank }
+        if lhs.kind != rhs.kind { return lhs.kind < rhs.kind }
+        return lhs.id < rhs.id
+    }
+
+    nonisolated private static func recoveryCommitRank(_ kind: String) -> Int {
+        switch kind {
+        case "restartReconciliation": return 0
+        case "processExit": return 1
+        default: return 2
+        }
     }
 
     /// Reconciles process state at the restart boundary. A Process reference is
@@ -275,7 +351,7 @@ extension GameRegistry {
     /// outcome is LaunchFailed and a durable recovery record; no relaunch is
     /// attempted here.
     internal func reconcileInterruptedLaunches() async throws -> [RecoveryRecord] {
-        var data = try await persistenceStore.readAppData()
+        let data = try await persistenceStore.readAppData()
         let durableGuards = try await persistenceStore.readRecoveryGuards()
         let originalGames = games
         var changed = false
@@ -305,15 +381,20 @@ extension GameRegistry {
                     "previousState": oldState.rawValue
                 ]
             )
-            data.recoveryRecords.append(record)
             recoveries.append(record)
             changed = true
         }
 
         guard changed else { return recoveries }
-        data.games = games
+        let gamesSnapshot = games
+        let persistedRecoveries = recoveries
         do {
-            try await persistenceStore.writeAppData(data)
+            try await persistenceStore.updateAppData { data in
+                data.games = gamesSnapshot
+                data.recoveryRecords.append(contentsOf: persistedRecoveries.filter { recovery in
+                    !data.recoveryRecords.contains(where: { $0.id == recovery.id })
+                })
+            }
         } catch {
             games = originalGames
             for record in recoveries {
@@ -338,25 +419,28 @@ extension GameRegistry {
     internal func commitProcessExitRecovery(_ record: RecoveryRecord) async throws {
         guard let gameID = record.gameID,
               let targetRaw = record.target,
-              let target = GameBusinessState(rawValue: targetRaw),
+              let recordedTarget = GameBusinessState(rawValue: targetRaw),
               let gameIndex = games.firstIndex(where: { $0.id == gameID }) else {
             throw RegistrationError.recoveryRequired("退出恢复事实缺少有效游戏目标")
         }
+        // 已确认的退出事实统一恢复到可启动状态，兼容旧版本保存的异常退出记录。
+        let target: GameBusinessState = record.kind == "processExit" ? .installed : recordedTarget
         let old = games[gameIndex]
         if old.state != target {
             games[gameIndex].state = try stateMachine.transition(from: old.state, to: target)
         }
-        var data = try await persistenceStore.readAppData()
-        data.games = games
-        if let recordIndex = data.recoveryRecords.firstIndex(where: { $0.id == record.id }) {
-            data.recoveryRecords[recordIndex].resolvedAt = Date()
-        } else {
-            var completedRecord = record
-            completedRecord.resolvedAt = Date()
-            data.recoveryRecords.append(completedRecord)
-        }
+        let gamesSnapshot = games
         do {
-            try await persistenceStore.writeAppData(data)
+            try await persistenceStore.updateAppData { data in
+                data.games = gamesSnapshot
+                if let recordIndex = data.recoveryRecords.firstIndex(where: { $0.id == record.id }) {
+                    data.recoveryRecords[recordIndex].resolvedAt = Date()
+                } else {
+                    var completedRecord = record
+                    completedRecord.resolvedAt = Date()
+                    data.recoveryRecords.append(completedRecord)
+                }
+            }
         } catch {
             games[gameIndex] = old
             throw RegistrationError.recoveryRequired("退出状态重试写入失败: \(error.localizedDescription)")

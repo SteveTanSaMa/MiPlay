@@ -16,7 +16,9 @@ public struct BuiltInSolutions {
     /// Solutions visible in the current release manifest. Historical definitions
     /// remain below for migration/read-only diagnostics and are never applicative.
     nonisolated public static func publishedSolutions() -> [CompatibilitySolution] {
-        [modifyHostname]
+        // No signed system-modification helper is registered in this target.
+        // Do not advertise actions that would only fail after confirmation.
+        []
     }
 
     /// 获取所有内置兼容方案

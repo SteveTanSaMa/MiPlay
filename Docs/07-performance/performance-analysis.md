@@ -55,3 +55,8 @@
 - 根因 (Root Cause)：当前测量环境和缓存规模未触发超过预算的内存压力；媒体资源生命周期仍可能在多场景切换时改变峰值，当前没有完整切换峰值数据。
 - 优化方向 (Optimization Direction)：在用户验证后固定三款真实媒体、窗口尺寸和切换脚本，重复采集 peak Physical Footprint、IOSurface/VideoToolbox 和 GPU allocated size；若峰值回归，再回溯媒体资源生命周期问题，不提前做架构重构。
 
+## UI 生命周期优化（2026-10-09）
+
+图片与官方图标磁盘读取移入路径驱动 task，后台读取 Data 后在主 actor 创建 NSImage；body 不再重复读取图片。视频播放器创建/启动移出 body，非选中或 scene 非 active 时暂停，Reduce Motion 下退化为静态图片。主题与背景使用同一图片实现。
+
+新增播放器暂停/复用回归通过；未做 Instruments、GPU、能耗或帧率基准，不声明量化性能收益。证据与限制见 [原生 UI 审查](../03-ui/ui-native-review-2026-10-09.md)。

@@ -8,16 +8,18 @@
 import Foundation
 
 // Source: Architecture Design → Domain Model → RuntimeEnvironment
-// Source: Architecture Design → ADR 011 → Wine 版本管理双层分离
+// Source: Architecture Design -> ADR 037 -> fixed runtime catalog
 
-/// 内置 Wine 版本清单。
-/// 定义 MiPlay 已知的、可从指定上游获取的 Wine 构建版本集合。
-/// Product 边界：不提供通用 Wine 版本管理器，仅管理 MiPlay 内置指定的有限版本集合。
+/// The single Wine release approved by the current product boundary.
 public struct BuiltInWineVersions {
+    nonisolated public static let fixedTag = "wine-crossover-11.0-1-signed"
     // Source: Architecture Design -> Revision 2026-08-03 -> WineSourceSelection
     public struct SourceDescriptor: Sendable, Equatable {
         public let sourceID: String
         public let apiEndpoint: URL
+        /// 仓库页面地址（设置页展示用）。与 `apiEndpoint` 必须指向同一仓库，
+        /// 由 `testSourceRepositoryWebURLMatchesAPIEndpoint` 锁定。
+        public let repositoryWebURL: URL
         public let allowedAssetHost: String
         public let allowedAssetPathPrefix: String
         public let allowedAssetRedirectHosts: [String]
@@ -30,6 +32,7 @@ public struct BuiltInWineVersions {
         nonisolated public init(
             sourceID: String,
             apiEndpoint: URL,
+            repositoryWebURL: URL,
             allowedAssetHost: String,
             allowedAssetPathPrefix: String,
             allowedAssetRedirectHosts: [String] = [],
@@ -39,6 +42,7 @@ public struct BuiltInWineVersions {
         ) {
             self.sourceID = sourceID
             self.apiEndpoint = apiEndpoint
+            self.repositoryWebURL = repositoryWebURL
             self.allowedAssetHost = allowedAssetHost
             self.allowedAssetPathPrefix = allowedAssetPathPrefix
             self.allowedAssetRedirectHosts = allowedAssetRedirectHosts
@@ -59,6 +63,7 @@ public struct BuiltInWineVersions {
     nonisolated public static let officialSource = SourceDescriptor(
         sourceID: "officialGitHub",
         apiEndpoint: URL(string: "https://api.github.com/repos/yaagl/anime-game-wine/releases?per_page=100")!,
+        repositoryWebURL: URL(string: "https://github.com/yaagl/anime-game-wine")!,
         allowedAssetHost: "github.com",
         allowedAssetPathPrefix: "/yaagl/anime-game-wine/releases/download/",
         allowedAssetRedirectHosts: [
@@ -80,7 +85,7 @@ public struct BuiltInWineVersions {
         approvedSources.first { $0.sourceID == sourceID }
     }
 
-    /// GitHub 发布版本元数据
+    /// Fixed GitHub release metadata policy.
     public struct WineVersionSource: Sendable {
         public let tagName: String
         public let displayName: String
@@ -103,50 +108,15 @@ public struct BuiltInWineVersions {
         }
     }
 
-    /// 获取所有内置 Wine 版本来源
+    /// Returns the one runtime entry supported by this release.
     nonisolated public static func allSources() -> [WineVersionSource] {
         return [
             WineVersionSource(
-                tagName: "wine-crossover-11.0-1-signed",
-                displayName: "Wine CrossOver 11.0-1 (Signed)",
+                tagName: fixedTag,
+                displayName: "MiPlay Wine 11.0-1 (Signed)",
                 githubReleaseURL: URL(string: "https://api.github.com/repos/yaagl/anime-game-wine/releases")!,
                 assetNameFilter: "osx64",
-                description: "签名的 CrossOver 11.0-1 版本"
-            ),
-            WineVersionSource(
-                tagName: "wine-crossover-11.0-1",
-                displayName: "Wine CrossOver 11.0-1",
-                githubReleaseURL: URL(string: "https://api.github.com/repos/yaagl/anime-game-wine/releases")!,
-                assetNameFilter: "osx64",
-                description: "CrossOver 11.0-1 版本"
-            ),
-            WineVersionSource(
-                tagName: "wine-11.0-signed",
-                displayName: "Wine Devel 11.0 (Signed)",
-                githubReleaseURL: URL(string: "https://api.github.com/repos/yaagl/anime-game-wine/releases")!,
-                assetNameFilter: "osx64",
-                description: "签名的 Wine 11.0 开发版本"
-            ),
-            WineVersionSource(
-                tagName: "wine-11.8-signed",
-                displayName: "Wine Devel 11.8 (Signed)",
-                githubReleaseURL: URL(string: "https://api.github.com/repos/yaagl/anime-game-wine/releases")!,
-                assetNameFilter: "osx64",
-                description: "签名的 Wine 11.8 开发版本"
-            ),
-            WineVersionSource(
-                tagName: "wine-crossover-21.2.0",
-                displayName: "Wine CrossOver 21.2.0",
-                githubReleaseURL: URL(string: "https://api.github.com/repos/yaagl/anime-game-wine/releases")!,
-                assetNameFilter: "arm64",
-                description: "稳定的 CrossOver 分支版本，兼容性较好"
-            ),
-            WineVersionSource(
-                tagName: "wine-devel-9.0",
-                displayName: "Wine Devel 9.0",
-                githubReleaseURL: URL(string: "https://api.github.com/repos/yaagl/anime-game-wine/releases")!,
-                assetNameFilter: "arm64",
-                description: "最新的 Wine 开发分支版本"
+                description: "MiPlay 托管的签名 Wine 运行时；上游发布标识保留为 \(fixedTag)"
             ),
         ]
     }

@@ -17,39 +17,6 @@
 /// 按游戏背景模式选择素材来源。
 @Observable
 public final class BackgroundMediaService {
-    public struct BackgroundGroup: Codable, Sendable, Identifiable, Equatable {
-        public let groupID: String
-        public let gameID: String
-        public let sourceID: String
-        public let version: String?
-        public let type: String?
-        public let backgroundURL: URL?
-        public let videoURL: URL?
-        public let themeURL: URL?
-
-        public var id: String { groupID }
-
-        public init(
-            groupID: String,
-            gameID: String,
-            sourceID: String,
-            version: String? = nil,
-            type: String? = nil,
-            backgroundURL: URL?,
-            videoURL: URL?,
-            themeURL: URL?
-        ) {
-            self.groupID = groupID
-            self.gameID = gameID
-            self.sourceID = sourceID
-            self.version = version
-            self.type = type
-            self.backgroundURL = backgroundURL
-            self.videoURL = videoURL
-            self.themeURL = themeURL
-        }
-    }
-
     public enum BackgroundError: Error, LocalizedError, Sendable {
         case unavailable(String)
         case persistenceFailed(String)
@@ -100,9 +67,9 @@ public final class BackgroundMediaService {
     internal var customImagePaths: [String: String] = [:]
     /// Theme 装饰图本地路径（带透明通道的 PNG，叠加在背景之上）
     internal var themeImagePaths: [String: String] = [:]
-    internal var backgroundGroups: [String: [BackgroundGroup]] = [:]
-    internal var selectedBackgroundGroupIDs: [String: String] = [:]
-    internal var backgroundGroupErrors: [String: String] = [:]
+    /// 当前背景组的静态背景图（PNG）本地路径。视频背景播放时作为底层画面，
+    /// 覆盖首帧加载与播放失败的场景。
+    internal var backgroundStillImagePaths: [String: String] = [:]
     /// Source: ADR 019 — content-addressable 缓存追踪
     internal var lastCachedBackgroundIds: [String: String] = [:]
     /// HoyoPlay metadata cache is actor state and must remain stored on the type.
@@ -114,6 +81,8 @@ public final class BackgroundMediaService {
     internal let hoyoPlayURL = URL(
         string: "https://hyp-api.mihoyo.com/hyp/hyp-connect/api/getAllGameBasicInfo?launcher_id=jGHBHlcOq1"
     )!
+    /// Source identity used by the API collection fingerprint.
+    internal let backgroundSourceID = "hoyoPlay"
 
     /// GameType → HoyoPlay game.biz 映射（国服版本）
     internal let gameKeyMap: [String: String] = [
@@ -158,13 +127,6 @@ public final class BackgroundMediaService {
             customImagePaths = appData.customImagePaths
             // Source: ADR 019 — 恢复 lastCachedBackgroundIds
             lastCachedBackgroundIds = appData.lastCachedBackgroundIds
-            selectedBackgroundGroupIDs = appData.backgroundGroupSelections
-            for (gameID, settings) in appData.perGameSettings {
-                if selectedBackgroundGroupIDs[gameID] == nil,
-                   let groupID = settings.selectedBackgroundGroupID {
-                    selectedBackgroundGroupIDs[gameID] = groupID
-                }
-            }
         } catch {
             await logWriter.warning("背景设置加载失败: \(error.localizedDescription)", module: "BackgroundMediaService")
         }
@@ -190,13 +152,17 @@ public final class BackgroundMediaService {
         return themeImagePaths[gameId]
     }
 
-    /// 强制刷新缓存
-    /// Source: ADR 019 — 清除子目录缓存后重新加载
+    /// 获取当前背景组的静态背景图本地路径（视频背景的底层画面）
+    public func getBackgroundStillImagePath(for gameId: String) -> String? {
+        return backgroundStillImagePaths[gameId]
+    }
+
+    /// 刷新 API 背景元数据并重新加载媒体。
+    /// Source: ADR 035 — 缓存失效仅由 API 集合指纹 diff 决定；
+    /// lastCachedBackgroundIds 仅保留为诊断事实。
     public func refreshCache(for gameId: String) async {
-        if let bgId = lastCachedBackgroundIds[gameId] {
-            _ = try? await mediaCacheManager.clearCache(forGameId: gameId, backgroundId: bgId)
-        }
-        lastCachedBackgroundIds.removeValue(forKey: gameId)
+        cachedEntries = nil
+        cacheTimestamp = nil
         mediaStates[gameId] = .notLoaded
         await loadMedia(for: gameId)
     }

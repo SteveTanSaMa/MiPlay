@@ -2,9 +2,10 @@
 
 > **文档状态**：活跃（Active）
 > **适用范围**：`Docs/03-ui/` 文档约束；不改变业务代码、ViewModel 或状态模型
-> **实现状态**：本文件是 Implementation 输入；当前 SwiftUI 源码仍保留待改造的 `onTapGesture`、整体玻璃缩放和旧主按钮尺寸，本 UI Agent 不修改这些源码。
+> **实现状态**：本文件是下游 Implementation 输入；当前 Product/Research 回溯要求重新对齐 Wine UI，SwiftUI 源码不属于本轮 UI 文档修改范围。
 > **对照**：`Docs/02-ux/ux-state-flow.md`、`Docs/02-ux/ux-edge-cases.md`、`Docs/01-research/research-ui-patterns.md`、`Docs/01-research/research-apple-platform-constraints.md`、现有 `MiPlay/UI/`
 > **Task 4 修正**：主按钮、图标间距、Liquid Glass 融合、窗口居中和完整 Accessibility Tree
+> **Product/Research 回溯修订**：2026-08-28。固定 `wine-crossover-11.0-1-signed`、共享 runtime、共享 prefix 覆盖此前 I-4。
 
 ## 1. 标准控件边界
 
@@ -13,6 +14,9 @@
 | 游戏图标 | `Button` 的 action 负责选择该游戏；label 内容承载现有玻璃图标和状态点 | 在图标或外层容器上使用 `onTapGesture` |
 | 设置齿轮 | `Button` 的 action 调用现有 `openSettings()`；保留 `⌘,` 的 Settings 场景快捷入口 | 仅给 `Image` 添加 `onTapGesture` |
 | 主操作 | 继续使用现有 `PrimaryActionButton`，由传入状态决定 enabled/disabled 和文案 | 在 View 内根据业务事实自行判断动作 |
+| 背景组圆点 | 标准 `Button`；默认隐藏，顶部悬停区只触发显示，不注册点击/手势 | 用透明点击层或 `onTapGesture` 完成选择 |
+| 统一 Wine 任务 | 一个标准 `Button` 动作槽，按上游提供的任务事实呈现下载并安装、重试或取消 | 添加作用范围 Picker、版本选择、来源选择或删除固定 runtime |
+| 此 Mac 行 | 只读 `LabeledContent` 四行；未知值显示“未知” | 用 model identifier、架构或旧缓存拼写机型/芯片/内存 |
 | 取消、重试、回滚、确认 | 使用标准 `Button`；破坏性回滚/取消使用系统 role 或确认界面 | 用可点击 `Text`、`Image` 或手势伪造按钮 |
 
 Button 只负责发送当前视图已经获得的动作闭包。UI 不新增状态、不启动任务、不从图标颜色推导业务结论。
@@ -53,6 +57,8 @@ Button 只负责发送当前视图已经获得的动作闭包。UI 不新增状�
 |---------|----------------|--------|------------|
 | 游戏图标 Button | 选择该游戏 | 不改变选择 | 无，避免三款游戏争抢全局快捷键 |
 | 设置 Button | 打开 Settings | 不改变主窗口 | `⌘,` 打开或聚焦 Settings |
+| 背景组圆点 Button | 提交该背景组选择 | 不改变选择 | 方向键在有效组间移动 |
+| 统一 Wine 任务 Button | 提交下载并安装、重试或取消动作 | 不改变固定 runtime/prefix 身份 | 无 |
 | 主操作 Button | 执行当前状态对应动作 | 不取消任务 | 无 |
 | 任务取消 Button | 请求取消 | 关闭可关闭的反馈视图；若清理/回滚中则不可关闭 | 无 |
 | 重试 Button | 提交新的重试任务 | 不改变上一条失败事实 | 无 |
@@ -145,6 +151,11 @@ Button 只负责发送当前视图已经获得的动作闭包。UI 不新增状�
 - [ ] `Unavailable`、权限失败、回滚已确认和回滚未确认均有独立 UI；不存在“方案应用成功”替代状态。
 - [ ] 主窗口和 Settings 窗口固定尺寸不因英文文案而改变；长文案在详情区域换行。
 - [ ] 文档未把不存在的游戏成功、方案成功或自动修复状态写成 UI 状态。
+- [ ] 背景组圆点默认隐藏、hover 区域显示、hover 放大/高亮、离开恢复；键盘 focus 可独立显示并提交。
+- [ ] Wine 设置页只显示固定 `wine-crossover-11.0-1-signed`、共享 prefix 和单一任务动作；没有版本列表、作用范围或删除入口。
+- [ ] Wine 下载、安装、失败、取消和恢复中的状态使用同一任务区域，不因阶段切换改变布局。
+- [ ] 三款游戏的共用 runtime/prefix 是只读事实；没有按游戏 Wine 或 prefix 选择控件，也不把公共就绪写成三款游戏均已启动验证。
+- [ ] “此 Mac”显示机型、芯片、内存、macOS 版本四行；未读取时显示“未知”，无推断。
 
 ## 10. Task 4 几何实施要求
 
@@ -191,3 +202,71 @@ Button 只负责发送当前视图已经获得的动作闭包。UI 不新增状�
 | 回滚中 | `正在恢复应用前状态` | 等待，不可取消 |
 
 游戏 Button 的 label/value/hint、焦点顺序、装饰背景隐藏和证据格式见 `ui-validation-and-accessibility.md`。
+
+## 13. 背景组圆点 hover 预览（I-2 冻结）
+
+### 13.1 显示、位置与 hover
+
+| 状态 | UI 规格 |
+|---|---|
+| 默认 | 圆点容器 `opacity 0`；不参与指针 hit testing；仍保留在键盘焦点顺序与 VoiceOver 树中 |
+| 指针进入顶部悬停区 | 圆点容器 `opacity 1`，圆点可被鼠标激活 |
+| 指针离开顶部悬停区 | 圆点恢复 `opacity 0`；画面恢复当前选中组，不提交、不写回 |
+| 键盘焦点进入任一圆点 | 圆点容器显示，焦点环可见；与鼠标显示使用同一可见状态 |
+| 仅 1 个有效组 | 不创建圆点控制，也不制造单项焦点 |
+
+位置规格：
+
+- 悬停区固定高 `40pt`，位于窗口顶部 `0...40pt`，水平居中，宽度为圆点行宽度加两侧 `48pt` 安全余量，最大 `360pt`。
+- 圆点行位于 `top: 12pt`；单圆点命中框 `24 × 24pt`；HStack 间距 `10pt`。
+- 圆点内容默认直径 `10pt`；hover 放大 `1.2` 并高亮，仅作用于圆点内容，不改变命中框、间距或容器尺寸。
+- 圆点区与 GameSelectionRailView、PrimaryActionView 的 frame 不相交；底部操作区顶部 y ≥ `300pt`，垂直净距 ≥ `264pt`。
+
+### 13.2 圆点语义
+
+- 圆点 Button 的 accessibility label 为 `{组名}背景组`；value 为 `当前选中`、`预览中`、`加载中` 或 `加载失败` 中当前结构化事实；hint 为 `离开恢复当前选中组；Return/Space 提交`。
+- hover 预览、加载、失败都不改变当前选中组，不写持久化，不删除缓存。
+- 预览加载失败时，在当前选中组保持的前提下显示失败事实；重试入口只在 ViewModel/Domain 提供真实动作时出现。
+
+## 14. 统一 Wine runtime 与共享 prefix（Product/Research 回溯，2026-08-28）
+
+Wine 环境 Pane 只表达一个固定运行时产品事实，不提供用户选择模型：
+
+| 区域 | 结构 | 稳定约束 |
+|---|---|---|
+| 固定 runtime | 只读 `LabeledContent`：`wine-crossover-11.0-1-signed`、MiPlay 托管状态 | min `42pt`；不显示可选版本、不提供来源选择 |
+| 共享 prefix | 只读 `LabeledContent`：共享 prefix 状态 | min `42pt`；不显示路径、不提供按游戏 prefix 控件 |
+| 三款游戏共用事实 | 只读行或只读三行：原神、星穹铁道、绝区零均使用同一 runtime/prefix | 不显示每款游戏不同 runtime/prefix；不提供选择、解绑或删除 |
+| 当前任务 | 固定目标、阶段、真实进度/进度未知、传输、速度、失败/恢复事实 | 区域固定 `122pt`；任务字段不因下载/安装/恢复切换而重排 |
+| 任务动作 | 一个标准 Button 动作槽 | 依上游 action 呈现下载并安装、重试或取消；同一位置只出现一个动作 |
+
+### 14.1 交互与可访问性
+
+| 语言 | label | value | hint |
+|---|---|---|---|
+| 中文 | `统一 Wine 运行环境` | 固定 runtime 状态、共享 prefix 状态、当前任务事实 | `查看统一运行环境状态` |
+| English | `Managed Wine runtime` | Fixed runtime state, shared prefix state, current task facts | `View the shared runtime status` |
+
+约束：
+
+- 页面不出现“全局 / 单独”、`Picker`、版本列表、来源选择、外部 Wine、外部 prefix 或删除固定 runtime/prefix 的语义。
+- 统一任务按钮的可见文案由上游提供的 action 决定：未形成托管安装事实时为下载并安装，失败或恢复允许时为重试，任务进行中且可取消时为取消；UI 不自行判断条件。
+- 下载、安装、共享 prefix 准备和目标游戏启动前置验证必须分开显示。共享 prefix 已就绪不等于三款游戏启动前置均已通过。
+- 失败、取消或恢复未确认时，页面保留此前有效的固定 runtime/prefix 事实；不得用部分文件、目录存在或日志内容替代状态。
+- 共享 prefix 的资源锁、并发限制和生命周期由 Architecture/Implementation 定义；UI 只展示其结构化投影。
+
+## 15. “此 Mac”信息行（I-5 冻结）
+
+通用 Pane 的“此 Mac”为只读四行：
+
+| 行 | 已确认值 | 未读取/空值 | 读取失败 |
+|---|---|---|---|
+| 机型 | 系统报告的 machine name | `机型未知` | `无法读取机型` |
+| 芯片 | 系统报告的 chip name | `芯片未知` | `无法读取芯片` |
+| 内存 | 系统报告的物理内存 | `内存未知` | `无法读取内存` |
+| macOS 版本 | 系统报告的产品版本 | `macOS 版本未知` | `无法读取 macOS 版本` |
+
+- 每行使用 `LabeledContent`，行高 min `42pt`；未知或失败字段不显示空值、0、默认值或旧缓存。
+- model identifier 与 build number 不作为主层级字段。
+- Wine 目标磁盘空间作为独立只读行，失败显示 `无法读取目标磁盘空间`；不并入“此 Mac”主层级，也不作为 runtime/prefix 就绪结论。
+- VoiceOver 将“此 Mac”作为只读状态组：label `此 Mac`，value 为四个字段值及各自读取状态；单个字段失败只影响该字段。

@@ -16,6 +16,8 @@ public struct Game: Codable, Sendable, Identifiable, Equatable {
     public var lastIntegrity: IntegritySummary?
     public var lastMetadata: GameMetadata?
     public var metadataFailure: String?
+    /// Last launch diagnostic retained for the UI and support logs.
+    public var lastLaunchFailure: String?
     public var lastLaunchDate: Date?
     public var solutionApplications: [SolutionApplication]
 
@@ -35,6 +37,7 @@ public struct Game: Codable, Sendable, Identifiable, Equatable {
         lastIntegrity: IntegritySummary? = nil,
         lastMetadata: GameMetadata? = nil,
         metadataFailure: String? = nil,
+        lastLaunchFailure: String? = nil,
         lastLaunchDate: Date?,
         solutionApplications: [SolutionApplication]
     ) {
@@ -47,6 +50,7 @@ public struct Game: Codable, Sendable, Identifiable, Equatable {
             lastIntegrity: lastIntegrity,
             lastMetadata: lastMetadata,
             metadataFailure: metadataFailure,
+            lastLaunchFailure: lastLaunchFailure,
             lastLaunchDate: lastLaunchDate,
             solutionApplications: solutionApplications
         )
@@ -61,6 +65,7 @@ public struct Game: Codable, Sendable, Identifiable, Equatable {
         lastIntegrity: IntegritySummary? = nil,
         lastMetadata: GameMetadata? = nil,
         metadataFailure: String? = nil,
+        lastLaunchFailure: String? = nil,
         lastLaunchDate: Date?,
         solutionApplications: [SolutionApplication]
     ) {
@@ -72,6 +77,7 @@ public struct Game: Codable, Sendable, Identifiable, Equatable {
         self.lastIntegrity = lastIntegrity
         self.lastMetadata = lastMetadata
         self.metadataFailure = metadataFailure
+        self.lastLaunchFailure = lastLaunchFailure
         self.lastLaunchDate = lastLaunchDate
         self.solutionApplications = solutionApplications
     }
@@ -92,6 +98,7 @@ public struct Game: Codable, Sendable, Identifiable, Equatable {
         lastIntegrity = try container.decodeIfPresent(IntegritySummary.self, forKey: .lastIntegrity)
         lastMetadata = try container.decodeIfPresent(GameMetadata.self, forKey: .lastMetadata)
         metadataFailure = try container.decodeIfPresent(String.self, forKey: .metadataFailure)
+        lastLaunchFailure = try container.decodeIfPresent(String.self, forKey: .lastLaunchFailure)
         lastLaunchDate = try container.decodeIfPresent(Date.self, forKey: .lastLaunchDate)
         solutionApplications = try container.decodeIfPresent([SolutionApplication].self, forKey: .solutionApplications) ?? []
     }
@@ -106,12 +113,13 @@ public struct Game: Codable, Sendable, Identifiable, Equatable {
         try container.encodeIfPresent(lastIntegrity, forKey: .lastIntegrity)
         try container.encodeIfPresent(lastMetadata, forKey: .lastMetadata)
         try container.encodeIfPresent(metadataFailure, forKey: .metadataFailure)
+        try container.encodeIfPresent(lastLaunchFailure, forKey: .lastLaunchFailure)
         try container.encodeIfPresent(lastLaunchDate, forKey: .lastLaunchDate)
         try container.encode(solutionApplications, forKey: .solutionApplications)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, type, location, installPath, state, version, lastIntegrity, lastMetadata, metadataFailure, lastLaunchDate, solutionApplications
+        case id, type, location, installPath, state, version, lastIntegrity, lastMetadata, metadataFailure, lastLaunchFailure, lastLaunchDate, solutionApplications
     }
 
     nonisolated public static func == (lhs: Game, rhs: Game) -> Bool { lhs.id == rhs.id }

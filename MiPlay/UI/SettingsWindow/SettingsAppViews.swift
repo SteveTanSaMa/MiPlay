@@ -6,13 +6,93 @@
 import SwiftUI
 
 // Source: UI Design -> Settings panels
+// 用户指令：设置界面尽可能精简；诊断信息移入「关于」。
 
-/// 通用设置。
+/// 通用设置：只保留常用项。
 struct GeneralSettingsView: View {
     let settingsViewModel: SettingsViewModel
 
     var body: some View {
         Form {
+            // 用户指令：把影响游戏运行的设置（Metal HUD、超帧率、Retina、按键映射）
+            // 统一放在通用设置里（原先分散在每款游戏与 Wine 页），并置顶；
+            // 「语言」「更新」下移到其后。
+            Section {
+                Toggle(isOn: Binding(
+                    get: { settingsViewModel.gameEnvironmentSettings.metalHUD },
+                    set: { settingsViewModel.applyMetalHUD($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Metal HUD")
+                        Text("显示帧率、GPU 时间与渲染分辨率。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityLabel("Metal HUD")
+                .accessibilityHint("显示帧率、GPU 时间与渲染分辨率。")
+
+                Toggle(isOn: Binding(
+                    get: { settingsViewModel.gameEnvironmentSettings.fpsUnlock },
+                    set: { settingsViewModel.applyFPSUnlock($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("解锁帧率上限")
+                        // 游戏名统一走 `GameType.displayName`（「原神」「崩坏：星穹铁道」），
+                        // 避免手写出现冒号/点号不一致。
+                        Text("解锁「\(GameType.genshinImpact.displayName)」与「\(GameType.honkaiStarRail.displayName)」的帧率上限")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityLabel("解锁帧率上限")
+                .accessibilityHint("适用于原神和崩坏：星穹铁道。")
+
+                Toggle(isOn: Binding(
+                    get: { settingsViewModel.gameEnvironmentSettings.retinaMode },
+                    set: { settingsViewModel.applyRetinaMode($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Retina 模式")
+                        // 文案随开关切换：开 = Retina 渲染；关 = macOS 逻辑分辨率渲染。
+                        Text(settingsViewModel.gameEnvironmentSettings.retinaMode
+                             ? "以 Retina 模式渲染"
+                             : "以 macOS 逻辑分辨率渲染")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityLabel("Retina 模式")
+                .accessibilityHint("使用 Retina 分辨率渲染。")
+
+                Toggle(isOn: Binding(
+                    get: { settingsViewModel.gameEnvironmentSettings.leftCommandIsCtrl },
+                    set: { settingsViewModel.applyLeftCommandIsCtrl($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("左 Command 键用作 Control")
+                        Text("使用左 ⌘ 执行游戏内 Ctrl 快捷键。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityLabel("左 Command 键用作 Control")
+                .accessibilityHint("使用左 Command 执行游戏内 Control 快捷键。")
+
+            } header: {
+                Text("游戏运行")
+            } footer: {
+                Text("更改将在下次启动游戏时生效。")
+            }
+
             Section("语言") {
                 Picker("界面语言", selection: Binding(
                     get: { settingsViewModel.currentLanguage },
@@ -24,49 +104,59 @@ struct GeneralSettingsView: View {
                 }
             }
 
-            Section("更新与版本") {
+            Section("更新") {
                 Toggle("游戏客户端更新可用通知", isOn: Binding(
                     get: { settingsViewModel.isGameUpdateNotificationEnabled },
                     set: { settingsViewModel.setGameUpdateNotificationEnabled($0) }
                 ))
             }
 
-            Section("此 Mac") {
-                LabeledContent("机型标识", value: deviceValue(settingsViewModel.chipModel))
-                LabeledContent("macOS 版本", value: deviceValue(settingsViewModel.systemVersion))
-                LabeledContent("磁盘空间", value: diskSpaceValue(settingsViewModel.diskSpaceText))
-            }
-
-            Section("游戏库") {
-                ForEach(settingsViewModel.managedGames) { game in
-                    HStack {
-                        Text(game.type.displayName)
-                        Spacer()
-                        Text(game.state == .installed ? "已定位" : "未定位")
-                            .foregroundStyle(game.state == .installed ? .green : .secondary)
-                    }
+            Section("目录") {
+                Button("打开应用数据目录") {
+                    Task { await settingsViewModel.openDataDirectory() }
+                }
+                Button("打开日志目录") {
+                    Task { await settingsViewModel.openLogsDirectory() }
                 }
             }
+        }
+        .formStyle(.grouped)
+    }
+}
 
-            Section("日志") {
-                Button("查看日志") {
-                    Task { await settingsViewModel.exportLogs() }
-                }
-                if let logContent = settingsViewModel.logContent {
-                    if logContent.isEmpty {
-                        Text("暂无日志")
+/// 关于：版本信息 + 本机诊断信息（由「通用」移入）。
+struct AboutView: View {
+    let settingsViewModel: SettingsViewModel
+
+    var body: some View {
+        Form {
+            Section {
+                HStack(spacing: 14) {
+                    Image(systemName: "gamecontroller.fill")
+                        .font(.system(size: 40))
+                        .foregroundStyle(Color.accentColor)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("MiPlay")
+                            .font(.title2)
+                            .fontWeight(.bold)
+                        Text("版本 \(settingsViewModel.aboutInfo.appVersion) (\(settingsViewModel.aboutInfo.buildNumber))")
+                            .font(.caption)
                             .foregroundStyle(.secondary)
-                    } else {
-                        ScrollView {
-                            Text(logContent)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(height: 160)
-                        .textSelection(.enabled)
+                        Text(settingsViewModel.aboutInfo.license)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
                     }
+                    Spacer()
                 }
+                .padding(.vertical, 4)
+            }
+
+            Section("此 Mac") {
+                LabeledContent("机型", value: deviceValue(settingsViewModel.machineName))
+                LabeledContent("芯片", value: deviceValue(settingsViewModel.chipName))
+                LabeledContent("内存", value: deviceValue(settingsViewModel.physicalMemoryText))
+                LabeledContent("macOS 版本", value: deviceValue(settingsViewModel.systemVersion))
+                LabeledContent("Wine 目标磁盘空间", value: diskSpaceValue(settingsViewModel.diskSpaceText))
             }
         }
         .formStyle(.grouped)
@@ -78,38 +168,5 @@ struct GeneralSettingsView: View {
 
     private func diskSpaceValue(_ value: String) -> String {
         value == "检测失败" || value.isEmpty ? "无法读取目标磁盘空间" : value
-    }
-}
-
-/// 关于信息。
-struct AboutView: View {
-    let settingsViewModel: SettingsViewModel
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "gamecontroller.fill")
-                .font(.system(size: 64))
-                .foregroundStyle(Color.accentColor)
-
-            Text("MiPlay")
-                .font(.largeTitle)
-                .fontWeight(.bold)
-
-            Text("版本 \(settingsViewModel.aboutInfo.appVersion) (\(settingsViewModel.aboutInfo.buildNumber))")
-                .font(.body)
-                .foregroundStyle(.secondary)
-
-            Text(settingsViewModel.aboutInfo.license)
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-
-            Divider()
-
-            Text("一款面向 Mac 玩家的米哈游游戏启动器")
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

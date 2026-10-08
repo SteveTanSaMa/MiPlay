@@ -150,6 +150,42 @@ public actor ProcessManager {
 
     // MARK: - Launch
 
+    /// 子进程的基础环境：继承当前进程环境，但剔除只对开发/调试有意义的
+    /// Metal 变量（`MTL_*` / `METAL_*`）。
+    ///
+    /// Xcode 运行 MiPlay 时会注入 `MTL_DEBUG_LAYER=1`（Metal API Validation）等
+    /// 变量。Wine/DXMT 在开启校验的 Metal 下会命中调试层断言并直接终止游戏：
+    /// 实测绝区零 `MTLDebugBlitCommandEncoder ... BC7_RGBAUnorm vs
+    /// BC7_RGBAUnorm_sRGB` → abort，退出码 72。这些变量属于 MiPlay 自己的
+    /// 开发环境，不能透传给游戏或 Wine 进程。
+    ///
+    /// 过滤只作用于继承来的键；调用方显式传入的覆盖值在过滤之后合并，
+    /// 因此我们自己的 `MTL_HUD_*`（性能选项）不受影响。
+    public nonisolated static func childEnvironment(overrides: [String: String]? = nil) -> [String: String] {
+        filteredChildEnvironment(base: ProcessInfo.processInfo.environment, overrides: overrides)
+    }
+
+    /// 纯函数形式的环境过滤（可测试）：先剔除基环境里的开发调试 Metal 变量，
+    /// 再合并调用方的覆盖值。
+    public nonisolated static func filteredChildEnvironment(
+        base: [String: String],
+        overrides: [String: String]? = nil
+    ) -> [String: String] {
+        var environment = base
+        for key in developmentOnlyMetalVariables(in: environment) {
+            environment.removeValue(forKey: key)
+        }
+        if let overrides {
+            for (key, value) in overrides { environment[key] = value }
+        }
+        return environment
+    }
+
+    /// 当前进程环境里只属于开发调试的 Metal 变量键（用于诊断记录）。
+    public nonisolated static func developmentOnlyMetalVariables(in environment: [String: String]) -> [String] {
+        environment.keys.filter { $0.hasPrefix("MTL_") || $0.hasPrefix("METAL_") }
+    }
+
     public func launch(spec: ProcessLaunchSpec) throws -> UUID {
         guard FileManager.default.isExecutableFile(atPath: spec.executablePath) else {
             guard FileManager.default.fileExists(atPath: spec.executablePath) else {
@@ -171,16 +207,21 @@ public actor ProcessManager {
         }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: spec.executablePath)
-        process.arguments = spec.arguments
+        let executableURL = URL(fileURLWithPath: spec.executablePath)
+        if Self.isPOSIXShellScript(at: executableURL) {
+            // Sandboxed test and wrapper locations may not allow direct
+            // execve of a writable script. Keep the interpreter fixed and
+            // pass the script as data; native binaries use the normal path.
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = [spec.executablePath] + spec.arguments
+        } else {
+            process.executableURL = executableURL
+            process.arguments = spec.arguments
+        }
 
         // Merge requested values into the inherited environment. Assigning only the
         // caller's dictionary would remove PATH and other values Wine needs.
-        if let requestedEnvironment = spec.environment {
-            var environment = ProcessInfo.processInfo.environment
-            for (key, value) in requestedEnvironment { environment[key] = value }
-            process.environment = environment
-        }
+        process.environment = Self.childEnvironment(overrides: spec.environment)
         if let workingDirectory = spec.workingDirectory {
             process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
         }
@@ -266,6 +307,13 @@ public actor ProcessManager {
             workingDirectory: workingDirectory,
             captureOutput: captureOutput
         ))
+    }
+
+    private static func isPOSIXShellScript(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        return (try? handle.read(upToCount: 32))
+            .map { String(decoding: $0, as: UTF8.self).hasPrefix("#!/bin/sh") } == true
     }
 
     public func launchAndWait(

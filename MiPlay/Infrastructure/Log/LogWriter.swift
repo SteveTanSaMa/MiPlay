@@ -42,7 +42,7 @@ public actor LogWriter {
 
     private static let allowedModules: Set<String> = [
         "General", "App", "BackgroundMediaService", "FileIntegrityVerifier",
-        "GameFileSystemRepository", "GameRegistry", "LaunchOrchestrator",
+        "GameFileSystemRepository", "GameIconProvider", "GameRegistry", "LaunchOrchestrator",
         "LibraryViewModel", "LogWriter", "MediaTranscoder", "NetworkDownloadProvider",
         "PerformanceOptionManager", "PersistenceStore", "PreLaunchValidator", "ProcessManager", "SettingsViewModel",
         "SolutionEngine", "TaskScheduler", "VersionChecker", "WineRuntimeProvider",

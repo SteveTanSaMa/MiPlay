@@ -15,24 +15,32 @@ import AppKit
 /// 设置窗口场景。由 WindowGroup("settings") 承载为独立窗口。
 struct SettingsWindowScene: View {
     let settingsViewModel: SettingsViewModel
+    let registerWindow: (NSWindow) -> Void
     @State private var selectedSidebarItem: SettingsSidebarItem = .general
 
     var body: some View {
         NavigationSplitView {
-            List(SettingsSidebarItem.allCases, id: \.self, selection: $selectedSidebarItem) { item in
-                Label(item.rawValue, systemImage: item.icon)
-                    .tag(item)
+            List(selection: $selectedSidebarItem) {
+                Section("应用") {
+                    sidebarRow(.general)
+                    sidebarRow(.wineEnvironment)
+                }
+                Section("游戏") {
+                    sidebarRow(.gameGenshin)
+                    sidebarRow(.gameStarRail)
+                    sidebarRow(.gameZZZ)
+                }
+                sidebarRow(.about)
             }
+            .accessibilityLabel("设置分类")
             .listStyle(.sidebar)
-            .frame(width: 240)
             .navigationSplitViewColumnWidth(min: 240, ideal: 240, max: 240)
         } detail: {
             SettingsDetailView(
                 settingsViewModel: settingsViewModel,
                 selectedItem: selectedSidebarItem
             )
-            .frame(width: 560, alignment: .topLeading)
-            .frame(maxHeight: .infinity, alignment: .topLeading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .navigationSplitViewColumnWidth(min: 560, ideal: 560, max: 560)
         }
         .navigationSplitViewStyle(.balanced)
@@ -40,6 +48,8 @@ struct SettingsWindowScene: View {
         .task { await settingsViewModel.loadSettings() }
         .frame(width: 800, height: 448)
         .background(SettingsWindowPositioner())
+        // 用户指令：点击主窗口时要能关闭设置窗口 —— 这里把本窗口注册给 AppDelegate。
+        .background(WindowRegistrar(registerWindow: registerWindow))
         .alert("无法完成操作", isPresented: .init(
             get: { settingsViewModel.errorMessage != nil },
             set: { if !$0 { settingsViewModel.clearError() } }
@@ -48,6 +58,11 @@ struct SettingsWindowScene: View {
         } message: {
             Text(settingsViewModel.errorMessage ?? "")
         }
+    }
+
+    private func sidebarRow(_ item: SettingsSidebarItem) -> some View {
+        Label(item.rawValue, systemImage: item.icon)
+            .tag(item)
     }
 }
 
@@ -73,6 +88,8 @@ enum SettingsSidebarItem: String, CaseIterable, Hashable {
         }
     }
 
+    var title: String { gameType?.displayName ?? rawValue }
+
     var gameType: GameType? {
         switch self {
         case .gameGenshin: return .genshinImpact
@@ -91,6 +108,20 @@ struct SettingsDetailView: View {
     let selectedItem: SettingsSidebarItem
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(selectedItem.title)
+                .font(.title2.weight(.semibold))
+                .accessibilityAddTraits(.isHeader)
+            .padding(.horizontal, 24)
+            .padding(.top, 16)
+            .padding(.bottom, 8)
+
+            detailContent
+                .id(selectedItem)
+        }
+    }
+
+    private var detailContent: some View {
         Group {
             switch selectedItem {
             case .general:

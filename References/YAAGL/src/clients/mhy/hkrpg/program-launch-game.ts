@@ -44,7 +44,7 @@ cd "%~dp0"
 cd /d "${wine.toWinePath(gameDir)}"
 "${wine.toWinePath(resolve("./jadeite/jadeite.exe"))}" "${wine.toWinePath(
     join(gameDir, gameExecutable)
-  )}" -- -disable-gpu-skinning`;
+  )}"`;
   await writeFile(resolve("config.bat"), cmd);
   yield* patchProgram(gameDir, wine, server, config);
   await mkdirp(resolve("./logs"));
@@ -91,7 +91,7 @@ cd /d "${wine.toWinePath(gameDir)}"
       "cmd",
       ["/c", `${wine.toWinePath(resolve("./config.bat"))}`],
       {
-        MTL_HUD_ENABLED: config.metalHud ? "1" : "",
+        MTL_HUD_ENABLED: config.metalHud ? "1" : "0",
         WINEDLLOVERRIDES: "",
         ...(wine.attributes.renderBackend == "dxmt"
           ? {

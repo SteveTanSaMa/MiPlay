@@ -1,9 +1,14 @@
 # Screen Inventory（屏幕清单）
 
+> 当前实现核对（2026-10-09）：实际界面为沉浸主窗口、独立 Settings、启动准备遮罩、系统目录 Sheet 与 Alert。游戏详情、兼容方案独立页面及历史 WineProgressSheet 不在当前实际 UI 中。以下历史条目不能作为重新添加界面的依据；当前文件与验证清单见 [原生 UI 审查](ui-native-review-2026-10-09.md)。
+
+
 > **文档状态**：活跃（Active）
 > **UI 阶段**：界面结构设计
 > **继承来源**：UX 任务分析、UX 用户旅程、UX 信息模型
 > **Task 4 修正**：按当前 `MiPlay/UI/` 结构呈现真实任务状态；不添加不存在的成功屏幕。
+> **Product/Research 回溯修订**：2026-08-28。用户新硬约束覆盖此前 I-4；当前只允许固定 `wine-crossover-11.0-1-signed`、一个共享 Wine runtime 和一个共享 prefix。
+> **废止说明**：此前“全局 / 单独 Wine 版本”结构、Wine 版本列表、来源选择和按游戏 Wine 控件不再是 UI 输入。
 
 ---
 
@@ -15,8 +20,8 @@
 | 2 | GameLaunchView | 单游戏沉浸式启动视图，三款游戏共用同一布局结构 | 主窗口内容区 |
 | 3 | PathLocationFlow | 选择已安装游戏路径、反馈权限和完整性结果 | 系统 `NSOpenPanel` + 主窗口任务反馈 |
 | 4 | GameDetailWindow | 浏览、确认与应用兼容方案，以及游戏详情 | 独立窗口 |
-| 5 | Settings | 游戏级与全局配置管理 | 独立 Settings 场景 |
-| 6 | WineProgressSheet | Wine 运行时获取进度 | Sheet（模态）/ Overlay |
+| 5 | Settings | 通用配置、三款游戏非 Wine 设置与统一 Wine runtime 管理 | 独立 Settings 场景 |
+| 6 | WineProgressSheet | 统一固定 Wine 与共享 prefix 的单一准备任务反馈 | Sheet（模态）/ Overlay |
 
 ---
 
@@ -32,6 +37,9 @@
   - BackgroundView 占满窗口；窗口尺寸为 1280 × 688 px
   - GameSelectionRailView 位于左下角，Settings gear 位于 Game Rail 下方
   - PrimaryActionButton 位于右下角，不设置独立中心信息区
+  - 背景组圆点仅在有效背景组多于 1 个时存在：默认 `opacity 0`，指针进入顶部 40pt 悬停区后显示，离开后恢复隐藏
+  - 背景组圆点区固定位于窗口顶部 `top: 12pt`、水平居中；单圆点命中框 `24 × 24pt`、圆点间距 `10pt`，与左下 Game Rail 和右下主操作区无重叠
+  - 圆点 hover 时圆点内容放大并高亮，不改变命中框、布局尺寸或窗口层级
   - 状态通过 Game Rail 状态圆点、主按钮语义和任务反馈传达；不显示泛化成功状态
   - 游戏图标和设置齿轮均为标准 `Button`，可被 VoiceOver 和键盘激活
   - 加载遮罩为不透明白色，不使用半透明材质
@@ -70,10 +78,10 @@
 
 ### 5. Settings
 
-- **用途（Purpose）**：提供所有可配置项的浏览与修改界面。包含全局配置（通用、系统环境、Wine 环境）、游戏级配置（基本信息、安装状态）、关于信息。六项配置 Pane 通过 NavigationSplitView 的 Sidebar 导航切换。
+- **用途（Purpose）**：提供所有可配置项的浏览与修改界面。包含通用、三款游戏的非 Wine 设置、统一 Wine 环境和关于信息。六项配置 Pane 通过 NavigationSplitView 的 Sidebar 导航切换。
 - **入口（Entry）**：从 MainWindow 的 Game Rail 下方设置齿轮按钮（`openSettings()`）进入；键盘快捷键 `⌘,`；菜单栏"设置…"。
 - **出口（Exit）**：用户关闭窗口（红绿灯按钮 / ⌘W）。关闭后设置状态保持，不阻塞主窗口操作。
-- **归属任务（Owned Tasks）**：配置管理（全局管理 + 单游戏信息查看）、Wine 运行时状态查看。
+- **归属任务（Owned Tasks）**：通用配置、单游戏非 Wine 信息查看、统一 Wine runtime 与共享 prefix 状态查看。
 - **引用 UX 任务（Reference UX Tasks）**：任务"管理性能选项"（配置入口）、旅程 7（调优游戏表现）。
 - **窗口规格**：
   - 独立 `Settings` Scene 和独立 `GameDetailWindow`，非主窗口 overlay
@@ -85,6 +93,13 @@
   - Sidebar 宽度 240pt，列表项 24pt 行高，6 个 Pane
   - Detail 使用 `Form { Section }` + `.formStyle(.grouped)`，行高 min 42pt
   - 只读信息行使用 `LabeledContent`（macOS 13+）
+  - Wine 环境 Pane 只展示一个固定 runtime、一个共享 prefix 和一个统一任务区域；不展示作用范围切换、版本选择或版本列表
+  - 固定 runtime 身份显示为 `wine-crossover-11.0-1-signed`；来源由产品管理，页面不提供来源选择、URL 或外部路径
+  - 统一任务区域提供单一下载/安装/重试入口；任务进行中、失败、取消和恢复中的字段位置保持稳定
+  - 三款游戏以只读事实显示共用同一个 Wine runtime 和共享 prefix；不得为游戏显示不同 Wine、不同 prefix 或选择控件
+  - 共享 runtime/prefix 就绪只表示公共运行环境事实；不得由该状态推断三款游戏的启动前置均已通过
+  - 通用 Pane 的“此 Mac”为只读四行：机型、芯片、内存、macOS 版本；未读取字段显示明确未知态，不做推断
+  - Wine 目标磁盘空间作为独立只读行，不进入“此 Mac”主层级
   - 关闭方式：红绿灯关闭按钮 / ⌘W
 
 - **macOS 26 规范合规性**：

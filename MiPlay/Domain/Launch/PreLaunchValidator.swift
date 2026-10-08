@@ -48,7 +48,7 @@ public actor PreLaunchValidator {
 
     /// 校验结果
     public enum ValidationResult: Sendable {
-        case passed
+        case passed(warnings: [ValidationError] = [])
         case failed(errors: [ValidationError])
 
         public var isPassed: Bool {
@@ -58,6 +58,13 @@ public actor PreLaunchValidator {
 
         public var errors: [ValidationError] {
             if case .failed(let errs) = self { return errs }
+            return []
+        }
+
+        /// Non-blocking facts that the caller should surface without treating
+        /// the validation as a positive integrity assertion.
+        public var warnings: [ValidationError] {
+            if case .passed(let warnings) = self { return warnings }
             return []
         }
     }
@@ -108,7 +115,7 @@ public actor PreLaunchValidator {
             messageCode: "launch.preflight_started"
         ))
         let relativePaths = game.type.executableRelativePaths
-        let minimumDiskSpaceRequired = game.type.minimumDiskSpaceRequired
+        let minimumDiskSpaceRequired = game.type.launchDiskSpaceRequired
 
         // 1. 系统版本校验
         if !systemDetector.meetsMinimumRequirement() {
@@ -138,9 +145,7 @@ public actor PreLaunchValidator {
                         throw ValidationError.permissionDenied(gameName: displayName, detail: "stale bookmark 写回失败: \(error.localizedDescription)")
                     }
                 }
-                let executableFound = relativePaths.contains {
-                    FileManager.default.fileExists(atPath: resolvedURL.appendingPathComponent($0).path)
-                }
+                let executableFound = game.type.firstExistingExecutable(at: resolvedURL.path) != nil
                 guard executableFound else {
                     let firstPath = resolvedURL.appendingPathComponent(relativePaths[0]).path
                     throw ValidationError.executableNotFound(gameName: displayName, path: firstPath)
@@ -166,34 +171,42 @@ public actor PreLaunchValidator {
             return .failed(errors: errors)
         }
 
+        var warnings: [ValidationError] = []
         if let integrity = scopedValidation.0 {
-            if integrity.status != .passed {
-                if integrity.status == .unsupported {
-                    errors.append(.integrityUnsupported(gameName: displayName, detail: integrity.errors.joined(separator: "; ")))
-                } else {
-                    errors.append(.invalidFileState(gameName: displayName, detail: "完整性校验未通过"))
-                }
+            switch integrity.status {
+            case .passed:
+                break
+            case .unsupported:
+                // A release manifest is not shipped yet. Keep this as an
+                // explicit warning so existing, user-owned installations can
+                // launch without claiming IntegrityPassed.
+                warnings.append(.integrityUnsupported(
+                    gameName: displayName,
+                    detail: integrity.errors.joined(separator: "; ")
+                ))
+            case .failed, .cancelled:
+                errors.append(.invalidFileState(
+                    gameName: displayName,
+                    detail: integrity.errors.isEmpty ? "完整性校验未通过" : integrity.errors.joined(separator: "; ")
+                ))
             }
         } else {
-            errors.append(.integrityUnsupported(gameName: displayName, detail: "完整性校验器未配置"))
+            warnings.append(.integrityUnsupported(
+                gameName: displayName,
+                detail: "完整性校验器未配置"
+            ))
         }
 
-        // Source: Architecture Design → ADR-018 — 统一通过 WineVersionManager 决策
-        // 4. Wine 运行时校验。路径存在还不等于 runtime ready：必须用
-        // 同一个 binary 完成版本检测和 prefix 准备，失败即阻断启动。
-        let runtime = await wineVersionManager.validatedRuntime()
-        if let runtime {
-            do {
-                _ = try await wineRuntimeProvider.load(runtime: runtime)
-                _ = try await wineRuntimeProvider.preparePrefix(for: game.id, runtime: runtime)
-            } catch {
-                errors.append(.wineNotReady(gameName: displayName))
-            }
-        } else {
+        // Source: Architecture Design -> ADR 037-042 -> fixed runtime/shared prefix
+        // Readiness is a side-effect-free public pair check. Prefix creation is
+        // owned by WineRuntimeSetup; launch only reuses the validated pair under
+        // its exclusive lease.
+        if await wineVersionManager.validatedRuntime(for: game.id) == nil {
             errors.append(.wineNotReady(gameName: displayName))
         }
 
         // 5. Disk space was measured while the bookmark lease was active.
+        // This is a launch guard, not a game download/patch capacity check.
         if scopedValidation.1 < minimumDiskSpaceRequired {
             errors.append(.diskSpaceInsufficient(
                 gameName: displayName,
@@ -211,9 +224,10 @@ public actor PreLaunchValidator {
                 gameID: game.id,
                 phase: "completed",
                 result: "completed",
-                messageCode: "launch.preflight_passed"
+                messageCode: warnings.isEmpty ? "launch.preflight_passed" : "launch.preflight_passed_with_warnings",
+                fields: ["warningCount": String(warnings.count)]
             ))
-            return .passed
+            return .passed(warnings: warnings)
         }
         await logWriter?.record(.init(
             level: .error,

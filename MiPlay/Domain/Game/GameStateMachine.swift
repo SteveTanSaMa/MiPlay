@@ -39,6 +39,7 @@ public struct GameStateMachine: Sendable {
         // Installed → *
         case (.installed, .updateAvailable): return true
         case (.installed, .launching): return true
+        case (.installed, .launchFailed): return true
         case (.installed, .notInstalled): return true
 
         // UpdateAvailable → *
@@ -97,7 +98,7 @@ public struct GameStateMachine: Sendable {
         case .running:
             return "正在运行"
         case .launchFailed:
-            return "查看修复方案"
+            return "启动"
         }
     }
 

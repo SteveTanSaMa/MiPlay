@@ -55,3 +55,16 @@ Release 的第一次命令因未启用 `ENABLE_TESTABILITY` 导致测试 module 
 ## 门禁判定
 
 Gate 2（自动化实现）通过；Gate 3 仅自动化部分通过；Gate 4 性能未测；Gate 5 Release Ready 未通过。原因是 UI/Wine/系统权限/性能/覆盖率阈值仍无完整证据，而不是本轮自动化存在 P0/P1 assertion failure。
+
+## UI 优化验证（2026-10-08）
+
+- Debug arm64 build 通过；最终全量回归 **136 tests / 0 failures**（`QAArtifacts/UI-Optimization-20261008/tests-final.log`）。
+- 首次筛选误把文件名作为 XCTest 类名，执行 0 项，不计为通过证据。随后全量执行 136 项，两个测试共 5 条断言失败；复查发现工作区相应测试已被其他改动更新。本轮没有修改测试，针对两项复跑 2/2 通过，再次全量回归 136/136 通过。各次日志保留。
+- 原生 SwiftUI 静态预览检查控件浅/深背景、任务进度和恢复事实、设置浅/深外观、缓存主题与官方图标。预览使用隔离依赖、临时数据目录，不触发游戏启动或应用启动准备。
+- 实际点击/焦点、视频、VoiceOver 与系统辅助功能设置仍未验收。详见 [UI 修订](../03-ui/ui-revision-2026-10-08.md)。
+
+## 原生 UI 优化回归（2026-10-09）
+
+最终 Debug arm64 137 tests / 0 failures，证据为 `QAArtifacts/UI-Native-20261008/tests-final.log`；新增播放器初始暂停、复用与 pauseAll 回归。原生独立预览覆盖控件状态、浅/深背景、Settings Light/Dark、游戏/Wine/关于页、Dark Mode 白色启动与失败状态。
+
+computer use 验证 Tab/Shift-Tab、Space/Return、游戏选择、主操作单次回调、设置导航与表单滚动。未定位游戏的维护按钮为 disabled。未实际启用 VoiceOver，未切换全局三项辅助功能；未完成真实应用完整启动、目录授权/取消或视频视觉/性能验收。不得把预览和单元测试描述为端到端通过。详见 [原生 UI 审查](../03-ui/ui-native-review-2026-10-09.md)。

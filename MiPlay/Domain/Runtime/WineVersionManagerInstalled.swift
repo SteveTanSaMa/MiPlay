@@ -3,168 +3,116 @@
 
 import Foundation
 
-// Source: Architecture Design -> WineVersionManager -> installed runtime records
+// Source: Architecture Design -> ADR 037/042 -> one non-deletable runtime
 extension WineVersionManager {
+    /// Compatibility projection for existing callers. The returned collection
+    /// contains zero or one fixed runtime and never exposes alternatives.
     public func getInstalledVersions() async -> [WineVersionInfo] {
-        let versionsDir = await wineVersionsDirectory()
-        var installed: [WineVersionInfo] = []
-
-        guard FileManager.default.fileExists(atPath: versionsDir.path) else { return installed }
-
-        do {
-            let contents = try FileManager.default.contentsOfDirectory(atPath: versionsDir.path)
-            for item in contents {
-                guard Self.managedWineTags.contains(item), installedVersionTags.contains(item) else { continue }
-                let itemPath = versionsDir.appendingPathComponent(item, isDirectory: true)
-                    .resolvingSymlinksInPath().standardizedFileURL
-                let wineBinPath = itemPath.appendingPathComponent("bin/wine").path
-                guard itemPath.path.hasPrefix(versionsDir.resolvingSymlinksInPath().standardizedFileURL.path + "/"),
-                      FileManager.default.isExecutableFile(atPath: wineBinPath) else { continue }
-                if FileManager.default.fileExists(atPath: wineBinPath) {
-                    installed.append(WineVersionInfo(
-                        id: item,
-                        tagName: item,
-                        name: item,
-                        downloadURL: URL(string: "about:blank")!,
-                        fileSize: 0,
-                        publishedAt: Date(),
-                        isDownloaded: true,
-                        isSelected: selectedVersionTag == item
-                    ))
-                }
-            }
-        } catch {
-            Task { await logWriter.error("获取已安装版本列表失败: \(error)", module: "WineVersionManager") }
+        guard let record = runtimeRecord,
+              record.identity == Self.fixedRuntimeTag,
+              FileManager.default.isExecutableFile(atPath: record.binaryPath) else {
+            return []
         }
-
-        return installed
+        let source = BuiltInWineVersions.source(for: Self.fixedRuntimeTag)
+        return [WineVersionInfo(
+            id: Self.fixedRuntimeTag,
+            tagName: Self.fixedRuntimeTag,
+            name: source?.displayName ?? Self.fixedRuntimeTag,
+            downloadURL: URL(string: "about:blank")!,
+            fileSize: 0,
+            publishedAt: Date(),
+            sourceID: record.sourceID,
+            policyRevision: "2026-08-28",
+            assetName: record.assetName,
+            isDownloaded: true,
+            isSelected: true
+        )]
     }
 
-    /// 标记版本为已安装（下载+解压完成后调用）
+    /// Commits the single managed runtime record after binary validation.
     public func markVersionInstalled(tagName: String) async throws {
-        guard Self.managedWineTags.contains(tagName) else {
+        guard tagName == Self.fixedRuntimeTag else {
             throw VersionManagerError.versionNotFound(tagName)
         }
         let versionsDir = await wineVersionsDirectory()
-        let finalURL = versionsDir.appendingPathComponent(tagName, isDirectory: true)
+        let finalURL = versionsDir.appendingPathComponent(Self.fixedRuntimeTag, isDirectory: true)
         let canonicalRoot = versionsDir.resolvingSymlinksInPath().standardizedFileURL
         let canonicalVersion = finalURL.resolvingSymlinksInPath().standardizedFileURL
+        let binary = canonicalVersion.appendingPathComponent("bin/wine")
         guard canonicalVersion.path.hasPrefix(canonicalRoot.path + "/"),
-              FileManager.default.isExecutableFile(atPath: canonicalVersion.appendingPathComponent("bin/wine").path) else {
-            throw VersionManagerError.extractionFailed("Wine binary 未通过安装验证")
+              FileManager.default.fileExists(atPath: binary.path) else {
+            throw VersionManagerError.extractionFailed("固定 Wine binary 不存在: \(binary.path)")
         }
-        var appData = try await persistenceStore.readAppData()
-        var candidate = Set(appData.installedWineVersions)
-        candidate.insert(tagName)
-        appData.installedWineVersions = candidate.sorted()
-        try await persistenceStore.writeAppData(appData)
+
+        // tar archives can carry a mode that macOS does not preserve as
+        // executable after a sandboxed move. Normalize the entry at the
+        // managed boundary before accepting the runtime.
+        do {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: binary.path
+            )
+        } catch {
+            throw VersionManagerError.extractionFailed(
+                "固定 Wine binary 权限设置失败: \(binary.path): \(error.localizedDescription)"
+            )
+        }
+        guard FileManager.default.isExecutableFile(atPath: binary.path) else {
+            let permissions = (try? FileManager.default.attributesOfItem(atPath: binary.path)[.posixPermissions]) as? NSNumber
+            let mode = permissions.map { String(format: "%03o", $0.intValue & 0o777) } ?? "未知"
+            throw VersionManagerError.extractionFailed(
+                "固定 Wine binary 不可执行: \(binary.path)，权限 \(mode)"
+            )
+        }
+
+        let record = ManagedWineRuntimeRecord(
+            identity: Self.fixedRuntimeTag,
+            sourceID: BuiltInWineVersions.officialSource.sourceID,
+            assetName: cachedAvailableVersion(tagName: Self.fixedRuntimeTag)?.assetName
+                ?? "wine-crossover-11.0-1-osx64-signed.tar.xz",
+            rootPath: canonicalVersion.path,
+            binaryPath: binary.path,
+            architecture: "arm64",
+            revision: UUID().uuidString,
+            state: "installed",
+            verifiedAt: Date()
+        )
+        try await persistenceStore.updateAppData { appData in
+            appData.managedWineRuntime = record
+        }
         let committed = try await persistenceStore.readAppData()
-        guard committed.installedWineVersions.contains(tagName) else {
-            throw VersionManagerError.persistenceFailed("安装记录写入后重读未包含 \(tagName)")
+        guard let verified = committed.managedWineRuntime,
+              verified.identity == record.identity,
+              verified.sourceID == record.sourceID,
+              verified.assetName == record.assetName,
+              verified.rootPath == record.rootPath,
+              verified.binaryPath == record.binaryPath,
+              verified.architecture == record.architecture,
+              verified.revision == record.revision,
+              verified.state == record.state else {
+            throw VersionManagerError.persistenceFailed("固定 Wine 安装记录写回后重读不一致")
         }
-        installedVersionTags = Set(committed.installedWineVersions)
+        runtimeRecord = record
+        selectedVersionTag = Self.fixedRuntimeTag
+        installedVersionTags = [Self.fixedRuntimeTag]
         await logWriter.record(.init(
             level: .info,
             module: "WineVersionManager",
             eventName: "wine.install.commit",
-            wineTag: tagName,
+            wineTag: Self.fixedRuntimeTag,
             phase: "installedRecord",
             result: "completed",
             messageCode: "wine.install_record_committed",
-            fields: ["persistence": "verified"]
+            fields: ["persistence": "verified", "runtimeIdentity": Self.fixedRuntimeTag]
         ))
     }
 
-    /// 删除指定版本
+    /// The current runtime/shared prefix is a protected pair and has no user
+    /// deletion path in the fixed-runtime product.
     public func deleteVersion(tagName: String) async throws {
-        guard Self.managedWineTags.contains(tagName), BuiltInWineVersions.source(for: tagName) != nil else {
+        guard tagName == Self.fixedRuntimeTag else {
             throw VersionManagerError.versionNotFound(tagName)
         }
-        guard !activeDownloadTags.values.contains(tagName) else {
-            throw VersionManagerError.recoveryRequired("Wine 版本正在使用或下载中，不能删除")
-        }
-
-        var appData = try await persistenceStore.readAppData()
-        guard appData.installedWineVersions.contains(tagName) else {
-            throw VersionManagerError.versionNotFound("未找到已安装记录: \(tagName)")
-        }
-        guard appData.selectedWineVersion != tagName, selectedVersionTag != tagName else {
-            throw VersionManagerError.recoveryRequired("当前选中的 Wine 版本不能删除")
-        }
-        if appData.recoveryRecords.contains(where: {
-            $0.kind == "wineInstall" && $0.target == tagName && $0.resolvedAt == nil
-        }) {
-            throw VersionManagerError.recoveryRequired("Wine 版本存在未完成恢复事实")
-        }
-
-        let destDir = await wineVersionsDirectory()
-        let canonicalBase = destDir.resolvingSymlinksInPath().standardizedFileURL
-        let versionURL = destDir.appendingPathComponent(tagName, isDirectory: true)
-        let canonicalVersion = versionURL.resolvingSymlinksInPath().standardizedFileURL
-        guard canonicalVersion.path.hasPrefix(canonicalBase.path + "/") else {
-            throw VersionManagerError.sourceInvalid("Wine 删除路径不在托管目录内")
-        }
-
-        let deletingURL = canonicalBase.appendingPathComponent(".deleting", isDirectory: true)
-        try FileManager.default.createDirectory(at: deletingURL, withIntermediateDirectories: true)
-        let archiveURL = deletingURL.appendingPathComponent("\(tagName)-\(UUID().uuidString)", isDirectory: true)
-        var movedForDelete = false
-        if FileManager.default.fileExists(atPath: canonicalVersion.path) {
-            try FileManager.default.moveItem(at: canonicalVersion, to: archiveURL)
-            movedForDelete = true
-        }
-
-        appData.installedWineVersions.removeAll { $0 == tagName }
-        do {
-            try await persistenceStore.writeAppData(appData)
-            let verified = try await persistenceStore.readAppData()
-            guard !verified.installedWineVersions.contains(tagName) else {
-                throw VersionManagerError.persistenceFailed("Wine 删除记录写回后仍存在")
-            }
-        } catch {
-            if movedForDelete {
-                do { try FileManager.default.moveItem(at: archiveURL, to: canonicalVersion) }
-                catch let restoreError {
-                    let detail = "Wine 删除记录写入失败: \(error.localizedDescription); 原目录恢复失败: \(restoreError.localizedDescription)"
-                    let recoveryError = await recordRecovery(RecoveryRecord(
-                        kind: "wineDelete",
-                        target: tagName,
-                        phase: "deletePersistence",
-                        detail: detail,
-                        payload: ["archivePath": archiveURL.path, "finalPath": canonicalVersion.path]
-                    ))
-                    throw VersionManagerError.recoveryRequired(recoveryError.map { "\(detail); \($0)" } ?? detail)
-                }
-            }
-            throw error
-        }
-
-        if movedForDelete {
-            do { try FileManager.default.removeItem(at: archiveURL) }
-            catch {
-                let detail = "Wine 删除记录已提交，但临时目录清理失败: \(error.localizedDescription)"
-                let recoveryError = await recordRecovery(RecoveryRecord(
-                    kind: "wineDelete",
-                    target: tagName,
-                    phase: "deleteCleanup",
-                    detail: detail,
-                    payload: ["archivePath": archiveURL.path]
-                ))
-                throw VersionManagerError.recoveryRequired(recoveryError.map { "\(detail); \($0)" } ?? detail)
-            }
-        }
-        installedVersionTags.remove(tagName)
-        await logWriter.info("Wine 版本已删除: \(tagName)", module: "WineVersionManager")
-        await logWriter.record(.init(
-            level: .info,
-            module: "WineVersionManager",
-            eventName: "wine.delete",
-            wineTag: tagName,
-            phase: "completed",
-            result: "completed",
-            messageCode: "wine.delete_completed",
-            fields: ["persistence": "verified", "cleanupVerified": "true"]
-        ))
+        throw VersionManagerError.recoveryRequired("当前固定 Wine runtime 与共享 prefix 不提供删除操作")
     }
-
 }

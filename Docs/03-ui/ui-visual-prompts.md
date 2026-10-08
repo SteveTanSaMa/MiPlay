@@ -1,5 +1,9 @@
 # Visual Prompts（文生图模型视觉提示词）
 
+> **2026-10-07 第二轮反馈覆盖**：用户希望更通透。主窗口改用 `.clear` 原生液态玻璃配轻烟黑染色，移除第一轮厚黑底，以细边框和局部文字阴影辅助辨认；以 [UI 修订计划](ui-revision-2026-10-07.md) 第二轮方案为准。
+
+> **2026-10-07 用户方向覆盖**：主窗口的游戏图标、设置入口和主按钮改为黑色液态玻璃试用版，白色前景、清晰选中描边；禁用按钮保留完整面板。下文对应默认玻璃与 `.primary` 配色描述由此修订覆盖，加载层和设置窗口保持原规范。实现、验证与交接见 [UI 修订计划](ui-revision-2026-10-07.md)。
+
 > **文档状态**：活跃（Active）
 > **目的**：为每个关键 Screen 生成可供文生图模型使用的视觉设计提示词
 > **美学基准**：Apple 美学（macOS 26+ 原生质感）
@@ -11,7 +15,7 @@
 
 **目标模型：** Midjourney
 
-**English Prompt：**
+**English Prompt:**
 ```
 A full-screen immersive game launcher interface on macOS 26, Apple Liquid Glass design aesthetic, fixed at 1280 by 688 pixels. The entire window is dominated by a fantasy game key visual artwork as the background, rendered edge-to-edge. At the lower left, exactly three compact game icon contents form a vertical GameSelectionRailView; each icon uses glassEffect, a 16pt corner radius, and a small status dot. Directly below the game rail sits a glass gear button that opens Settings. A single prominent PrimaryActionButton sits at the lower right, using glassEffect with Glass.regular and a 16pt corner radius, with no center information panel or secondary action menu. The button label is the only primary status cue. Loading is represented by an opaque white loading layer. The overall atmosphere is premium, serene, and unobstructed, with the background artwork remaining the visual focus. Soft dynamic shadows, subtle glass reflections, no window title bar visible, content spills edge to edge. 8K detail, cinematic lighting -- shot on 50mm lens, f/1.8.
 ```
@@ -27,15 +31,13 @@ A full-screen immersive game launcher interface on macOS 26, Apple Liquid Glass 
 ---
 
 
----
-
-## 按钮视觉策略（Button Visual Strategy）
+### 按钮视觉策略（Button Visual Strategy）
 
 > **适用版本**：UI-11 + UI-12 修复后；Settings 独立场景 (ADR 020)
 > **设计原则**：按钮在任意背景色调下保持可辨识，遵循 Apple Liquid Glass 美学，不退回半透明遮罩方案。
 > **CR-6 修复**：主操作按钮使用 `.primary` 文字，系统自动适配亮色/暗色模式。
 
-### 材质策略
+#### 材质策略
 
 所有按钮和可点击图标使用毛玻璃材质替代固定颜色：
 
@@ -48,7 +50,7 @@ A full-screen immersive game launcher interface on macOS 26, Apple Liquid Glass 
 
 [^1]: 设置齿轮图标直接使用毛玻璃背景而非 `.foregroundStyle(.secondary)` 固定灰色，确保在深色背景素材上保持可见。毛玻璃材质自动根据背景明暗调整透明度和色调。
 
-### Hover 悬停效果
+#### Hover 悬停效果
 
 所有可点击按钮和图标必须包含 hover 态反馈，遵循 macOS 原生质感：
 
@@ -70,9 +72,9 @@ A full-screen immersive game launcher interface on macOS 26, Apple Liquid Glass 
 
 **目标模型：** Midjourney
 
-**English Prompt：**
+**English Prompt:**
 ```
-A close-up detail view of a macOS 26 GameSelectionRailView at the lower left of a full-screen game launcher. Exactly three vertically arranged GameIconContent items use glassEffect and 16pt rounded corners, each with a game icon and a small colored status dot. A separate glass gear button sits directly below the rail. There is no rail background container and no center information panel. The background artwork remains visible around the controls. Cinematic macro shot, 8K detail, premium glass rendering with realistic reflections. Shot on 85mm lens, f/2.8.
+A close-up detail view of a macOS 26 GameSelectionRailView at the lower left of a full-screen game launcher. Exactly three vertically arranged GameIconContent items use glassEffect and 16ptrounded corners, each with a game icon and a small colored status dot. A separate glass gear button sits directly below the rail. There is no rail background container and no center information panel. The background artwork remains visible around the controls. Cinematic macro shot, 8K detail, premium glass rendering with realistic reflections. Shot on 85mm lens, f/2.8.
 ```
 
 **中文说明：**
@@ -89,7 +91,7 @@ macOS 26 游戏启动器左下角 `GameSelectionRailView` 的细节特写。三�
 
 **目标模型：** Midjourney
 
-**English Prompt：**
+**English Prompt:**
 ```
 A macOS 26 game path location flow using the native NSOpenPanel and a restrained Liquid Glass task feedback area. The system file picker selects an existing game executable or folder; selecting a path is not presented as installation or success. After the picker, show a compact task feedback region with the current phase, a determinate progress indicator only when a real estimate exists, and clear states for access denied, integrity failed, integrity unsupported, cancelled, and retryable failure. Use standard semantic buttons labeled "Cancel", "Retry", and "Choose Again". Keep the fixed 1280 by 688 main window structure and do not add a success banner.
 ```
@@ -108,7 +110,7 @@ macOS 26 已安装游戏路径定位流程，优先使用系统 `NSOpenPanel`。
 
 **目标模型：** Midjourney
 
-**English Prompt：**
+**English Prompt:**
 ```
 A macOS 26 standalone GameDetailWindow for browsing compatibility solutions, Apple Liquid Glass design. The fixed 550 by 700 window contains a game header, a segmented tab picker, and a CompatibilitySolutionView. The solution list shows risk, scope, availability, current application state, and diagnostic facts. A selected solution can show a standard "Apply" Button or a standard "Rollback" Button; Applying, RolledBack, Failed, and recovery-unconfirmed states are distinct, and Applied explicitly does not imply that the game is running. The window remains open after a verified solution result so the user can inspect the fact before returning to launch. Use semantic buttons and visible text, not color alone.
 ```
@@ -133,7 +135,7 @@ macOS 26 独立 `GameDetailWindow` 的兼容方案页，使用 Apple Liquid Glas
 - NavigationSplitView sidebar 240pt，6 个 Pane
 - Detail 使用 Form + .formStyle(.grouped)，LabeledContent，42pt 行高
 
-**English Prompt：**
+**English Prompt:**
 ```
 A macOS 26 standalone settings window for a game launcher, Apple Liquid Glass design. The window is compact at 800pt by 448pt with a hidden title bar, floating independently — not as a sheet or overlay. Inside, a standard NavigationSplitView layout: left sidebar at 240pt width with 6 navigation items at 24pt row height — "General" (gear icon), three game entries (game controller icons), "Wine Environment" (wine glass icon), and "About" (info circle icon). A subtle divider separates the sidebar from the content area. On the right side, the detail panel uses macOS grouped Form style with sections containing LabeledContent rows at minimum 42pt height, showing configuration toggles, text info rows, and pickers — all natively spaced. The About pane features a centered VStack layout with a large app icon (64pt), app name "MiPlay" in bold title, version info, and a centered description. The overall feeling is native, clean, and premium — a dedicated settings window that feels like part of macOS itself. 8K detail, soft shadows, edge highlights on glass edges. Shot on 50mm lens, f/2.8.
 ```
@@ -149,7 +151,7 @@ A macOS 26 standalone settings window for a game launcher, Apple Liquid Glass de
 
 **目标模型：** Midjourney
 
-**English Prompt：**
+**English Prompt:**
 ```
 A macOS 26 progress sheet showing Wine runtime download status, Apple Liquid Glass design. A compact frosted glass panel (420pt wide) floats in the center of a dark, blurred game background. The sheet's glass material is thick and translucent with subtle animated shimmer effects. In the center of the sheet, a large circular progress ring made of glass with a gradient glow (cyan to blue) animates smoothly -- showing approximately 67% completion. Inside the ring, the percentage "67%" in large white digits. Below the ring, a stage description "Downloading Wine Runtime..." in white, with a smaller sub-text "Stage 2 of 4 - Downloading (1.2 GB / 2.4 GB)" in light gray. A vertical list of four stage indicators on the left side of the ring: Stage 1 "Preparing" marked complete (green checkmark), Stage 2 "Downloading" marked active (cyan pulse), Stage 3 "Verifying" marked pending (gray), Stage 4 "Installing" marked pending (gray). At the bottom, a small "Cancel" glass button in subtle style. A faint network speed indicator "12.5 MB/s" at the bottom right. The overall feeling is smooth, technical, and premium -- like watching a sophisticated system prepare itself. 8K detail, subtle glass reflections, animated progress glow. Shot on 50mm lens, f/2.2.
 ```
@@ -168,7 +170,7 @@ macOS 26 Wine 运行时下载进度 Sheet，Apple Liquid Glass 设计。紧凑�
 
 **目标模型：** Midjourney
 
-**English Prompt：**
+**English Prompt:**
 ```
 A macOS 26 game launcher main window in its initial empty state, fixed at 1280 by 688 pixels. The full-screen game background remains unobstructed. At the lower left, three standard GameIconButton items form the GameSelectionRailView, each with a glassEffect label, 16pt rounded corners, and an optional neutral status dot; a semantic settings gear Button sits directly below the rail. At the lower right, a single Glass.regular PrimaryActionButton with a 16pt corner radius reads "Locate Game". There is no center information panel, no rail background container, and no secondary action menu. Loading uses an opaque white layer. The overall feeling is polished, welcoming, and focused. Cinematic lighting, 8K detail, subtle glass reflections, no window title bar. Shot on 50mm lens, f/2.2.
 ```
@@ -179,4 +181,23 @@ macOS 26 游戏启动器初始空状态主窗口，尺寸 1280 × 688。背景�
 **设计依据：**
 - 美学风格：Apple 美学 — Liquid Glass 材质
 - 参考来源：research-ui-patterns.md — Apple Web Design 的邀请式 CTA、macOS 26 设计规范
-- 关键视觉特征：`.glassEffect`、`Glass.regular`、16pt 圆角、左下游戏选择栏、右下主操作、不透明白色加载层
+- 关键视觉特征：`.glassEffect`、`.Glass.regular`、16pt 圆角、左下游戏选择栏、右下主操作、不透明白色加载层
+
+---
+
+### RecoveryOverlay — Visual Prompt
+
+**目标模型：** Midjourney
+
+**English Prompt:**
+```
+A macOS 26 recovery overlay for a game launcher, using Apple Liquid Glass design. A centered frosted glass panel (about 480pt wide) floats over a blurred, darker game background. The panel has a subtle animated shimmer. Inside, a circular progress indicator made of glass with a soft glow (blue to cyan gradient) animates. Below the ring, a title text reads "Recovering game state..." in white, and a smaller sub-text "This may take a moment" in light gray. At the bottom, a small "Cancel" glass button in subtle style. The overall feeling is technical, premium, and unobtrusive — like watching a sophisticated system restore itself. 8K detail, subtle glass reflections, animated progress glow. Shot on 50mm lens, f/2.2.
+```
+
+**中文说明：**
+macOS 26 重启恢复遮罩，Apple Liquid Glass 设计。居中毛玻璃面板（约 480pt 宽）浮动在模糊变暗的游戏背景之上。面板有微妙闪光动画。中央环形玻璃进度指示器带蓝到青渐变的柔光。下方标题文字 "Recovering game state..." 为白色，副文本 "This may take a moment" 为浅灰色。底部有细小的 "Cancel" 玻璃按钮。整体感觉技术感、高端且不显著 — 如同系统自我恢复的过程。
+
+**设计依据：**
+- 美学风格：Apple 美学 — Liquid Glass 材质
+- 参考来源：research-ui-patterns.md — macOS 26 设计规范的 Overlay 层级
+- 关键视觉特征：毛玻璃面板、环形进度指示器、恢复描述文本、Cancel 按钮、居中浮动

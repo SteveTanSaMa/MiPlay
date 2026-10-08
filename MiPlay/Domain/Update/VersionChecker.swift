@@ -11,6 +11,19 @@ import Foundation
 /// Compares authorized local evidence with an approved remote version source.
 /// It never performs a game update or treats metadata presence as integrity.
 public actor VersionChecker {
+    /// Official HoyoPlay branch metadata used for version notifications.
+    /// The response contains the latest channel branch for all supported
+    /// mainland games; it is not a game-file update manifest.
+    public static let defaultRemoteManifestURL = URL(
+        string: "https://hyp-api.mihoyo.com/hyp/hyp-connect/api/getGameBranches?launcher_id=jGHBHlcOq1&language=zh-cn"
+    )!
+
+    private static let remoteGameIDs: [GameType: String] = [
+        .genshinImpact: "1Z8W5NHUQb",
+        .honkaiStarRail: "64kMb5iAWu",
+        .zenlessZoneZero: "x6znKlJ0xK"
+    ]
+
     private struct RemoteVersionEvidence: Sendable {
         let version: String
         let channel: String?
@@ -45,7 +58,7 @@ public actor VersionChecker {
         self.gameRegistry = gameRegistry
     }
 
-    public func checkVersion(for game: Game) async throws -> VersionCheckResult {
+    public func checkVersion(for game: Game, fileVerification: Bool = false) async throws -> VersionCheckResult {
         guard let location = game.location, location.bookmarkData != nil else {
             throw VersionError.versionFileMissing("游戏目录尚未获得有效授权")
         }
@@ -65,7 +78,8 @@ public actor VersionChecker {
             for: game.type,
             installPath: access.url.path,
             gameID: game.id,
-            locationRevision: access.resolvedLocation.bookmarkVersion
+            locationRevision: access.resolvedLocation.bookmarkVersion,
+            fileVerification: fileVerification
         )
     }
 
@@ -75,15 +89,26 @@ public actor VersionChecker {
 
     // The path overload is retained only for tests and legacy migration. The
     // production launch/update path resolves GameLocation first.
-    internal func checkVersion(for gameType: GameType, installPath: String) async throws -> VersionCheckResult {
-        try await checkVersion(for: gameType, installPath: installPath, gameID: nil, locationRevision: nil)
+    internal func checkVersion(
+        for gameType: GameType,
+        installPath: String,
+        fileVerification: Bool = false
+    ) async throws -> VersionCheckResult {
+        try await checkVersion(
+            for: gameType,
+            installPath: installPath,
+            gameID: nil,
+            locationRevision: nil,
+            fileVerification: fileVerification
+        )
     }
 
     private func checkVersion(
         for gameType: GameType,
         installPath: String,
         gameID: String?,
-        locationRevision: Int?
+        locationRevision: Int?,
+        fileVerification: Bool
     ) async throws -> VersionCheckResult {
         let operationID = UUID()
         await logWriter.record(.init(
@@ -100,22 +125,22 @@ public actor VersionChecker {
             for: gameType,
             installPath: installPath,
             gameID: gameID,
-            locationRevision: locationRevision
+            locationRevision: locationRevision,
+            fileVerification: fileVerification
         )
         let remote = try await fetchLatestVersion(for: gameType)
         var conflicts: [String] = []
 
-        if integrityManifests[gameType] == nil {
-            conflicts.append("缺少与当前 Game/版本关联的完整性 manifest")
-        }
-        if evidence.pkgVersionMapping != .mapped {
-            conflicts.append("pkg_version 条目没有已批准的 Game/渠道/版本映射")
-        }
-        if !evidence.pkgVersionValidationErrors.isEmpty {
-            conflicts.append(contentsOf: evidence.pkgVersionValidationErrors)
-        }
-
         if let manifest = integrityManifests[gameType] {
+            // A manifest strengthens the version result, but its absence does
+            // not make a valid config.ini comparison impossible. Full file
+            // integrity remains a separate capability.
+            if evidence.pkgVersionMapping != .mapped, !evidence.pkgVersionEntries.isEmpty {
+                conflicts.append("pkg_version 条目没有已批准的 Game/渠道/版本映射")
+            }
+            if !evidence.pkgVersionValidationErrors.isEmpty {
+                conflicts.append(contentsOf: evidence.pkgVersionValidationErrors)
+            }
             if manifest.gameID != gameType.rawValue {
                 conflicts.append("IntegrityManifest 与目标 Game 不匹配")
             }
@@ -209,7 +234,8 @@ public actor VersionChecker {
         for gameType: GameType,
         installPath: String,
         gameID: String?,
-        locationRevision: Int?
+        locationRevision: Int?,
+        fileVerification: Bool
     ) async throws -> LocalEvidence {
         let url = URL(fileURLWithPath: installPath, isDirectory: true)
             .appendingPathComponent(gameType.versionFileRelativePath)
@@ -262,10 +288,16 @@ public actor VersionChecker {
         let entries = try await parsePkgVersion(
             at: URL(fileURLWithPath: installPath, isDirectory: true)
         )
-        let pkgValidationErrors = try await validatePkgVersionEntries(
-            at: URL(fileURLWithPath: installPath, isDirectory: true),
-            entries: entries
-        )
+        // 逐文件 MD5 校验在两种情况下执行：显式请求（用户在设置里点"校验文件
+        // 完整性"）或配置了校验清单。常规版本检查只比较声明版本，避免每次
+        // 启动都全量扫盘（原神 2743 个条目 ≈ 4.5 分钟 I/O）。
+        let performsFileVerification = fileVerification || integrityManifests[gameType] != nil
+        let pkgValidationErrors = performsFileVerification
+            ? try await validatePkgVersionEntries(
+                at: URL(fileURLWithPath: installPath, isDirectory: true),
+                entries: entries
+            )
+            : []
         let mapping: PkgVersionMappingStatus
         if entries.isEmpty {
             mapping = .notPresent
@@ -295,7 +327,8 @@ public actor VersionChecker {
                 "configPresent": "true",
                 "itemCount": String(entries.count),
                 "md5Present": entries.isEmpty ? "false" : "true",
-                "sizePresent": entries.isEmpty ? "false" : "true"
+                "sizePresent": entries.isEmpty ? "false" : "true",
+                "fileVerification": performsFileVerification ? "full" : "declaredOnly"
             ]
         ))
         return LocalEvidence(
@@ -308,6 +341,7 @@ public actor VersionChecker {
             pkgVersionEntries: entries,
             pkgVersionMapping: mapping,
             pkgVersionValidationErrors: pkgValidationErrors,
+            fileVerificationPerformed: performsFileVerification,
             gameID: gameID,
             locationRevision: locationRevision,
             sourceSummary: entries.isEmpty ? ["config.ini"] : ["config.ini", "pkg_version"]
@@ -393,6 +427,18 @@ public actor VersionChecker {
         }
         do {
             let data = try await networkProvider.requestData(from: remoteManifestURL)
+            if let branchesResponse = try? JSONDecoder().decode(HoyoPlayBranchesResponse.self, from: data),
+               let gameID = Self.remoteGameIDs[gameType],
+               let branch = branchesResponse.data.gameBranches.first(where: { $0.game.id == gameID }) {
+                guard isVersion(branch.main.tag) else {
+                    throw VersionError.versionParseFailed(branch.main.tag)
+                }
+                return RemoteVersionEvidence(
+                    version: branch.main.tag,
+                    channel: "1"
+                )
+            }
+
             if let direct = try? JSONDecoder().decode([String: String].self, from: data),
                let value = direct[gameType.rawValue] {
                 guard isVersion(value) else { throw VersionError.versionParseFailed(value) }
@@ -452,4 +498,29 @@ public actor VersionChecker {
         }
         return false
     }
+}
+
+nonisolated private struct HoyoPlayBranchesResponse: Decodable, Sendable {
+    let data: HoyoPlayBranchesData
+}
+
+nonisolated private struct HoyoPlayBranchesData: Decodable, Sendable {
+    let gameBranches: [HoyoPlayBranch]
+
+    enum CodingKeys: String, CodingKey {
+        case gameBranches = "game_branches"
+    }
+}
+
+nonisolated private struct HoyoPlayBranch: Decodable, Sendable {
+    let game: HoyoPlayGame
+    let main: HoyoPlayMainBranch
+}
+
+nonisolated private struct HoyoPlayGame: Decodable, Sendable {
+    let id: String
+}
+
+nonisolated private struct HoyoPlayMainBranch: Decodable, Sendable {
+    let tag: String
 }

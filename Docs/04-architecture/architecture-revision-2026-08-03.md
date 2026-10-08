@@ -1,7 +1,8 @@
-# MiPlay Architecture Revision 2026-08-03
+# MiPlay Architecture Revision 2026-08-03（历史基线）
 
-> **文档状态**：已冻结（Architecture Phase 3）
-> **适用范围**：本文件是本目录对 Product、Research、UX、UI 修订结果的当前解释。
+> **文档状态**：历史基线，已被 2026-08-28 Architecture 回溯取代
+> **当前规范**：本文件保留 2026-08-03 的追溯记录，不得作为当前 Wine runtime、shared prefix、任务或迁移契约。当前规范见 `architecture-domain-model.md`、`architecture-service-contracts.md`、`architecture-task-queue.md` 和 ADR 037-042。
+> **适用范围**：本文件仅记录 2026-08-03 对 Product、Research、UX、UI 修订结果的历史解释；除明确指向当前规范的追溯说明外，不构成当前契约。
 > **职责边界**：冻结系统组织、数据事实、状态传播、权限和服务契约；不定义 Swift 实现。
 > **下游规则**：Implementation、Review、QA 和 Release 不得用旧 Architecture 文档解释本文件未覆盖的行为。契约问题必须回溯 Architecture；本 Task 不修改业务源码。
 

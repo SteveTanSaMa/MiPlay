@@ -5,6 +5,7 @@
 //  Created by Steve Tan on 2026/7/7.
 //
 
+import CryptoKit
 import Foundation
 
 // Source: Architecture Design → Service Contract → GameFileSystemRepository
@@ -378,11 +379,7 @@ public actor GameFileSystemRepository {
     }
 
     internal func calculateMD5(of data: Data) -> String {
-        var hash = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
-        data.withUnsafeBytes { buffer in
-            _ = CC_MD5(buffer.baseAddress, CC_LONG(data.count), &hash)
-        }
-        return hash.map { String(format: "%02x", $0) }.joined()
+        Insecure.MD5.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - MiPlay Storage

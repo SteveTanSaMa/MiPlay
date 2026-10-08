@@ -19,6 +19,8 @@ extension WineVersionManager {
                 guard let self else { return }
                 var stagingPath: String?
                 var installedPath: String?
+                var runtimeCommitted = false
+                var prefixCommitted = false
                 do {
                     await self.logWriter.record(.init(
                         level: .info,
@@ -39,6 +41,12 @@ extension WineVersionManager {
                     let wineBinary = finalURL.appendingPathComponent("bin/wine")
                     if FileManager.default.fileExists(atPath: wineBinary.path) {
                         try await self.markVersionInstalled(tagName: version.tagName)
+                        runtimeCommitted = true
+                        try await self.prepareAndCommitSharedPrefix(
+                            runtime: ManagedWineRuntime(tagName: Self.fixedRuntimeTag, rootURL: finalURL)
+                        )
+                        prefixCommitted = true
+                        continuation.yield(.installed(versionPath: finalURL.path))
                         continuation.yield(.completed(versionPath: finalURL.path))
                         continuation.finish()
                         return
@@ -99,8 +107,24 @@ extension WineVersionManager {
                         throw VersionManagerError.downloadFailed("Wine 下载未产生完成事实")
                     }
 
-                    guard FileManager.default.fileExists(atPath: wineBinaryFor(staging.directoryURL).path) else {
-                        throw VersionManagerError.extractionFailed("解压后未找到 wine binary")
+                    let stagedWineBinary = wineBinaryFor(staging.directoryURL)
+                    guard FileManager.default.fileExists(atPath: stagedWineBinary.path) else {
+                        throw VersionManagerError.extractionFailed("解压后未找到 wine binary: \(stagedWineBinary.path)")
+                    }
+                    do {
+                        try FileManager.default.setAttributes(
+                            [.posixPermissions: 0o755],
+                            ofItemAtPath: stagedWineBinary.path
+                        )
+                    } catch {
+                        throw VersionManagerError.extractionFailed(
+                            "解压后无法设置 wine binary 权限: \(stagedWineBinary.path): \(error.localizedDescription)"
+                        )
+                    }
+                    guard FileManager.default.isExecutableFile(atPath: stagedWineBinary.path) else {
+                        throw VersionManagerError.extractionFailed(
+                            "解压后 wine binary 不可执行: \(stagedWineBinary.path)"
+                        )
                     }
 
                     continuation.yield(.installing)
@@ -111,21 +135,51 @@ extension WineVersionManager {
                     stagingPath = nil
                     installedPath = finalURL.path
 
+                    let installedWineBinary = wineBinaryFor(finalURL)
+                    try FileManager.default.setAttributes(
+                        [.posixPermissions: 0o755],
+                        ofItemAtPath: installedWineBinary.path
+                    )
+
                     do {
                         try await self.markVersionInstalled(tagName: version.tagName)
+                        runtimeCommitted = true
+                        continuation.yield(.installed(versionPath: finalURL.path))
+                        try await self.prepareAndCommitSharedPrefix(
+                            runtime: ManagedWineRuntime(tagName: Self.fixedRuntimeTag, rootURL: finalURL)
+                        )
+                        prefixCommitted = true
                     } catch let persistenceError {
+                        if runtimeCommitted {
+                            let detail = "Wine runtime/prefix pair 提交失败: \(persistenceError.localizedDescription)"
+                            let record = RecoveryRecord(
+                                kind: "wineRuntimeSetup",
+                                taskID: taskID.uuidString,
+                                target: Self.fixedRuntimeTag,
+                                phase: "runtimePairCommit",
+                                detail: detail,
+                                payload: [
+                                    "runtimePath": finalURL.path,
+                                    "prefixIdentity": Self.sharedPrefixIdentity
+                                ]
+                            )
+                            let recoveryWriteError = await self.recordRecovery(record)
+                            continuation.yield(.recoveryRequired(recoveryWriteError.map { "\(detail); 恢复事实写入失败: \($0)" } ?? detail))
+                            continuation.finish()
+                            return
+                        }
                         do {
                             try FileManager.default.removeItem(at: finalURL)
                             installedPath = nil
                         } catch {
                             let detail = "安装记录写入失败: \(persistenceError.localizedDescription); 最终目录清理失败: \(error.localizedDescription)"
                             let record = RecoveryRecord(
-                                kind: "wineInstall",
+                                kind: "wineRuntimeSetup",
                                 taskID: taskID.uuidString,
-                                target: version.tagName,
-                                phase: "installedRecord",
+                                target: Self.fixedRuntimeTag,
+                                phase: "runtimeRecord",
                                 detail: detail,
-                                payload: ["finalPath": finalURL.path]
+                                payload: ["runtimePath": finalURL.path]
                             )
                             let recoveryWriteError = await self.recordRecovery(record)
                             continuation.yield(.recoveryRequired(recoveryWriteError.map { "\(detail); 恢复事实写入失败: \($0)" } ?? detail))
@@ -135,7 +189,6 @@ extension WineVersionManager {
                         throw persistenceError
                     }
 
-                    continuation.yield(.installed(versionPath: finalURL.path))
                     continuation.yield(.completed(versionPath: finalURL.path))
                     await self.logWriter.record(.init(
                         level: .info,
@@ -153,17 +206,23 @@ extension WineVersionManager {
                 } catch is CancellationError {
                     var cleanupVerified = true
                     do {
-                        try await self.cleanup(paths: [stagingPath, installedPath].compactMap { $0 })
+                        let paths = [stagingPath, runtimeCommitted ? nil : installedPath].compactMap { $0 }
+                        try await self.cleanup(paths: paths)
                     } catch {
                         cleanupVerified = false
                         let detail = "取消后的 Wine 临时资源清理失败: \(error.localizedDescription)"
                         let record = RecoveryRecord(
-                            kind: "wineInstall",
+                            kind: "wineRuntimeSetup",
                             taskID: taskID.uuidString,
-                            target: version.tagName,
+                            target: Self.fixedRuntimeTag,
                             phase: "cancelCleanup",
                             detail: detail,
-                            payload: ["stagingPath": stagingPath ?? "", "finalPath": installedPath ?? ""]
+                            payload: [
+                                "stagingPath": stagingPath ?? "",
+                                "runtimePath": installedPath ?? "",
+                                "runtimeCommitted": String(runtimeCommitted),
+                                "prefixCommitted": String(prefixCommitted)
+                            ]
                         )
                         let recoveryWriteError = await self.recordRecovery(record)
                         continuation.yield(.recoveryRequired(recoveryWriteError.map { "\(detail); 恢复事实写入失败: \($0)" } ?? detail))
@@ -195,12 +254,17 @@ extension WineVersionManager {
                         cleanupVerified = false
                         let detail = "\(operationError); 临时资源清理失败: \(error.localizedDescription)"
                         let record = RecoveryRecord(
-                            kind: "wineInstall",
-                            taskID: taskID.uuidString,
-                            target: version.tagName,
-                            phase: "failureCleanup",
-                            detail: detail,
-                            payload: ["stagingPath": stagingPath ?? ""]
+                        kind: "wineRuntimeSetup",
+                        taskID: taskID.uuidString,
+                        target: Self.fixedRuntimeTag,
+                        phase: "failureCleanup",
+                        detail: detail,
+                        payload: [
+                            "stagingPath": stagingPath ?? "",
+                            "runtimePath": installedPath ?? "",
+                            "runtimeCommitted": String(runtimeCommitted),
+                            "prefixCommitted": String(prefixCommitted)
+                        ]
                         )
                         let recoveryWriteError = await self.recordRecovery(record)
                         continuation.yield(.recoveryRequired(recoveryWriteError.map { "\(detail); 恢复事实写入失败: \($0)" } ?? detail))
@@ -245,6 +309,70 @@ extension WineVersionManager {
 
     internal func registerDownload(taskID: UUID, tagName: String) {
         activeDownloadTags[taskID] = tagName
+    }
+
+    /// Commits the shared prefix only after the fixed runtime record exists.
+    /// The provider owns filesystem preparation; this method owns the pair
+    /// record and its write/read verification.
+    internal func prepareAndCommitSharedPrefix(runtime: ManagedWineRuntime) async throws {
+        guard runtime.identity == Self.fixedRuntimeTag,
+              let wineRuntimeProvider else {
+            throw VersionManagerError.recoveryRequired("共享 prefix 缺少固定 runtime provider")
+        }
+
+        let lease: SharedWinePrefixLease
+        do {
+            lease = try await wineRuntimeProvider.acquireSharedPrefixLease()
+        } catch let error as WineRuntimeProvider.WineError {
+            throw VersionManagerError.recoveryRequired(error.localizedDescription)
+        }
+
+        do {
+            let prepared = try await wineRuntimeProvider.prepareSharedPrefix(
+                runtime: runtime,
+                lease: lease
+            )
+            guard await wineRuntimeProvider.isSharedPrefixReady() else {
+                throw VersionManagerError.recoveryRequired("共享 prefix 准备后结构验证失败")
+            }
+            let appSupport = await fileSystemRepository.appSupportDirectory()
+            let prefixURL = prepared.url.resolvingSymlinksInPath().standardizedFileURL
+            let canonicalSupport = appSupport.resolvingSymlinksInPath().standardizedFileURL
+            guard prefixURL.path.hasPrefix(canonicalSupport.path + "/") else {
+                throw VersionManagerError.recoveryRequired("共享 prefix 越出应用支持目录")
+            }
+            let record = SharedWinePrefixRecord(
+                identity: Self.sharedPrefixIdentity,
+                relativePath: "WinePrefixes/shared",
+                absolutePath: prefixURL.path,
+                runtimeIdentity: Self.fixedRuntimeTag,
+                schemaRevision: "1",
+                state: "ready",
+                verifiedAt: Date()
+            )
+            try await persistenceStore.updateAppData { appData in
+                appData.sharedWinePrefix = record
+            }
+            let verified = try await persistenceStore.readAppData()
+            guard let persisted = verified.sharedWinePrefix,
+                  persisted.identity == record.identity,
+                  persisted.relativePath == record.relativePath,
+                  persisted.absolutePath == record.absolutePath,
+                  persisted.runtimeIdentity == record.runtimeIdentity,
+                  persisted.schemaRevision == record.schemaRevision,
+                  persisted.state == record.state else {
+                throw VersionManagerError.persistenceFailed("共享 prefix 记录写回后重读不一致")
+            }
+            prefixRecord = record
+            try await wineRuntimeProvider.releaseSharedPrefixLease(lease)
+        } catch {
+            try? await wineRuntimeProvider.releaseSharedPrefixLease(lease)
+            if let managerError = error as? VersionManagerError { throw managerError }
+            if let wineError = error as? WineRuntimeProvider.WineError {
+                throw VersionManagerError.recoveryRequired(wineError.localizedDescription)
+            }
+            throw VersionManagerError.recoveryRequired(error.localizedDescription)
+        }
     }
 
     internal nonisolated func wineBinaryFor(_ root: URL) -> URL {

@@ -92,6 +92,30 @@ extension WineVersionDownloader {
         }
     }
 
+    /// Returns a single wrapper directory when every archive entry is below
+    /// it. The upstream Wine release uses `wine/bin/wine`, while test and
+    /// locally produced archives may already be rooted at `bin/wine`.
+    internal nonisolated func archiveWrapperDirectory(from listing: String) -> String? {
+        let entries = listing
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let components = entries.compactMap {
+            $0.split(separator: "/", omittingEmptySubsequences: true).first.map(String.init)
+        }
+
+        guard let first = components.first,
+              components.allSatisfy({ $0 == first }),
+              components.count > 1,
+              entries.contains(where: {
+                  $0.hasPrefix("\(first)/bin/") || $0 == "\(first)/bin"
+              }) else {
+            return nil
+        }
+        return first
+    }
+
     internal func validateExtractedTree(at directory: URL) throws {
         let rootPath = directory.resolvingSymlinksInPath().standardizedFileURL.path
         let containedPrefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
@@ -125,6 +149,7 @@ extension WineVersionDownloader {
         guard FileManager.default.fileExists(atPath: staging.directoryURL.path) else {
             return
         }
+        makeCleanupTreeWritable(at: staging.directoryURL)
         do {
             try FileManager.default.removeItem(at: staging.directoryURL)
         } catch {
@@ -136,6 +161,33 @@ extension WineVersionDownloader {
             }
             throw error
         }
+    }
+
+    private nonisolated func makeCleanupTreeWritable(at directory: URL) {
+        let fileManager = FileManager.default
+        if let enumerator = fileManager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) {
+            for case let url as URL in enumerator {
+                guard let values = try? url.resourceValues(
+                    forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+                ),
+                values.isSymbolicLink != true else {
+                    continue
+                }
+                let permissions: Int16 = values.isDirectory == true ? 0o755 : 0o644
+                try? fileManager.setAttributes(
+                    [.posixPermissions: permissions],
+                    ofItemAtPath: url.path
+                )
+            }
+        }
+        try? fileManager.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: directory.path
+        )
     }
 
     internal func wasCancelled(sessionID: UUID) -> Bool {

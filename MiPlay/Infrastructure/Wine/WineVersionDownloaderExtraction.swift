@@ -29,12 +29,14 @@ extension WineVersionDownloader {
     /// - Parameters:
     ///   - archivePath: 归档文件路径
     ///   - extractionDir: 解压目标目录
+    ///   - onExtractionProgress: 解压进度回调（0…1），按已展开字节 / 归档未压缩总大小估算
     /// - Returns: 解压后的版本路径（包含 bin/wine）
     internal func extractArchive(
         archive: URL,
         staging: ManagedStaging,
         wineTag: String? = nil,
-        taskID: String? = nil
+        taskID: String? = nil,
+        onExtractionProgress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> String {
         let archivePath = archive.path
         let extractionDir = staging.directoryURL.path
@@ -84,15 +86,59 @@ extension WineVersionDownloader {
             try validateArchiveEntries(listing)
             let detailedListing = try await processManager.launchAndWait(
                 executablePath: "/usr/bin/tar",
-                arguments: ["-tvJf", archivePath],
+                // `--numeric-owner` 必须在前面：bsdtar 的旧式解析会把跟在
+                // `-tvJf` 之后的 `--long-option` 当成要列出的文件名。
+                arguments: ["--numeric-owner", "-tvJf", archivePath],
                 timeout: 120
             )
             try validateArchiveSymlinks(detailedListing, inside: staging.directoryURL)
-            _ = try await processManager.launchAndWait(
+            let extractionArguments: [String] = archiveWrapperDirectory(from: listing) == nil
+                ? ["-xJf", archivePath, "-C", extractionDir]
+                : ["-xJf", archivePath, "-C", extractionDir, "--strip-components", "1"]
+            // 解压进度：未压缩总大小直接取自上面已有的明细列表（无额外解压开销），
+            // 解压期间轮询目标目录已展开字节数。bsdtar 没有可用的进度回调
+            //（不支持 --checkpoint），因此这是最直接且诚实的进度来源。
+            let expectedBytes = Self.uncompressedSize(fromDetailedListing: detailedListing)
+            let extractionProcessID = try await processManager.launch(
                 executablePath: "/usr/bin/tar",
-                arguments: ["-xJf", archivePath, "-C", extractionDir],
-                timeout: 120
+                arguments: extractionArguments,
+                captureOutput: true
             )
+            let progressMonitor = Task {
+                while !Task.isCancelled {
+                    if expectedBytes > 0 {
+                        let extracted = Self.directoryByteCount(at: extractionDir)
+                        onExtractionProgress?(
+                            min(Double(extracted) / Double(expectedBytes), 0.99)
+                        )
+                    }
+                    try? await Task.sleep(for: .milliseconds(400))
+                }
+            }
+            do {
+                let termination = try await processManager.waitForTermination(
+                    processID: extractionProcessID,
+                    timeout: 120
+                )
+                progressMonitor.cancel()
+                guard !termination.terminatedBySignal, termination.statusCode == 0 else {
+                    let detail = termination.output
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .suffix(400)
+                    throw DownloaderError.extractionFailed(
+                        "tar 解压退出码 \(termination.statusCode)\(termination.terminatedBySignal ? "（信号中断）" : "")\(detail.isEmpty ? "" : ": \(detail)")"
+                    )
+                }
+            } catch {
+                progressMonitor.cancel()
+                _ = try? await processManager.terminateAndWait(
+                    processID: extractionProcessID,
+                    force: true,
+                    timeout: 5
+                )
+                throw error
+            }
+            onExtractionProgress?(1)
             try validateExtractedTree(at: staging.directoryURL)
         } catch is CancellationError {
             await logWriter.record(.init(
@@ -272,4 +318,35 @@ extension WineVersionDownloader {
 
     /// Test/migration seam. It still requires the destination to be a managed
     /// `.staging` child; arbitrary paths cannot reach extraction cleanup.
+
+    // MARK: - 解压进度辅助
+
+    /// 从 `tar -tvJf --numeric-owner` 明细累加未压缩总大小（解析失败的行忽略）。
+    /// 形如 `-rw-r--r--  0 501 20 12345 Feb 13 12:34 path`。
+    nonisolated internal static func uncompressedSize(fromDetailedListing listing: String) -> Int64 {
+        var total: Int64 = 0
+        for line in listing.split(whereSeparator: \.isNewline) {
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count >= 5, let size = Int64(fields[4]) else { continue }
+            total += size
+        }
+        return total
+    }
+
+    /// 目录内普通文件的总字节数（解压进度用）。
+    nonisolated internal static func directoryByteCount(
+        at path: String,
+        fileManager: FileManager = .default
+    ) -> Int64 {
+        guard let enumerator = fileManager.enumerator(atPath: path) else { return 0 }
+        var total: Int64 = 0
+        for case let item as String in enumerator {
+            let fullPath = (path as NSString).appendingPathComponent(item)
+            guard let attributes = try? fileManager.attributesOfItem(atPath: fullPath),
+                  attributes[.type] as? FileAttributeType == .typeRegular,
+                  let size = attributes[.size] as? Int64 else { continue }
+            total += size
+        }
+        return total
+    }
 }

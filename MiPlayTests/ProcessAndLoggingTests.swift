@@ -1,8 +1,106 @@
 // Source: Implementation maintenance split -> process lifecycle and structured logging
 import XCTest
+import Darwin
 @testable import MiPlay
 
 @MainActor extension MiPlayCoreTests {
+    func testApplicationMissingOrInvalidExitStatusRemainsUnknown() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let log = root.appendingPathComponent("launch.log")
+        let status = root.appendingPathComponent("launch.status")
+        try Data("Library WDFLDR.SYS not found".utf8).write(to: log)
+        let launcher = ApplicationLauncher()
+        let missing = launcher.exitResult(logURL: log, statusURL: status)
+        XCTAssertEqual(missing.statusCode, -1)
+        XCTAssertFalse(missing.terminatedBySignal)
+        for value in ["", "signal:0", "signal:999", "exit:-1", "exit:999", "garbage"] {
+            try Data(value.utf8).write(to: status)
+            let exit = launcher.exitResult(logURL: log, statusURL: status)
+            XCTAssertEqual(exit.statusCode, -1, value)
+            XCTAssertFalse(exit.terminatedBySignal, value)
+            XCTAssertFalse(GameExitDiagnostic.summary(
+                statusCode: exit.statusCode, terminatedBySignal: exit.terminatedBySignal, output: exit.output
+            ).contains("反作弊"))
+        }
+    }
+
+    func testApplicationSessionResetPreventsPreviousExitAndLogFromBeingReused() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let log = root.appendingPathComponent("launch.log")
+        let status = root.appendingPathComponent("launch.status")
+        try Data("Library WDFLDR.SYS not found".utf8).write(to: log)
+        try Data("exit:5".utf8).write(to: status)
+        try ApplicationLauncher.prepareSessionFiles(logURL: log, statusURL: status)
+        let killedWrapper = ApplicationLauncher().exitResult(logURL: log, statusURL: status)
+        XCTAssertEqual(killedWrapper.statusCode, -1)
+        XCTAssertFalse(killedWrapper.terminatedBySignal)
+        XCTAssertEqual(killedWrapper.output, "")
+        try Data("this session only".utf8).write(to: log)
+        try Data("signal:9\n".utf8).write(to: status)
+        let killedChild = ApplicationLauncher().exitResult(logURL: log, statusURL: status)
+        XCTAssertEqual(killedChild.statusCode, SIGKILL)
+        XCTAssertTrue(killedChild.terminatedBySignal)
+        XCTAssertEqual(killedChild.output, "this session only")
+    }
+
+    func testDriverNamesAndOrdinaryExitNumbersDoNotProveAnticheatFailure() {
+        for output in ["loaded HoYoKProtect.sys", "WDFLDR.SYS", "err:graphics: failed initialization", "HoYoKProtect.sys\nunrelated operation failed"] {
+            let summary = GameExitDiagnostic.summary(statusCode: 5, terminatedBySignal: false, output: output)
+            XCTAssertFalse(summary.contains("反作弊"), output)
+        }
+        // exit(137) 是退出码事实，不能仅按 128+9 反推 SIGKILL。
+        let summary = GameExitDiagnostic.summary(statusCode: 137, terminatedBySignal: false, output: "")
+        XCTAssertTrue(summary.contains("退出码 137"))
+        XCTAssertFalse(summary.contains("SIGKILL"))
+        let term = GameExitDiagnostic.summary(statusCode: SIGTERM, terminatedBySignal: true, output: "Library WDFLDR.SYS not found")
+        XCTAssertTrue(term.contains("SIGTERM"))
+        XCTAssertFalse(term.contains("反作弊"))
+    }
+
+    func testGameLauncherWritesKilledChildStatusForCurrentSession() async throws {
+        let launcherURL = try XCTUnwrap(Bundle.main.url(forResource: "GameLauncher", withExtension: nil))
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let log = root.appendingPathComponent("launch.log")
+        let status = root.appendingPathComponent("launch.status")
+        try Data("Library WDFLDR.SYS not found".utf8).write(to: log)
+        try Data("exit:5".utf8).write(to: status)
+        try ApplicationLauncher.prepareSessionFiles(logURL: log, statusURL: status)
+        let manager = ProcessManager()
+        let processID = try await manager.launch(
+            executablePath: launcherURL.path,
+            arguments: ["/bin/sh", "-c", "printf 'current session\\n'; kill -9 $$"],
+            environment: ["MIPLAY_LAUNCH_LOG": log.path, "MIPLAY_LAUNCH_STATUS": status.path],
+            captureOutput: true
+        )
+        _ = try await manager.waitForTermination(processID: processID, timeout: 5)
+        let exit = ApplicationLauncher().exitResult(logURL: log, statusURL: status)
+        XCTAssertEqual(exit.statusCode, SIGKILL)
+        XCTAssertTrue(exit.terminatedBySignal)
+        XCTAssertTrue(exit.output.contains("current session"))
+        XCTAssertFalse(exit.output.contains("WDFLDR"))
+    }
+
+    func testActualKilledChildIsNotDiagnosedAsAnticheatFailure() async throws {
+        let manager = ProcessManager()
+        let processID = try await manager.launch(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "printf 'Library WDFLDR.SYS not found\\n'; kill -9 $$"],
+            captureOutput: true
+        )
+        let exit = try await manager.waitForTermination(processID: processID, timeout: 5)
+        XCTAssertTrue(exit.terminatedBySignal)
+        XCTAssertEqual(exit.statusCode, SIGKILL)
+        let diagnosis = LaunchOrchestrator.LaunchError.processExited(
+            exitCode: exit.statusCode, signal: exit.statusCode, output: exit.output
+        ).localizedDescription
+        XCTAssertTrue(diagnosis.contains("被强制终止"))
+        XCTAssertTrue(diagnosis.contains("无法确认发起方"))
+        XCTAssertFalse(diagnosis.contains("反作弊"))
+    }
+
     func testProcessManagerCollectsOutputAndExitStatus() async throws {
         let manager = ProcessManager()
         let processID = try await manager.launch(

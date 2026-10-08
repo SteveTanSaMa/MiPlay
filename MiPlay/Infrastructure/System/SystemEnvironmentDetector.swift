@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import IOKit
 
 // Source: Architecture Design → Service Contract → SystemEnvironmentDetector
 
@@ -32,8 +33,11 @@ public struct SystemEnvironmentDetector: Sendable {
         public let osVersion: String
         public let buildNumber: String
         public let isAppleSilicon: Bool
-        public let chipModel: String
+        public let machineName: String
+        public let chipName: String
+        public let modelIdentifier: String
         public let physicalMemory: UInt64
+        public let physicalMemoryText: String
         public let processorCount: Int
     }
 
@@ -80,29 +84,34 @@ public struct SystemEnvironmentDetector: Sendable {
         return result != 0
     }
 
-    /// 获取芯片型号
-    public nonisolated func getChipModel() -> String {
-        let size = UnsafeMutablePointer<Int>.allocate(capacity: 1)
-        defer { size.deallocate() }
+    /// 获取芯片名称。芯片名称来自 brand_string，不使用硬件机型标识。
+    public nonisolated func getChipName() -> String {
+        readSysctlString("machdep.cpu.brand_string")
+    }
 
-        size.pointee = 0
-        sysctlbyname("machdep.cpu.brand_string", nil, size, nil, 0)
-        let cString = UnsafeMutablePointer<CChar>.allocate(capacity: size.pointee)
-        defer { cString.deallocate() }
-        sysctlbyname("machdep.cpu.brand_string", cString, size, nil, 0)
-        let brand = String(cString: cString)
+    /// 获取硬件机型标识，例如 "MacBookPro17,1"。
+    public nonisolated func getModelIdentifier() -> String {
+        readSysctlString("hw.model")
+    }
 
-        if isAppleSilicon() {
-            // For Apple Silicon, get the chip model from sysctl
-            size.pointee = 0
-            sysctlbyname("hw.model", nil, size, nil, 0)
-            let modelCString = UnsafeMutablePointer<CChar>.allocate(capacity: size.pointee)
-            defer { modelCString.deallocate() }
-            sysctlbyname("hw.model", modelCString, size, nil, 0)
-            return String(cString: modelCString)
+    /// System-provided machine marketing name, for example "MacBook Pro".
+    /// Returns an empty string when the system does not expose one; it is never
+    /// synthesized from the model identifier.
+    public nonisolated func getMachineName() -> String {
+        guard let productName = readPlatformProperty("product-name"), !productName.isEmpty else {
+            return ""
         }
+        let family = productName.split(separator: "(", maxSplits: 1).first.map {
+            String($0).trimmingCharacters(in: .whitespaces)
+        } ?? ""
+        return family
+    }
 
-        return brand.trimmingCharacters(in: .whitespaces)
+    public nonisolated func getPhysicalMemoryText() -> String {
+        ByteCountFormatter.string(
+            fromByteCount: Int64(getPhysicalMemory()),
+            countStyle: .memory
+        )
     }
 
     /// 获取物理内存大小（字节）
@@ -121,10 +130,45 @@ public struct SystemEnvironmentDetector: Sendable {
             osVersion: getOSVersion(),
             buildNumber: getBuildNumber(),
             isAppleSilicon: isAppleSilicon(),
-            chipModel: getChipModel(),
+            machineName: getMachineName(),
+            chipName: getChipName(),
+            modelIdentifier: getModelIdentifier(),
             physicalMemory: getPhysicalMemory(),
+            physicalMemoryText: getPhysicalMemoryText(),
             processorCount: getProcessorCount()
         )
+    }
+
+    private nonisolated func readPlatformProperty(_ key: String) -> String? {
+        let service = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching("IOPlatformExpertDevice")
+        )
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+
+        guard let value = IORegistryEntrySearchCFProperty(
+            service,
+            kIOServicePlane,
+            key as CFString,
+            kCFAllocatorDefault,
+            IOOptionBits(kIORegistryIterateRecursively)
+        ) else { return nil }
+        if let data = value as? Data {
+            return String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+        }
+        return value as? String
+    }
+
+    private nonisolated func readSysctlString(_ name: String) -> String {
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 1 else { return "" }
+
+        let buffer = UnsafeMutablePointer<CChar>.allocate(capacity: size)
+        defer { buffer.deallocate() }
+        guard sysctlbyname(name, buffer, &size, nil, 0) == 0 else { return "" }
+        return String(cString: buffer).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Disk Space

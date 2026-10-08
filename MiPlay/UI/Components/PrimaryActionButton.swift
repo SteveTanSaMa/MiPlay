@@ -17,28 +17,49 @@ struct PrimaryActionButton: View {
     let state: LibraryViewModel.PrimaryButtonState
     let action: () -> Void
 
+    private var actionSymbol: String? {
+        switch state.action {
+        case .locate: return "folder.badge.plus"
+        case .launch: return "play.fill"
+        case .update: return "arrow.down.circle"
+        case .none: return nil
+        }
+    }
+
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
-                if case .disabled = state {
+                if case .disabled(let label) = state, label.hasSuffix("…") {
                     ProgressView()
-                        .scaleEffect(0.8)
                         .controlSize(.small)
+                        .tint(.white)
+                }
+
+                if let symbol = actionSymbol {
+                    Image(systemName: symbol)
+                        .font(.body.weight(.semibold))
+                        .accessibilityHidden(true)
                 }
 
                 Text(state.label)
                     .font(.title3)
                     .fontWeight(.semibold)
             }
+            .shadow(color: .black.opacity(0.45), radius: 1, y: 1)
             .frame(width: 220, height: 64)
         }
         // Source: Liquid Glass — P0 .buttonStyle(.glass)
         // Source: UI-4 — 圆角对齐游戏图标 16pt；interactive 为 Glass 实例方法，非静态成员
-        .buttonStyle(.plain)
-        .glassEffect(Glass.regular.interactive(true), in: RoundedRectangle(cornerRadius: 16))
-        .foregroundStyle(.white)
+        .buttonStyle(.borderless)
+        .focusable()
+        .foregroundStyle(state.isEnabled ? .white : .white.opacity(0.7))
+        .modifier(DarkGlassSurface(interactive: state.isEnabled))
         .disabled(!state.isEnabled)
-        .opacity(state.isEnabled ? 1.0 : 0.35)
+        .onKeyPress(keys: [.return, .space], phases: .down) { _ in
+            guard state.isEnabled else { return .ignored }
+            action()
+            return .handled
+        }
         .accessibilityLabel(state.label)
         .accessibilityValue(state.isEnabled ? "可执行" : "不可用，\(state.label)")
         .accessibilityHint(state.isEnabled ? "执行当前选中游戏的操作" : "当前操作不可用")

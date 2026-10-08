@@ -3,6 +3,35 @@ import XCTest
 @testable import MiPlay
 
 @MainActor extension MiPlayCoreTests {
+    /// A background video path change (group switch, hover preview, cache
+    /// re-transcode) must rebuild the pooled player; reusing the stale player
+    /// kept the old file playing or left a blank layer after cleanup.
+    func testPlayerPoolRebuildsWhenVideoPathChanges() {
+        let pool = PlayerPool()
+        let first = pool.player(for: "ZenlessZoneZero", videoPath: "/tmp/a.mp4")
+        let samePath = pool.player(for: "ZenlessZoneZero", videoPath: "/tmp/a.mp4")
+        XCTAssertTrue(first === samePath)
+
+        let changed = pool.player(for: "ZenlessZoneZero", videoPath: "/tmp/b.mp4")
+        XCTAssertFalse(first === changed)
+        XCTAssertEqual(first.rate, 0)
+    }
+
+    /// Creating a background player must not start hidden media from view evaluation.
+    func testBackgroundPlayerCreationStartsPausedAndCanPauseAll() {
+        let pool = PlayerPool()
+        let first = pool.player(for: "one", videoPath: "/tmp/one.mp4")
+        let second = pool.player(for: "two", videoPath: "/tmp/two.mp4")
+        XCTAssertEqual(first.rate, 0)
+        XCTAssertEqual(second.rate, 0)
+        first.rate = 1
+        second.rate = 1
+        pool.pauseAll()
+        XCTAssertEqual(first.rate, 0)
+        XCTAssertEqual(second.rate, 0)
+        XCTAssertTrue(pool.player(for: "one", videoPath: "/tmp/one.mp4") === first)
+    }
+
     func testPrimaryButtonAndSettingsAccessibilityContractsAreStable() {
         let enabled = LibraryViewModel.PrimaryButtonState.enabled(label: "启动", action: .launch)
         XCTAssertTrue(enabled.isEnabled)
@@ -12,6 +41,11 @@ import XCTest
         } else {
             XCTFail("Expected launch action")
         }
+
+        let failed = LibraryViewModel.PrimaryButtonState.enabled(label: "启动", action: .launch)
+        XCTAssertTrue(failed.isEnabled)
+        XCTAssertEqual(failed.label, "启动")
+        XCTAssertEqual(GameStateMachine().suggestedAction(for: .launchFailed), "启动")
 
         let disabled = LibraryViewModel.PrimaryButtonState.disabled("启动中…")
         XCTAssertFalse(disabled.isEnabled)
@@ -28,23 +62,17 @@ import XCTest
         XCTAssertEqual(SettingsSidebarItem.gameZZZ.gameType, .zenlessZoneZero)
     }
 
-    func testWineReadinessRequiresGameSpecificPrefixBeforeWineReady() async throws {
+    func testWineReadinessRequiresSharedPrefixBeforeWineReady() async throws {
         let appSupport = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: appSupport) }
         let fileSystem = GameFileSystemRepository(appSupportDirectory: appSupport)
         let persistence = PersistenceStore(baseURL: try makeTemporaryDirectory())
         let process = ProcessManager()
         let logger = LogWriter(fileSystemRepository: fileSystem)
-        let runtimeRoot = appSupport
-            .appendingPathComponent("WineVersions/wine-devel-9.0/bin", isDirectory: true)
-        try FileManager.default.createDirectory(at: runtimeRoot, withIntermediateDirectories: true)
-        try FileManager.default.createSymbolicLink(
-            at: runtimeRoot.appendingPathComponent("wine"),
-            withDestinationURL: URL(fileURLWithPath: "/bin/sh")
-        )
+        let pair = try makeFixedWineRuntimePair(appSupport: appSupport, createPrefix: false)
         try await persistence.writeAppData(AppData(
-            selectedWineVersion: "wine-devel-9.0",
-            installedWineVersions: ["wine-devel-9.0"]
+            managedWineRuntime: pair.runtime,
+            sharedWinePrefix: pair.prefix
         ))
 
         let downloader = WineVersionDownloader(
@@ -65,17 +93,20 @@ import XCTest
         await manager.initialize()
 
         guard case .prefixNotReady(gameID: nil) = await manager.checkReadiness() else {
-            return XCTFail("Settings readiness must not report WineReady without a game prefix")
-        }
-        let gameID = GameType.genshinImpact.rawValue
-        guard case .prefixNotReady(gameID: gameID) = await manager.checkReadiness(for: gameID) else {
-            return XCTFail("Missing game prefix should remain a readiness failure")
+            return XCTFail("Settings readiness must not report ready without the shared prefix")
         }
 
-        let prefix = appSupport.appendingPathComponent("WinePrefixes/\(gameID)/drive_c", isDirectory: true)
-        try FileManager.default.createDirectory(at: prefix, withIntermediateDirectories: true)
-        guard case .ready = await manager.checkReadiness(for: gameID) else {
-            return XCTFail("A verified game prefix should complete WineReady")
+        let prefix = appSupport.appendingPathComponent("WinePrefixes/shared", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: prefix.appendingPathComponent("drive_c", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: prefix.appendingPathComponent("dosdevices", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        guard case .ready = await manager.checkReadiness() else {
+            return XCTFail("A verified shared prefix should complete Wine readiness")
         }
     }
 
@@ -100,6 +131,21 @@ import XCTest
         XCTAssertThrowsError(
             try WineVersionDownloader.ManagedStaging(rootURL: stagingRoot, directoryURL: symlink)
         )
+    }
+
+    func testWineArchiveWrapperDirectoryIsDetected() {
+        let fileSystem = GameFileSystemRepository()
+        let downloader = WineVersionDownloader(
+            networkProvider: NetworkDownloadProvider(),
+            fileSystemRepository: fileSystem,
+            processManager: ProcessManager(),
+            logWriter: LogWriter(fileSystemRepository: fileSystem)
+        )
+        let wrapped = "wine/\nwine/bin/\nwine/bin/wine\n"
+        let rooted = "bin/\nbin/wine\n"
+
+        XCTAssertEqual(downloader.archiveWrapperDirectory(from: wrapped), "wine")
+        XCTAssertNil(downloader.archiveWrapperDirectory(from: rooted))
     }
 
     func testWineExtractionRejectsArchiveOutsideManagedStagingWithoutDeletingIt() async throws {
@@ -137,6 +183,112 @@ import XCTest
         XCTAssertTrue(SettingsViewModel.WineStatusText.notDownloaded.label.contains("未下载"))
         XCTAssertTrue(SettingsViewModel.WineStatusText.prefixNotReady(gameID: nil).label.contains("前缀"))
         XCTAssertTrue(SettingsViewModel.WineStatusText.error("binary").label.contains("错误"))
+    }
+
+    func testSystemEnvironmentDetectorExposesAboutThisMacFields() {
+        let detector = SystemEnvironmentDetector()
+        XCTAssertFalse(detector.getMachineName().isEmpty, "Expected system-provided machine name")
+        XCTAssertFalse(detector.getChipName().isEmpty, "Expected system-provided chip name")
+        XCTAssertFalse(detector.getModelIdentifier().isEmpty, "Expected hardware model identifier")
+        XCTAssertFalse(detector.getPhysicalMemoryText().isEmpty, "Expected readable physical memory")
+        XCTAssertFalse(detector.getOSVersion().isEmpty, "Expected macOS product version")
+
+        let info = detector.getSystemInfo()
+        XCTAssertEqual(info.machineName, detector.getMachineName())
+        XCTAssertEqual(info.chipName, detector.getChipName())
+        XCTAssertEqual(info.modelIdentifier, detector.getModelIdentifier())
+        XCTAssertEqual(info.physicalMemoryText, detector.getPhysicalMemoryText())
+        XCTAssertGreaterThan(info.physicalMemory, 0)
+    }
+
+    /// 用户指令：设置窗口打开时点击主窗口，不仅要切换焦点，还要关闭设置窗口。
+    /// 其它窗口获得焦点时设置窗口保持打开；主窗口获得焦点时关闭。
+    func testSettingsWindowClosesWhenMainWindowTakesFocus() {
+        final class RecordingWindow: NSWindow {
+            var closeCount = 0
+            override func close() {
+                closeCount += 1
+                super.close()
+            }
+        }
+
+        let delegate = AppDelegate()
+        let mainWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 688),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let settingsWindow = RecordingWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 448),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let otherWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        delegate.registerMainWindow(mainWindow)
+        delegate.registerSettingsWindow(settingsWindow)
+        // 程序化创建的窗口默认 `isReleasedWhenClosed = true`，在测试里 `close()`
+        // 会与 ARC 的强引用冲突（over-release 崩溃）。
+        for window in [mainWindow, settingsWindow, otherWindow] {
+            window.isReleasedWhenClosed = false
+        }
+
+        // 其它窗口获得焦点：设置窗口保持打开。
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: otherWindow)
+        XCTAssertEqual(settingsWindow.closeCount, 0)
+
+        // 主窗口获得焦点：设置窗口关闭。
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: mainWindow)
+        XCTAssertEqual(settingsWindow.closeCount, 1, "点击主窗口必须关闭设置窗口")
+    }
+
+    func testSettingsActivationRestoresMainAppearanceWithoutTakingKeyboardFocus() async throws {
+        // 测试宿主由 Xcode 在后台启动，用记录窗口验证通知链与 API 调用，
+        // 实际 main/key 状态及玻璃外观由 ProbeMainWindowFocus 验证。
+        final class RecordingWindow: NSWindow {
+            var simulatedVisibility = true
+            var simulatedKey = false
+            var makeMainCount = 0
+            var makeKeyCount = 0
+            override var isVisible: Bool { simulatedVisibility }
+            override var isKeyWindow: Bool { simulatedKey }
+            override func makeMain() { makeMainCount += 1 }
+            override func makeKey() { makeKeyCount += 1 }
+            override func close() { simulatedVisibility = false }
+        }
+        let delegate = AppDelegate()
+        let mainWindow = RecordingWindow()
+        let settingsWindow = RecordingWindow()
+        settingsWindow.simulatedKey = true
+        delegate.registerMainWindow(mainWindow)
+        delegate.registerSettingsWindow(settingsWindow)
+        // 重复注册不应导致通知被处理多次。
+        delegate.registerSettingsWindow(settingsWindow)
+
+        NotificationCenter.default.post(name: NSWindow.didBecomeMainNotification, object: settingsWindow)
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(mainWindow.makeMainCount, 1)
+        XCTAssertEqual(mainWindow.makeKeyCount, 0, "保留活动外观不能抢走设置窗口的键盘焦点")
+        XCTAssertTrue(settingsWindow.isVisible)
+
+        delegate.toggleSettings { XCTFail("设置已打开时应关闭") }
+        XCTAssertFalse(settingsWindow.isVisible)
+        var requestedOpen = false
+        delegate.toggleSettings { requestedOpen = true }
+        XCTAssertTrue(requestedOpen, "关闭后仍可再次打开设置")
+
+        settingsWindow.simulatedVisibility = true
+        NotificationCenter.default.post(name: NSWindow.didBecomeMainNotification, object: settingsWindow)
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(mainWindow.makeMainCount, 2)
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: mainWindow)
+        XCTAssertFalse(settingsWindow.isVisible, "点击主窗口仍应关闭设置")
     }
 
 }

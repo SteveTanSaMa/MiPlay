@@ -76,9 +76,12 @@ extension TaskScheduler {
                 try await finish(taskID, state: .completed, outcome: result.status.rawValue, error: nil, recovery: nil, phase: result.status == .passed ? "完整性校验通过" : "已取得完整性结果")
 
             case .versionCheck:
-                try await phase(taskID, "正在检测版本", progress: nil)
+                // context["fileVerification"] = "true" 时执行逐文件 MD5 校验
+                //（设置页的"校验文件完整性"手动入口）。
+                let deepVerification = task.context["fileVerification"] == "true"
+                try await phase(taskID, deepVerification ? "正在校验游戏文件" : "正在检测版本", progress: nil)
                 guard let gameID = task.gameId, let game = await gameRegistry.getGame(by: gameID), let versionChecker else { throw SchedulerError.invalidRequest("版本检查器未配置") }
-                let result = try await versionChecker.checkVersion(for: game)
+                let result = try await versionChecker.checkVersion(for: game, fileVerification: deepVerification)
                 if result.outcome == .versionEvidenceConflict {
                     try await gameRegistry.recordMetadataFailure(
                         id: gameID,
@@ -118,85 +121,116 @@ extension TaskScheduler {
                 try await gameRegistry.updateSolutionApplicationState(id: gameID, applicationId: applicationID, newState: .rolledBack)
                 try await finish(taskID, state: .completed, outcome: "rolledBack", error: nil, recovery: nil, phase: "恢复已确认")
 
-            case .wineVersionDownload:
-                guard let manager = wineVersionManager,
-                      let tagName = task.context["tagName"] else {
+            case .wineRuntimeSetup:
+                guard let manager = wineVersionManager else {
                     throw SchedulerError.invalidRequest("Wine 下载任务参数无效")
                 }
-                let version = await manager.cachedAvailableVersion(tagName: tagName)
-                guard let version else {
-                    throw SchedulerError.invalidRequest("未找到已验证的 Wine 目录条目 \(tagName)，请先刷新版本列表")
-                }
-                let sessionID = UUID()
-                wineSessionIDs[taskID] = sessionID
-                var terminal = false
-                var recoveryDetail: String?
-                let stream = await manager.downloadAndInstall(version: version, taskID: sessionID)
-                for await downloadPhase in stream {
-                    try Task.checkCancellation()
-                    switch downloadPhase {
-                    case .fetchingMetadata:
-                        try await phase(taskID, "正在获取 Wine 版本信息", progress: nil)
-                    case .downloading(let progress, let speed, let bytesReceived, let totalBytes):
-                        try await phase(
-                            taskID,
-                            "正在下载 Wine",
-                            progress: progress,
-                            downloadProgress: TaskDownloadProgress(
-                                bytesReceived: bytesReceived,
-                                totalBytes: totalBytes,
-                                speed: speed
+                if try await manager.setupExistingManagedRuntimeIfPresent() {
+                    try await phase(taskID, "正在确认已有 MiPlay Wine", progress: nil)
+                    try await finish(taskID, state: .completed, outcome: "runtimePairReady", error: nil, recovery: nil, phase: "固定 Wine runtime 和共享 prefix 已就绪")
+                } else {
+                    try await phase(taskID, "正在读取固定 Wine 版本信息", progress: nil)
+                    let version = try await manager.fetchAvailableVersions().first {
+                        $0.tagName == WineVersionManager.fixedRuntimeTag
+                    }
+                    guard let version else {
+                        throw SchedulerError.invalidRequest("未找到固定 Wine 目录条目")
+                    }
+                    let sessionID = UUID()
+                    wineSessionIDs[taskID] = sessionID
+                    var terminal = false
+                    var recoveryDetail: String?
+                    let stream = await manager.downloadAndInstall(version: version, taskID: sessionID)
+                    for await downloadPhase in stream {
+                        try Task.checkCancellation()
+                        switch downloadPhase {
+                        case .fetchingMetadata:
+                            try await phase(taskID, "正在获取 Wine 版本信息", progress: nil)
+                        case .downloading(let progress, let speed, let bytesReceived, let totalBytes):
+                            try await phase(
+                                taskID,
+                                "正在下载 Wine",
+                                progress: progress,
+                                downloadProgress: TaskDownloadProgress(
+                                    bytesReceived: bytesReceived,
+                                    totalBytes: totalBytes,
+                                    speed: speed
+                                )
                             )
-                        )
-                    case .verifying:
-                        try await phase(taskID, "正在校验下载归档", progress: nil)
-                    case .extracting(let progress):
-                        try await phase(taskID, "正在解压 Wine", progress: progress)
-                    case .installing:
-                        try await phase(taskID, "正在提交 Wine 安装", progress: nil)
-                    case .installed:
-                        try await phase(taskID, "Wine 文件已安装，正在确认记录", progress: nil)
-                    case .completed:
-                        terminal = true
-                    case .cancelled:
-                        throw CancellationError()
-                    case .recoveryRequired(let detail):
-                        recoveryDetail = detail
-                    case .failed(let detail):
-                        throw SchedulerError.invalidRequest(detail)
-                    case .failedWithFailure(let failure):
-                        if let statusCode = failure.statusCode {
-                            throw SchedulerError.wineAssetHTTPFailure(
-                                statusCode: statusCode,
-                                detail: failure.localizedDescription
-                            )
+                        case .verifying:
+                            try await phase(taskID, "正在校验下载归档", progress: nil)
+                        case .extracting(let progress):
+                            try await phase(taskID, "正在解压 Wine", progress: progress)
+                        case .installing:
+                            try await phase(taskID, "正在提交 Wine 安装", progress: nil)
+                        case .installed:
+                            try await phase(taskID, "Wine 文件已安装，正在确认记录", progress: nil)
+                        case .completed:
+                            terminal = true
+                        case .cancelled:
+                            throw CancellationError()
+                        case .recoveryRequired(let detail):
+                            recoveryDetail = detail
+                        case .failed(let detail):
+                            throw SchedulerError.invalidRequest(detail)
+                        case .failedWithFailure(let failure):
+                            if let statusCode = failure.statusCode {
+                                throw SchedulerError.wineAssetHTTPFailure(
+                                    statusCode: statusCode,
+                                    detail: failure.localizedDescription
+                                )
+                            }
+                            throw SchedulerError.invalidRequest(failure.localizedDescription)
                         }
-                        throw SchedulerError.invalidRequest(failure.localizedDescription)
+                    }
+                    if let recoveryDetail {
+                        try await finish(taskID, state: .failed, outcome: nil, error: recoveryDetail, recovery: recoveryDetail, phase: "Wine 安装需要恢复")
+                    } else if terminal {
+                        try await finish(taskID, state: .completed, outcome: "runtimePairReady", error: nil, recovery: nil, phase: "固定 Wine runtime 和共享 prefix 已就绪")
+                    } else {
+                        throw SchedulerError.invalidRequest("Wine 下载未产生完成事实")
                     }
                 }
-                if let recoveryDetail {
-                    try await finish(taskID, state: .failed, outcome: nil, error: recoveryDetail, recovery: recoveryDetail, phase: "Wine 安装需要恢复")
-                } else if terminal {
-                    try await finish(taskID, state: .completed, outcome: "wineInstalled", error: nil, recovery: nil, phase: "Wine 下载和安装完成")
-                } else {
-                    throw SchedulerError.invalidRequest("Wine 下载未产生完成事实")
-                }
-            case .wineCatalogQuery:
-                guard let manager = wineVersionManager else {
-                    throw SchedulerError.invalidRequest("Wine 版本管理器未配置")
-                }
-                try await phase(taskID, "正在获取 Wine 版本目录", progress: nil)
-                let versions = try await manager.fetchAvailableVersions()
-                try await finish(
-                    taskID,
-                    state: .completed,
-                    outcome: versions.isEmpty ? "noAvailableManagedVersion" : "availableManagedVersions",
-                    error: nil,
-                    recovery: nil,
-                    phase: versions.isEmpty ? "没有可用托管 Wine 版本" : "Wine 版本目录已更新"
-                )
-            case .backgroundMediaLoad:
+            case .wineVersionDownload, .wineCatalogQuery:
+                // These task names remain decodable for old task history only;
+                // new callers must use the single WineRuntimeSetup task.
                 throw SchedulerError.unsupported(task.type)
+            case .backgroundMediaLoad:
+                guard let gameID = task.gameId, let backgroundMediaService else {
+                    throw SchedulerError.invalidRequest("背景素材服务未配置")
+                }
+                try await phase(taskID, "正在加载背景素材", progress: nil)
+                await backgroundMediaService.loadMedia(for: gameID)
+                try Task.checkCancellation()
+                switch await backgroundMediaService.getMediaState(for: gameID) {
+                case .ready:
+                    try await finish(
+                        taskID,
+                        state: .completed,
+                        outcome: "mediaReady",
+                        error: nil,
+                        recovery: nil,
+                        phase: "背景素材已就绪"
+                    )
+                case .failed(let detail):
+                    try await finish(
+                        taskID,
+                        state: .failed,
+                        outcome: nil,
+                        error: detail,
+                        recovery: "检查网络或素材缓存后重试",
+                        phase: "背景素材加载失败"
+                    )
+                case .loading, .notLoaded:
+                    try await finish(
+                        taskID,
+                        state: .failed,
+                        outcome: nil,
+                        error: "背景素材未产生可确认结果",
+                        recovery: "重试背景素材加载",
+                        phase: "背景素材状态未确认"
+                    )
+                }
             case .logExport:
                 try await phase(taskID, "正在刷新日志缓冲", progress: nil)
                 let content = try await logWriter.exportLogs()
@@ -242,15 +276,46 @@ extension TaskScheduler {
         downloadProgress: TaskDownloadProgress? = nil
     ) async throws {
         guard var task = tasks[id] else { throw SchedulerError.taskNotFound(id) }
+        let previousDescription = task.phaseDescription
         task.phaseDescription = description
         task.progress = progress
         if let downloadProgress {
             downloadProgressDetails[id] = downloadProgress
-        } else {
-            downloadProgressDetails.removeValue(forKey: id)
+        } else if let previousDownloadProgress = downloadProgressDetails[id] {
+            // Keep the completed transfer size visible while verification,
+            // extraction, and installation continue. The speed is no longer
+            // live once the download phase has ended.
+            downloadProgressDetails[id] = TaskDownloadProgress(
+                bytesReceived: previousDownloadProgress.bytesReceived,
+                totalBytes: previousDownloadProgress.totalBytes,
+                speed: 0
+            )
         }
         task.revision += 1
-        try await commit(task)
+
+        // 进度 tick 的落盘节流：下载/解压每秒会产出大量 tick，若每个 tick 都
+        // `commit`（= 全量写一次 AppData），事件与进度会排在写盘后面，界面看起来
+        // 卡住（用户实测：下载进度停在 5%，解压阶段完全不动）。
+        // 内存状态与事件流每次 tick 都更新（界面即时），磁盘按 300ms 节流；
+        // 阶段说明变化、无进度的阶段切换、以及进度到达 0/1 时照常立即落盘。
+        let progressPersistedRecently: Bool
+        if let last = lastProgressPersistAt[id] {
+            progressPersistedRecently = ContinuousClock.now - last < .milliseconds(300)
+        } else {
+            progressPersistedRecently = false
+        }
+        let shouldPersist = previousDescription != description
+            || progress == nil
+            || progress == 0
+            || progress == 1
+            || !progressPersistedRecently
+        if shouldPersist {
+            try await commit(task)
+            lastProgressPersistAt[id] = ContinuousClock.now
+        } else {
+            tasks[id] = task
+            emit(task, persistence: .memoryOnly)
+        }
         await recordTaskEvent(
             task,
             eventName: "task.phase",

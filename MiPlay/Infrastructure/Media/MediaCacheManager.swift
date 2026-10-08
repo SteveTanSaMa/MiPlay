@@ -30,15 +30,21 @@ public actor MediaCacheManager {
     }
 
     private let fileManager: FileManager
+    private let baseURL: URL?
 
-    public init() {
+    public init(baseURL: URL? = nil) {
         self.fileManager = FileManager.default
+        self.baseURL = baseURL
     }
 
     /// 获取缓存目录
     public func cacheDirectory() -> URL {
-        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("MiPlay/MediaCache", isDirectory: true)
+        let root = baseURL
+            ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = root.appendingPathComponent(
+            baseURL == nil ? "MiPlay/MediaCache" : "MediaCache",
+            isDirectory: true
+        )
         try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -64,6 +70,58 @@ public actor MediaCacheManager {
         let dir = cacheDirectory().appendingPathComponent(subdirectory, isDirectory: true)
         try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent(key)
+    }
+
+    /// Returns the stable metadata file location inside a Game's cache group.
+    /// Fingerprints and cache manifests live here, not in AppData.
+    public func cacheMetadataURL(forGameId gameId: String, filename: String) -> URL {
+        let dir = cacheDirectory().appendingPathComponent(gameId, isDirectory: true)
+        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(filename)
+    }
+
+    /// Writes derived cache metadata (for example the API collection
+    /// fingerprint) with an atomic replace.
+    public func writeCacheMetadata(_ data: Data, forGameId gameId: String, filename: String) throws {
+        let url = cacheMetadataURL(forGameId: gameId, filename: filename)
+        let temporary = url.appendingPathExtension("tmp")
+        do {
+            try data.write(to: temporary, options: [.atomic])
+            if fileManager.fileExists(atPath: url.path) {
+                _ = try fileManager.replaceItemAt(url, withItemAt: temporary)
+            } else {
+                try fileManager.moveItem(at: temporary, to: url)
+            }
+        } catch {
+            try? fileManager.removeItem(at: temporary)
+            throw CacheError.writeFailed("缓存元数据写入失败: \(error.localizedDescription)")
+        }
+    }
+
+    /// Reads derived cache metadata. A missing or unreadable file returns nil
+    /// so callers can treat the collection as unknown without destructive
+    /// cleanup.
+    public func readCacheMetadata(forGameId gameId: String, filename: String) throws -> Data? {
+        let url = cacheMetadataURL(forGameId: gameId, filename: filename)
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        return try Data(contentsOf: url)
+    }
+
+    /// Lists only background-group directories for a Game. Metadata files at
+    /// the Game root are not treated as groups.
+    public func groupDirectoryNames(forGameId gameId: String) throws -> [String] {
+        let dir = cacheDirectory().appendingPathComponent(gameId, isDirectory: true)
+        guard fileManager.fileExists(atPath: dir.path) else { return [] }
+        let contents = try fileManager.contentsOfDirectory(atPath: dir.path)
+        var groups: [String] = []
+        for item in contents {
+            let itemURL = dir.appendingPathComponent(item, isDirectory: true)
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: itemURL.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { continue }
+            groups.append(item)
+        }
+        return groups
     }
 
     /// 写入缓存（不自动删除旧素材，由用户手动清理）

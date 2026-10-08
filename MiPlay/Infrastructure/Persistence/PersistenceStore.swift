@@ -64,7 +64,11 @@ public actor PersistenceStore {
             guard decoded.schemaVersion <= AppData.currentSchemaVersion else {
                 throw StoreError.unsupportedSchema(decoded.schemaVersion)
             }
-            guard decoded.schemaVersion < AppData.currentSchemaVersion else {
+            let hasLegacyWineState = decoded.selectedWineVersion != nil
+                || decoded.selectedWineSource != nil
+                || !decoded.installedWineVersions.isEmpty
+                || decoded.perGameSettings.values.contains { $0.wineVersionOverride != nil }
+            guard decoded.schemaVersion < AppData.currentSchemaVersion || hasLegacyWineState else {
                 recordPersistenceEvent(
                     eventName: "persistence.read",
                     phase: "read",
@@ -74,11 +78,20 @@ public actor PersistenceStore {
                 return AppDataLoadResult(data: decoded, state: .readable)
             }
 
-            // Legacy path records are decoded as migrationRequired by Game. Keep the
-            // original file and backup before writing the schema-2 representation.
+            // Keep the original file and backup before writing the canonical schema 4
+            // representation. Legacy Wine selection and per-game override values are
+            // migration input only and must not authorize the new runtime pair.
             try createBackup("AppData")
             var migrated = decoded
             migrated.schemaVersion = AppData.currentSchemaVersion
+            migrated.selectedWineVersion = nil
+            migrated.selectedWineSource = nil
+            migrated.installedWineVersions = []
+            migrated.perGameSettings = migrated.perGameSettings.mapValues { settings in
+                var normalized = settings
+                normalized.wineVersionOverride = nil
+                return normalized
+            }
             do {
                 let migratedData = try encode(migrated)
                 try atomicWrite(migratedData, to: url, preserveBackup: false)
@@ -180,6 +193,19 @@ public actor PersistenceStore {
             }
             throw StoreError.writeFailed("写入后重新读取验证失败: \(error.localizedDescription)")
         }
+    }
+
+    /// Performs one serialized read-modify-write transaction on AppData.
+    /// Individual readAppData/writeAppData calls are actor-isolated, but
+    /// callers using them separately can still overwrite each other's fields.
+    @discardableResult
+    public func updateAppData(
+        _ update: @Sendable (inout AppData) throws -> Void
+    ) throws -> AppData {
+        var data = try readAppData()
+        try update(&data)
+        try writeAppData(data)
+        return data
     }
 
     /// Test and diagnostics seam for exercising commit failure paths without
