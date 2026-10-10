@@ -11,6 +11,7 @@ import SwiftUI
 /// 通用设置：只保留常用项。
 struct GeneralSettingsView: View {
     let settingsViewModel: SettingsViewModel
+    @AppStorage("showGameNews") private var showGameNews = true
 
     var body: some View {
         Form {
@@ -107,6 +108,12 @@ struct GeneralSettingsView: View {
                 Text("游戏运行")
             } footer: {
                 Text("更改将在下次启动游戏时生效。")
+            }
+
+            Section("主窗口") {
+                Toggle("在主窗口显示游戏新闻", isOn: $showGameNews)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
             }
 
             Section("语言") {

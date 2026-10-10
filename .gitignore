@@ -32,3 +32,10 @@ QAArtifacts/
 
 # Local development preferences
 .commandcode/
+
+# Local upstream research checkout (revision documented in Docs/GameNews.md)
+References/Mingora/
+
+# Independent fork checkouts used as MiPlay references
+References/dxmt/
+References/lsfg/

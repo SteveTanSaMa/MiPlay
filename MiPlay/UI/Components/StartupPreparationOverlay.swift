@@ -5,13 +5,13 @@
 
 import SwiftUI
 
-// Source: 用户指令（2026-10-07）— Wine 下载/解压/配置提到流程最前，配全屏界面与
-// 进度条；随后才开始背景素材的下载与转化。
+// Source: 用户指令（2026-10-09）— 素材准备与 Wine 下载/配置并行，
+// Wine 先完成时继续显示剩余素材进度。
 //
 // 全屏阻断触控：遮罩由 `LibraryViewModel.startupPhase` 驱动，从第一帧起覆盖主页，
-// 直到 Wine 环境与背景素材全部就绪；Wine 阶段失败时停在遮罩上并提供重试。
+// 直到 Wine 就绪与素材任务结束；Wine 阶段失败时停在遮罩上并提供重试。
 
-/// 启动准备全屏遮罩（Wine 环境 → 背景素材）。
+/// 启动准备全屏遮罩（并行准备，等待剩余素材）。
 struct StartupPreparationOverlay: View {
     let phase: LibraryViewModel.StartupPhase
     let detail: String?
@@ -41,7 +41,7 @@ struct StartupPreparationOverlay: View {
     private var content: some View {
         VStack(spacing: 16) {
             Text(title)
-                .font(.title3.weight(.medium))
+                .font(.title2.weight(.medium))
                 .accessibilityAddTraits(.isHeader)
                 .accessibilityFocused($isTitleFocused)
 
@@ -69,7 +69,7 @@ struct StartupPreparationOverlay: View {
                 ProgressView(value: value)
                     .frame(width: 260)
                 Text("\(Int(value * 100))%")
-                    .font(.caption.monospacedDigit())
+                    .font(.body.monospacedDigit())
                     .foregroundStyle(Color.secondary)
             }
         } else {
@@ -80,7 +80,7 @@ struct StartupPreparationOverlay: View {
 
     private func messageView(_ message: String) -> some View {
         Text(message)
-            .font(.caption)
+            .font(.body)
             .foregroundStyle(failure == nil ? Color.secondary : Color.red)
             .multilineTextAlignment(.center)
             .frame(maxWidth: 460)

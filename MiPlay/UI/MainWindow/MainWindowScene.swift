@@ -13,12 +13,16 @@ import SwiftUI
 /// 主窗口场景。MiPlay 的核心交互场景。
 struct MainWindowScene: Scene {
     let libraryViewModel: LibraryViewModel
+    let newsProvider: HoYoPlayNewsProvider
+    let newsImageCache: NewsBannerImageCache
     let registerWindow: (NSWindow) -> Void
 
     var body: some Scene {
         WindowGroup(id: "main") {
             MainWindowContentView(
-                libraryViewModel: libraryViewModel
+                libraryViewModel: libraryViewModel,
+                newsProvider: newsProvider,
+                newsImageCache: newsImageCache
             )
             .frame(width: 1280, height: 688)
             .background(WindowRegistrar(registerWindow: registerWindow))
@@ -35,8 +39,11 @@ struct MainWindowScene: Scene {
 struct MainWindowContentView: View {
     // Source: Code Review → CR-3 — @State 语义误用
     let libraryViewModel: LibraryViewModel
+    let newsProvider: HoYoPlayNewsProvider
+    let newsImageCache: NewsBannerImageCache
     /// 游戏库为空时默认选中的占位游戏类型
     // Source: UI Design → UI-11/UI-12 — 材质按钮 + hover 效果
+    @AppStorage("showGameNews") private var showGameNews = true
     @State private var selectedPlaceholderType: GameType? = .genshinImpact
 
     /// 当前有效的游戏类型（真实游戏优先，否则用占位选择）
@@ -70,56 +77,64 @@ struct MainWindowContentView: View {
             .accessibilityHidden(true)
 
             // 前景内容
-            VStack(spacing: 0) {
-                Spacer()
-
-                // 底部区域：左侧导航栏 + 中央操作按钮
-                HStack(alignment: .bottom) {
-                    // 左下角：游戏选择栏
-                    GameSelectionRailView(
-                        games: libraryViewModel.games,
-                        selectedId: Binding(
-                            get: { libraryViewModel.selectedGameId },
-                            set: { newId in if let id = newId { libraryViewModel.selectGame(id: id) } }
-                        ),
-                        selectedPlaceholderType: $selectedPlaceholderType,
-                        onLocateGame: { gameType in locateGame(type: gameType) },
-                        onPreload: { gameType in
-                            Task { await libraryViewModel.preloadMedia(for: gameType.rawValue) }
-                        },
-                        iconURLs: libraryViewModel.gameIconURLs
-                    )
-                    .frame(width: 76)
-
+            GeometryReader { geometry in
+                VStack(spacing: 0) {
                     Spacer()
 
-                    // Source: 用户反馈 — 底部布局修正
-                    VStack(alignment: .trailing, spacing: 10) {
-                        MainTaskFeedbackView(
-                            game: libraryViewModel.selectedGame,
-                            progress: libraryViewModel.launchProgress,
-                            recovery: libraryViewModel.recoveryRecords.first {
-                                $0.resolvedAt == nil && $0.gameID == libraryViewModel.selectedGameId
-                            }
-                        ) { recordID in
-                            Task { await libraryViewModel.retryProcessExitRecovery(recordID: recordID) }
+                    // 底部区域：左侧导航栏 + 中央操作按钮
+                    HStack(alignment: .bottom) {
+                        // 左下角：游戏选择栏
+                        GameSelectionRailView(
+                            games: libraryViewModel.games,
+                            selectedId: Binding(
+                                get: { libraryViewModel.selectedGameId },
+                                set: { newId in if let id = newId { libraryViewModel.selectGame(id: id) } }
+                            ),
+                            selectedPlaceholderType: $selectedPlaceholderType,
+                            onLocateGame: { gameType in locateGame(type: gameType) },
+                            onPreload: { gameType in
+                                Task { await libraryViewModel.preloadMedia(for: gameType.rawValue) }
+                            },
+                            iconURLs: libraryViewModel.gameIconURLs
+                        )
+                        .frame(width: 76)
+
+                        if showGameNews, let game = effectiveGameType {
+                            GameNewsPanel(game: game, provider: newsProvider, imageCache: newsImageCache)
+                                .frame(width: min(340, geometry.size.width * 0.27))
+                                .padding(.leading, 18)
                         }
 
-                        PrimaryActionButton(
-                            state: libraryViewModel.primaryButtonState,
-                            action: {
-                                guard let game = libraryViewModel.selectedGame else { return }
-                                if case .enabled(_, let action) = libraryViewModel.primaryButtonState, action == .locate {
-                                    locateGame(type: game.type)
-                                } else {
-                                    Task { await libraryViewModel.performPrimaryAction() }
+                        Spacer()
+
+                        // Source: 用户反馈 — 底部布局修正
+                        VStack(alignment: .trailing, spacing: 10) {
+                            MainTaskFeedbackView(
+                                game: libraryViewModel.selectedGame,
+                                progress: libraryViewModel.launchProgress,
+                                recovery: libraryViewModel.recoveryRecords.first {
+                                    $0.resolvedAt == nil && $0.gameID == libraryViewModel.selectedGameId
                                 }
+                            ) { recordID in
+                                Task { await libraryViewModel.retryProcessExitRecovery(recordID: recordID) }
                             }
-                        )
+
+                            PrimaryActionButton(
+                                state: libraryViewModel.primaryButtonState,
+                                action: {
+                                    guard let game = libraryViewModel.selectedGame else { return }
+                                    if case .enabled(_, let action) = libraryViewModel.primaryButtonState, action == .locate {
+                                        locateGame(type: game.type)
+                                    } else {
+                                        Task { await libraryViewModel.performPrimaryAction() }
+                                    }
+                                }
+                            )
+                        }
                     }
+                    .padding(.horizontal, 30)
+                    .padding(.bottom, 48)
                 }
-                .padding(.horizontal, 30)
-                .padding(.bottom, 48)
             }
             .disabled(libraryViewModel.isStartupPreparationVisible)
             .accessibilityHidden(libraryViewModel.isStartupPreparationVisible)

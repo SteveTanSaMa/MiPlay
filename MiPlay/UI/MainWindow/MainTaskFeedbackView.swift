@@ -25,12 +25,12 @@ struct MainTaskFeedbackView: View {
                                 ProgressView().controlSize(.small)
                             }
                             Text(progress.phase)
-                                .font(.callout.weight(.medium))
+                                .font(.system(size: 14, weight: .medium))
                                 .fixedSize(horizontal: false, vertical: true)
                             Spacer(minLength: 8)
                             if let value = progress.progress {
                                 Text(value, format: .percent.precision(.fractionLength(0)))
-                                    .font(.caption.monospacedDigit())
+                                    .font(.body.monospacedDigit())
                                     .foregroundStyle(.secondary)
                             }
                         }
@@ -47,17 +47,18 @@ struct MainTaskFeedbackView: View {
                     if progress != nil { Divider() }
                     VStack(alignment: .leading, spacing: 8) {
                         Label("状态需要恢复", systemImage: "exclamationmark.triangle.fill")
-                            .font(.callout.weight(.medium))
+                            .font(.system(size: 14, weight: .medium))
                             .foregroundStyle(.orange)
                         Text(recovery.detail)
-                            .font(.caption)
+                            .font(.body)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                             .lineLimit(3)
                             .help(recovery.detail)
                         Button("重试恢复") { retry(recovery.id) }
                             .buttonStyle(.bordered)
-                            .controlSize(.small)
+                            .controlSize(.regular)
+                            .font(.body)
                     }
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel("\(game?.type.displayName ?? "游戏")状态恢复失败")

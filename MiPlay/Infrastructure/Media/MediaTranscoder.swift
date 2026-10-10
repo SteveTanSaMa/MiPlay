@@ -53,6 +53,9 @@ public actor MediaTranscoder {
         self.ffmpegPathOverride = ffmpegPath
     }
 
+    /// Included in the video cache marker so previous lossy outputs are regenerated.
+    nonisolated internal static let videoQualityProfile = "h264-crf14-veryslow-yuv420p-v1"
+
     // MARK: - 转码
 
     /// 临时输出路径：`.part` 插在扩展名之前，保证 ffmpeg 仍能按扩展名选择
@@ -69,7 +72,8 @@ public actor MediaTranscoder {
     }
 
     /// 将 webm 高品质转码为 mp4。
-    /// slow 使用更高压缩效率，CRF 18 提供高质量视觉结果；
+    /// CRF 14 在高画质与体积之间取平衡，veryslow 提高压缩效率；
+    /// 保留原始分辨率与帧率，不通过放大制造细节。
     /// PNG/WebP 转换仍是无损输出，不受该视频质量参数影响。
     /// - Parameters:
     ///   - inputPath: 输入 webm 文件路径
@@ -117,15 +121,15 @@ public actor MediaTranscoder {
                     "-i", inputPath,
                     "-map", "0:v:0",
                     "-c:v", "libx264",
-                    "-preset", "slow",
-                    "-crf", "18",
+                    "-preset", "veryslow",
+                    "-crf", "14",
                     "-pix_fmt", "yuv420p",
                     "-movflags", "+faststart",
                     "-an",
                     "-y",
                     tempPath
                 ],
-                timeout: 120
+                timeout: 600
             )
         } catch {
             try? FileManager.default.removeItem(atPath: tempPath)
@@ -177,6 +181,12 @@ public actor MediaTranscoder {
                 messageCode: "background.transcode.output_missing"
             ))
             throw TranscodeError.transcodeFailed(error.localizedDescription)
+        }
+
+        do {
+            try Self.videoQualityProfile.write(toFile: outputPath + ".quality", atomically: true, encoding: .utf8)
+        } catch {
+            await logWriter.warning("视频质量缓存标记写入失败", module: "MediaTranscoder")
         }
 
         await logWriter.record(.init(

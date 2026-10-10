@@ -101,6 +101,8 @@ struct MiPlayApp: App {
 
     let libraryViewModel: LibraryViewModel
     let settingsViewModel: SettingsViewModel
+    let newsProvider: HoYoPlayNewsProvider
+    let newsImageCache: NewsBannerImageCache
 
     init() {
         // 基础设施层初始化
@@ -108,6 +110,8 @@ struct MiPlayApp: App {
         let network = NetworkDownloadProvider()
         let system = SystemEnvironmentDetector()
         let log = LogWriter(fileSystemRepository: fileSystem)
+        self.newsProvider = HoYoPlayNewsProvider(network: network, logger: log)
+        self.newsImageCache = NewsBannerImageCache(network: network)
         let persistence = PersistenceStore(logWriter: log)
         let process = ProcessManager(logWriter: log)
         let wine = WineRuntimeProvider(
@@ -247,10 +251,8 @@ struct MiPlayApp: App {
             await wineVersionMgr.initialize()
             await scheduler.initialize()
 
-            // 用户指令（2026-10-07）：Wine 的下载/解压/配置提到启动流程的最前面，
-            // 由 `LibraryViewModel` 的启动准备第一阶段驱动（带全屏进度），
-            // 完成后才开始背景素材的下载与转化。这里不再自行提交 Wine 任务，
-            // 只保留管理器初始化，让设置窗口能尽早读到状态。
+            // Wine 与素材的并行启动准备由 LibraryViewModel 统一驱动。
+            // 这里只保留管理器初始化，让设置窗口能尽早读到状态。
         }
     }
 
@@ -258,6 +260,8 @@ struct MiPlayApp: App {
         // Source: ADR 020 — 主窗口简化，设置移入独立窗口
         MainWindowScene(
             libraryViewModel: libraryViewModel,
+            newsProvider: newsProvider,
+            newsImageCache: newsImageCache,
             registerWindow: appDelegate.registerMainWindow
         )
         .commands {

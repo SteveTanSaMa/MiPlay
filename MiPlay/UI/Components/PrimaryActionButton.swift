@@ -37,12 +37,12 @@ struct PrimaryActionButton: View {
 
                 if let symbol = actionSymbol {
                     Image(systemName: symbol)
-                        .font(.body.weight(.semibold))
+                        .font(.title3.weight(.semibold))
                         .accessibilityHidden(true)
                 }
 
                 Text(state.label)
-                    .font(.title3)
+                    .font(.title2)
                     .fontWeight(.semibold)
             }
             .shadow(color: .black.opacity(0.45), radius: 1, y: 1)

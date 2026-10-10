@@ -591,6 +591,33 @@ import Observation
         XCTAssertTrue(accepted)
     }
 
+    func testVideoCacheRequiresCurrentEncodingQuality() async throws {
+        let baseURL = try makeTemporaryDirectory()
+        let supportURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+        defer { try? FileManager.default.removeItem(at: supportURL) }
+        let cache = MediaCacheManager(baseURL: supportURL)
+        let gameID = GameType.genshinImpact.rawValue
+        let videoURL = await cache.cachedFileURL(forKey: "video.mp4", inDirectory: "\(gameID)/bg-1")
+        try Data("previous video".utf8).write(to: videoURL)
+        let service = try makeBackgroundService(
+            cacheBase: supportURL,
+            store: PersistenceStore(baseURL: baseURL),
+            network: makeMockNetwork(response: Self.backgroundResponseJSON())
+        )
+        var accepted = await service.hasSubCache(for: gameID, backgroundId: "bg-1", type: .video, ext: "mp4")
+        XCTAssertFalse(accepted, "Old videos must be regenerated after the quality change")
+        try "h264-crf18-slow".write(toFile: videoURL.path + ".quality", atomically: true, encoding: .utf8)
+        accepted = await service.hasSubCache(for: gameID, backgroundId: "bg-1", type: .video, ext: "mp4")
+        XCTAssertFalse(accepted)
+        try MediaTranscoder.videoQualityProfile.write(toFile: videoURL.path + ".quality", atomically: true, encoding: .utf8)
+        accepted = await service.hasSubCache(for: gameID, backgroundId: "bg-1", type: .video, ext: "mp4")
+        XCTAssertTrue(accepted)
+        try Data().write(to: videoURL)
+        accepted = await service.hasSubCache(for: gameID, backgroundId: "bg-1", type: .video, ext: "mp4")
+        XCTAssertFalse(accepted, "A quality marker cannot make an empty video valid")
+    }
+
     private func makeStubFFmpeg(in directory: URL, exitCode: Int32) throws -> URL {
         let scriptURL = directory.appendingPathComponent("stub-ffmpeg-\(exitCode).sh")
         // 与真实 ffmpeg 一致：输出路径必须以可识别的扩展名结尾，否则无法选择

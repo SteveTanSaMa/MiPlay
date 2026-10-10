@@ -27,7 +27,7 @@ public final class LibraryViewModel {
     private(set) var launchProgress: LaunchProgress?
     /// 游戏库是否已初始化
     private(set) var isInitialized = false
-    /// 启动准备阶段（Wine 环境 → 背景素材 → 就绪）。首帧即为 `.preparingWine`，
+    /// 启动准备阶段（Wine 与背景素材并行 → 就绪）。首帧即为 `.preparingWine`，
     /// 全屏遮罩据此覆盖整个准备过程。
     private(set) var startupPhase: StartupPhase = .preparingWine
     /// 全屏遮罩上的说明文字（如「正在准备背景素材…（1/3）」）。
@@ -96,8 +96,8 @@ public final class LibraryViewModel {
     private let persistenceStore: PersistenceStore
     private let taskScheduler: TaskScheduler
     private let logWriter: LogWriter
-    /// Wine 运行时/共享 prefix 的决策者。启动准备的第一阶段由它驱动；
-    /// nil（测试或未接线）时跳过该阶段，直接进入背景素材准备。
+    /// Wine 运行时/共享 prefix 的决策者。启动准备的 Wine 阶段由它驱动；
+    /// nil（测试或未接线）时只等待背景素材准备。
     private let wineVersionManager: WineVersionManager?
     /// 官方游戏图标获取（best-effort）。nil（测试或未接线）时跳过图标补齐，
     /// 仍会读取本地已有缓存。
@@ -137,7 +137,7 @@ public final class LibraryViewModel {
 
     // MARK: - Startup preparation
 
-    /// 启动准备阶段：Wine 运行时/共享 prefix → 背景素材 → 就绪。
+    /// Wine 与素材并行准备；Wine 先完成时显示剩余素材进度。
     public enum StartupPhase: Sendable, Equatable {
         case preparingWine
         case preparingMedia
@@ -146,9 +146,8 @@ public final class LibraryViewModel {
 
     // MARK: - Initialization
 
-    /// 初始化视图模型。启动准备按用户要求分两个阶段串联：
-    /// 先准备 Wine 运行时与共享 prefix，完成后再下载/转码背景素材；
-    /// 全程由全屏遮罩（`startupPhase != .ready`）覆盖主页。
+    /// 初始化视图模型。背景下载/转码与 Wine 下载/解压/配置重叠，
+    /// 全屏遮罩等待 Wine 就绪以及素材任务进入终态。
     public func initialize() async {
         guard !isInitialized else { return }
         isLoading = true
@@ -176,19 +175,20 @@ public final class LibraryViewModel {
         // 官方图标与启动准备并行（best-effort，不阻塞任何阶段）。
         Task { await refreshGameIcons() }
 
-        // 阶段 1：Wine 运行时 + 共享 prefix（下载 / 解压 / 配置）
+        // 调度器独立管理素材后台任务，不占 Wine runtime / prefix 的资源锁。
+        // 提前提交，让下载与转码覆盖 Wine 下载、解压和配置的等待时间。
+        let mediaTaskIDs = await startBackgroundMediaPreparation()
         let wineReady = await prepareWineEnvironment()
         guard wineReady else {
-            // 失败时停在准备界面（展示原因 + 重试），不进入背景素材阶段：
-            // 没有可用的 Wine 环境时放行到主页只会让启动按钮必然失败。
+            // Wine 失败时保留遮罩；素材任务继续填充缓存，重试复用进行中的任务。
             isLoading = false
             isInitialized = true
             return
         }
 
-        // 阶段 2：Wine 就绪后才开始背景素材的下载与转码
+        // Wine 先结束时只等待尚未完成的素材；素材已结束则立即通过。
         startupPhase = .preparingMedia
-        await prepareBackgroundMedia()
+        await finishBackgroundMediaPreparation(mediaTaskIDs)
 
         startupPhase = .ready
         startupDetail = nil
@@ -202,7 +202,7 @@ public final class LibraryViewModel {
         }
     }
 
-    /// 准备界面上的「重试」：重新执行两个阶段（依赖已初始化，不重复初始化）。
+    /// 准备界面上的「重试」：并行准备，复用正在运行的素材任务与缓存。
     public func retryStartupPreparation() async {
         guard isInitialized else { return }
         startupFailure = nil
@@ -210,10 +210,11 @@ public final class LibraryViewModel {
         startupDetail = "正在重试…"
         startupProgress = nil
 
+        let mediaTaskIDs = await startBackgroundMediaPreparation()
         guard await prepareWineEnvironment() else { return }
 
         startupPhase = .preparingMedia
-        await prepareBackgroundMedia()
+        await finishBackgroundMediaPreparation(mediaTaskIDs)
 
         startupPhase = .ready
         startupDetail = nil
@@ -298,16 +299,28 @@ public final class LibraryViewModel {
         }
     }
 
-    /// 阶段 2：为三款游戏提交背景素材下载/转码任务，并等待全部进入终态。
-    private func prepareBackgroundMedia() async {
-        guard let mediaService = backgroundMediaService else { return }
-        startupProgress = 0
-        startupDetail = "正在准备背景素材…"
-
+    /// 只提交后台任务，不等待完成，也不覆盖 Wine 在遮罩上的进度。
+    private func startBackgroundMediaPreparation() async -> Set<ScheduledTaskID> {
+        guard let mediaService = backgroundMediaService else { return [] }
+        await mediaService.loadSettings()
+        // 恢复任务可能早于当前 ViewModel 创建，先从调度器事实补齐引用。
+        for task in await taskScheduler.allTaskSnapshots()
+        where task.type == .backgroundMediaLoad && (task.state == .pending || task.state == .running) {
+            if let gameID = task.gameId { backgroundMediaTaskIDs[gameID] = task.id }
+        }
+        var taskIDs = Set<ScheduledTaskID>()
         for gameType in GameType.allCases {
             await enqueueBackgroundMediaLoad(for: gameType.rawValue)
+            if let taskID = backgroundMediaTaskIDs[gameType.rawValue] {
+                taskIDs.insert(taskID)
+            }
         }
-        let taskIDs = Set(backgroundMediaTaskIDs.values)
+        // 使用本次任务 ID 的独立快照：终态事件会清理字典，但不能丢失等待条件。
+        return taskIDs
+    }
+
+    private func finishBackgroundMediaPreparation(_ taskIDs: Set<ScheduledTaskID>) async {
+        guard let mediaService = backgroundMediaService else { return }
         if !taskIDs.isEmpty {
             await waitForTasks(taskIDs)
         }

@@ -20,6 +20,7 @@
 		F10000010000000000000009 /* TestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F20000010000000000000009 /* TestSupport.swift */; };
 		F1000001000000000000000A /* LaunchOptimizationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000001000000000000000A /* LaunchOptimizationTests.swift */; };
 		F40000010000000000000001 /* RuntimeAssets in Resources */ = {isa = PBXBuildFile; fileRef = F30000010000000000000001 /* RuntimeAssets */; };
+		F1000001000000000000000B /* GameNewsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000001000000000000000B /* GameNewsTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -48,6 +49,7 @@
 		F20000010000000000000009 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
 		F2000001000000000000000A /* LaunchOptimizationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchOptimizationTests.swift; sourceTree = "<group>"; };
 		F30000010000000000000001 /* RuntimeAssets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = RuntimeAssets; sourceTree = "<group>"; };
+		F2000001000000000000000B /* GameNewsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameNewsTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -115,6 +117,7 @@
 				F20000010000000000000008 /* UIReadinessTests.swift */,
 				F20000010000000000000009 /* TestSupport.swift */,
 				F2000001000000000000000A /* LaunchOptimizationTests.swift */,
+				F2000001000000000000000B /* GameNewsTests.swift */,
 			);
 			path = MiPlayTests;
 			sourceTree = "<group>";
@@ -225,6 +228,7 @@
 				F10000010000000000000008 /* UIReadinessTests.swift in Sources */,
 				F10000010000000000000009 /* TestSupport.swift in Sources */,
 				F1000001000000000000000A /* LaunchOptimizationTests.swift in Sources */,
+				F1000001000000000000000B /* GameNewsTests.swift in Sources */,
 			);
 		};
 /* End PBXSourcesBuildPhase section */

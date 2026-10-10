@@ -127,7 +127,7 @@ extension BackgroundMediaService {
         let mode = backgroundModes[gameId] ?? .dynamic
         switch mode {
         case .dynamic:
-            let hasVideo = await mediaCacheManager.hasCachedFile(for: subdir + "/video.mp4")
+            let hasVideo = await hasSubCache(for: gameId, backgroundId: backgroundId, type: .video, ext: "mp4")
             let hasBg = await mediaCacheManager.hasCachedFile(for: subdir + "/background.png")
             return hasVideo && hasBg
         case .static:
@@ -152,7 +152,14 @@ extension BackgroundMediaService {
         let url = await mediaCacheManager.cachedFileURL(forKey: filename, inDirectory: subdirectory)
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         let size = attributes?[.size] as? Int64 ?? 0
-        return size > 0
+        guard size > 0 else { return false }
+        if type == .video, ext == "mp4" {
+            let marker = await Task.detached(priority: .utility) {
+                try? String(contentsOfFile: url.path + ".quality", encoding: .utf8)
+            }.value
+            return marker == MediaTranscoder.videoQualityProfile
+        }
+        return true
     }
 
     /// 旧版扁平缓存键（向下兼容读已有缓存）

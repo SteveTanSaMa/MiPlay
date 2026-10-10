@@ -69,7 +69,8 @@ struct GameSelectionRailView: View {
                 settingsIconView
                     .padding(.top, 16)
             }
-            .padding(.vertical, 10)
+            // 底部不留容器内边距，让设置按钮可见下沿参与主窗口的 bottom 对齐。
+            .padding(.top, 10)
         }
         // 状态描边放在玻璃容器外，避免被合成覆盖；固定几何无需缩放同步。
         .overlay(alignment: .top) {
@@ -136,11 +137,11 @@ struct GameSelectionRailView: View {
             }
             Color.clear
                 .frame(width: 64, height: 64)
-                .overlay { glassOutline(selected: false) }
+                .overlay(alignment: .bottom) { glassOutline(selected: false) }
                 // 本层 VStack 已有 12pt spacing；补 4pt 对齐设置入口的 16pt 顶距。
                 .padding(.top, 4)
         }
-        .padding(.vertical, 10)
+        .padding(.top, 10)
     }
 
     private func glassOutline(selected: Bool) -> some View {
@@ -215,7 +216,7 @@ struct GameSelectionRailView: View {
         }
         .buttonStyle(.borderless)
         .focusable()
-        .frame(width: 64, height: 64)
+        .frame(width: 64, height: 64, alignment: .bottom)
         .contentShape(Rectangle())
         .onKeyPress(keys: [.return, .space], phases: .down) { _ in
             openSettings()
