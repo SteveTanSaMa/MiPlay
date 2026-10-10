@@ -80,6 +80,10 @@ public actor LaunchOrchestrator {
 
     private var currentLaunchProcessID: UUID?
     private var currentGameID: String?
+    /// 本次启动会话的进程退出事实是否已确认（`monitorProcess` 的退出等待返回后置位）。
+    /// 用于区分"游戏可能仍在运行"与"进程已退出、只剩共享 prefix 清理"两种情况，
+    /// 决定恢复入口能否在本次会话内重试（见 `canRetryProcessExitRecovery`）。
+    private var sessionProcessExited = false
     private var cancellationRequested = false
     private var activeSecurityScopes: [UUID: SecurityScopedAccess] = [:]
     private var activeSharedPrefixLease: SharedWinePrefixLease?
@@ -117,6 +121,7 @@ public actor LaunchOrchestrator {
             return .failure(.gameAlreadyRunning(game.type.displayName))
         }
         currentGameID = game.id
+        sessionProcessExited = false
         cancellationRequested = false
         let operationID = UUID()
         // 启动耗时埋点：各阶段事件带 `durationMs`（从 launch.start 起算），
@@ -544,6 +549,14 @@ public actor LaunchOrchestrator {
 
     private func setCurrentProcess(_ processID: UUID) { currentLaunchProcessID = processID }
 
+    /// 会话收尾：清空进程/游戏守卫与"进程已退出"事实。四处正常收尾路径共用，
+    /// 保证三者始终一起重置。
+    private func endLaunchSession() {
+        currentLaunchProcessID = nil
+        currentGameID = nil
+        sessionProcessExited = false
+    }
+
     /// 只对 MiPlay 托管目录下的固定 runtime 启用 LaunchServices 启动；
     /// 其他布局保持直接子进程路径。
     private func isManagedRuntimeLayout(_ runtimeRootURL: URL) async -> Bool {
@@ -598,8 +611,7 @@ public actor LaunchOrchestrator {
         activeSecurityScopes.removeValue(forKey: processID)?.stop()
         try await releaseSharedPrefixLease()
         restoreStagedGameFiles()
-        currentLaunchProcessID = nil
-        currentGameID = nil
+        endLaunchSession()
     }
 
     private func restoreStagedGameFiles() {
@@ -657,8 +669,7 @@ public actor LaunchOrchestrator {
             )
             return .failure(.recoveryRequired(error.localizedDescription))
         }
-        currentLaunchProcessID = nil
-        currentGameID = nil
+        endLaunchSession()
         do {
             if let state = (await gameRegistry.getGame(by: gameID))?.state,
                state == .launching || state == .installed {
@@ -717,6 +728,9 @@ public actor LaunchOrchestrator {
                 terminatedBySignal = result.terminatedBySignal
                 output = result.output
             }
+            // 退出等待已经返回：本会话的进程退出事实成立。后续的 wineserver 清理
+            // 或状态提交失败都属于"进程已退出、清理未完成"，恢复入口据此允许重试。
+            sessionProcessExited = true
             // The game process is gone; restore the files staged aside for
             // this launch regardless of how the exit fact is committed.
             restoreStagedGameFiles()
@@ -734,8 +748,7 @@ public actor LaunchOrchestrator {
                 activeSecurityScopes.removeValue(forKey: processID)?.stop()
                 try await releaseSharedPrefixLease()
                 if currentLaunchProcessID == processID {
-                    currentLaunchProcessID = nil
-                    currentGameID = nil
+                    endLaunchSession()
                 }
                 await logWriter.record(.init(
                     level: statusCode == 0 && !terminatedBySignal ? .info : .warning,
@@ -791,18 +804,35 @@ public actor LaunchOrchestrator {
 
     /// Retries an exit-state commit only; it never relaunches the game.
     public func retryProcessExitRecovery(recordID: String) async throws {
-        // 启动进行中不得执行恢复：共享 prefix lease 与进程/作用域守卫属于当前启动。
-        guard currentLaunchProcessID == nil else {
+        // 恢复入口的前置条件（2026-10-10 修复）：
+        // - 没有启动会话在途：允许（应用重启后的自动恢复走这条路）；
+        // - 有会话在途、但该会话的进程退出事实已确认：允许——这正是
+        //   "进程已退出、共享 prefix 清理失败"的现场，必须在本次会话内可重试；
+        // - 有会话在途且进程状态未知（游戏可能仍在运行）：拒绝，避免误杀。
+        guard Self.canRetryProcessExitRecovery(
+            hasActiveSession: currentLaunchProcessID != nil,
+            sessionProcessExited: sessionProcessExited
+        ) else {
             throw LaunchError.recoveryRequired("启动进行中，暂缓执行状态恢复")
         }
-        try await gameRegistry.retryProcessExitRecovery(recordID: recordID)
+        // 顺序：先释放共享 prefix（幂等，已释放时内部直接返回），再提交退出事实。
+        // 反过来的话，"提交成功但清理失败"会消费掉待恢复记录，使下一次重试无从入口。
         try await releaseSharedPrefixLease()
+        try await gameRegistry.retryProcessExitRecovery(recordID: recordID)
         if let processID = currentLaunchProcessID {
             activeSecurityScopes.removeValue(forKey: processID)?.stop()
         }
         activeApplication = nil
-        currentLaunchProcessID = nil
-        currentGameID = nil
+        endLaunchSession()
+    }
+
+    /// 恢复入口是否可用（纯函数，可测试）。
+    /// 只有"存在在途会话且该会话的进程还没有确认退出"才是禁止条件。
+    nonisolated static func canRetryProcessExitRecovery(
+        hasActiveSession: Bool,
+        sessionProcessExited: Bool
+    ) -> Bool {
+        !hasActiveSession || sessionProcessExited
     }
 
 }

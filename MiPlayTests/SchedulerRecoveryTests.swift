@@ -455,4 +455,506 @@ import XCTest
         XCTAssertFalse(GameRegistry.precedesInRecoveryCommitOrder(higherID, lowerID))
     }
 
+    // MARK: - 启动会话恢复（2026-10-10 修复：wineserver 清理失败后本会话内可恢复）
+
+    /// 恢复入口前置条件矩阵（纯函数）。
+    func testLaunchRecoveryPreconditionMatrix() {
+        // 无会话在途：允许（应用重启后的自动恢复走这条）。
+        XCTAssertTrue(LaunchOrchestrator.canRetryProcessExitRecovery(
+            hasActiveSession: false, sessionProcessExited: false
+        ))
+        // 会话在途、进程退出事实已确认：允许（本次修复的目标场景）。
+        XCTAssertTrue(LaunchOrchestrator.canRetryProcessExitRecovery(
+            hasActiveSession: true, sessionProcessExited: true
+        ))
+        // 会话在途、进程状态未知（游戏可能仍在运行）：拒绝，避免误杀。
+        XCTAssertFalse(LaunchOrchestrator.canRetryProcessExitRecovery(
+            hasActiveSession: true, sessionProcessExited: false
+        ))
+        // 会话已收尾：允许。
+        XCTAssertTrue(LaunchOrchestrator.canRetryProcessExitRecovery(
+            hasActiveSession: false, sessionProcessExited: true
+        ))
+    }
+
+    /// wineserver 清理失败 → 会话内可手动恢复；恢复先释放 prefix 再提交退出事实；
+    /// 重复调用不会二次释放；成功后守卫清空、可再次启动。
+    func testWineserverShutdownFailureKeepsSessionRecoverableInApp() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("YuanShen.exe")
+        try Data("printf '%s' \"$0\" > \"$WINEPREFIX/launch-arg\"\nsleep 0.2\nexit 0\n".utf8)
+            .write(to: executable)
+        try Data("[General]\ngame_version=1.2.3\nchannel=1\nsub_channel=0\ncps=test\n".utf8)
+            .write(to: directory.appendingPathComponent("config.ini"))
+
+        let supportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: supportDirectory) }
+        // 游戏目录授权：与既有启动夹具相同，用解析器把测试书签指向临时目录。
+        let resolver = BookmarkResolver(
+            resolve: { _ in .init(url: directory, isStale: true) },
+            refresh: { _, _ in Data([2]) },
+            startAccessing: { _ in true },
+            stopAccessing: { _ in }
+        )
+        let fileSystem = GameFileSystemRepository(
+            appSupportDirectory: supportDirectory,
+            bookmarkResolver: resolver
+        )
+        let store = PersistenceStore(baseURL: try makeTemporaryDirectory())
+        let logger = LogWriter(fileSystemRepository: fileSystem)
+        let process = ProcessManager()
+        let pair = try makeFixedWineRuntimePair(appSupport: supportDirectory)
+        let wine = WineRuntimeProvider(processManager: process, fileSystemRepository: fileSystem)
+
+        // 受控 wineserver：默认 `-k` 失败（退出码 42）；marker 存在时成功。
+        // 只使用临时目录中的运行时，绝不触碰真实 Prefix。
+        let marker = supportDirectory.appendingPathComponent("wineserver-ok")
+        let server = supportDirectory
+            .appendingPathComponent("WineVersions")
+            .appendingPathComponent(WineVersionManager.fixedRuntimeTag)
+            .appendingPathComponent("bin/wineserver")
+        let serverScript = """
+        #!/bin/sh
+        case "$1" in
+          -w) exit 0 ;;
+          -k) if [ -f "\(marker.path)" ]; then exit 0; else exit 42; fi ;;
+          *) exit 0 ;;
+        esac
+        """
+        try Data(serverScript.utf8).write(to: server)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: server.path)
+
+        let hash = try await fileSystem.calculateSHA256(of: executable.path)
+        let game = Game(
+            id: GameType.genshinImpact.rawValue,
+            type: .genshinImpact,
+            location: GameLocation(
+                gameID: GameType.genshinImpact.rawValue,
+                bookmarkData: Data([1]),
+                lastKnownPath: directory.path,
+                resolutionState: .resolvable
+            ),
+            state: .installed,
+            version: "1.2.3",
+            lastLaunchDate: nil,
+            solutionApplications: []
+        )
+        try await store.writeAppData(AppData(
+            games: [game],
+            managedWineRuntime: pair.runtime,
+            sharedWinePrefix: pair.prefix
+        ))
+        let registry = GameRegistry(
+            persistenceStore: store,
+            fileSystemRepository: fileSystem,
+            stateMachine: GameStateMachine(),
+            systemDetector: SystemEnvironmentDetector(),
+            logWriter: logger
+        )
+        await registry.initialize()
+        let wineManager = WineVersionManager(
+            networkProvider: NetworkDownloadProvider(),
+            fileSystemRepository: fileSystem,
+            persistenceStore: store,
+            wineVersionDownloader: WineVersionDownloader(
+                networkProvider: NetworkDownloadProvider(),
+                fileSystemRepository: fileSystem,
+                processManager: process,
+                logWriter: logger
+            ),
+            logWriter: logger,
+            wineRuntimeProvider: wine
+        )
+        await wineManager.initialize()
+        let verifier = FileIntegrityVerifier(
+            fileSystemRepository: fileSystem,
+            manifests: [.genshinImpact: .init(
+                gameID: GameType.genshinImpact.rawValue,
+                version: "1.2.3",
+                files: ["YuanShen.exe": hash]
+            )],
+            gameRegistry: registry
+        )
+        let validator = PreLaunchValidator(
+            fileSystemRepository: fileSystem,
+            systemDetector: SystemEnvironmentDetector { _ in
+                (free: UInt64.max, total: UInt64.max)
+            },
+            wineRuntimeProvider: wine,
+            wineVersionManager: wineManager,
+            integrityVerifier: verifier,
+            gameRegistry: registry
+        )
+        let launch = LaunchOrchestrator(
+            preLaunchValidator: validator,
+            wineRuntimeProvider: wine,
+            wineVersionManager: wineManager,
+            processManager: process,
+            performanceOptionManager: PerformanceOptionManager(
+                persistenceStore: store,
+                logWriter: logger
+            ),
+            gameRegistry: registry,
+            fileSystemRepository: fileSystem,
+            logWriter: logger
+        )
+
+        let result = await launch.launch(game: game)
+        guard case .success = result else {
+            return XCTFail("Expected Wine binary launch, got \(result)")
+        }
+
+        // 等待"退出已提交 + 清理失败"的现场：状态回到 installed，且存在待恢复记录。
+        let deadline = Date().addingTimeInterval(8)
+        var pendingRecord: RecoveryRecord?
+        while Date() < deadline {
+            let state = await registry.getGame(by: game.id)?.state
+            let pending = await registry.pendingRecoveryRecords(gameID: game.id)
+                .filter { $0.kind == "processExit" }
+            if state == .installed, let first = pending.first {
+                pendingRecord = first
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let record = try XCTUnwrap(pendingRecord, "wineserver 清理失败后应保留待恢复记录")
+
+        // 场景 6：会话未收尾时不允许新启动（共享 Prefix 不会被并发操作）。
+        let concurrent = await launch.launch(game: game)
+        guard case .failure(.gameAlreadyRunning) = concurrent else {
+            return XCTFail("会话未收尾时不应允许新启动: \(concurrent)")
+        }
+
+        // 场景 2：恢复入口必须可达——应表现为 prefix 清理失败，而不是被会话守卫拒绝。
+        do {
+            try await launch.retryProcessExitRecovery(recordID: record.id)
+            XCTFail("wineserver 仍然失败时不应恢复成功")
+        } catch {
+            let description = error.localizedDescription
+            XCTAssertFalse(
+                description.contains("启动进行中"),
+                "恢复入口被会话守卫拒绝（本次修复的目标场景）: \(description)"
+            )
+        }
+        let stillPending = await registry.pendingRecoveryRecords(gameID: game.id)
+            .contains { $0.id == record.id }
+        XCTAssertTrue(stillPending, "第一次重试失败后不应丢失待恢复记录")
+
+        // 场景 3：清理恢复可用后，在同一应用会话内完成恢复。
+        try Data().write(to: marker)
+        try await launch.retryProcessExitRecovery(recordID: record.id)
+        let pendingAfter = await registry.pendingRecoveryRecords(gameID: game.id)
+        XCTAssertTrue(pendingAfter.isEmpty, "恢复完成后不应残留待恢复记录")
+        let stateAfter = await registry.getGame(by: game.id)?.state
+        XCTAssertEqual(stateAfter, .installed)
+
+        // 场景 4：同一恢复事实不能被处理两次（也不会二次释放 prefix 租约）。
+        do {
+            try await launch.retryProcessExitRecovery(recordID: record.id)
+            XCTFail("已消费的恢复事实不应再次被处理")
+        } catch {
+            // 期望：恢复事实不存在或已处理
+        }
+
+        // 场景 1：正常收尾后守卫已清空，可以再次启动（原有行为不变）。
+        let relaunch = await launch.launch(game: game)
+        guard case .success = relaunch else {
+            return XCTFail("恢复后应可再次启动: \(relaunch)")
+        }
+        await launch.cancelLaunch()
+    }
+
+    // MARK: - 提交前异常路径验证（2026-10-10）
+    //
+    // A：Prefix 已释放、退出事实提交失败 → 记录不丢、不重复释放、可最终提交、状态一致。
+    // B：上述状态下应用重启 → 新实例识别 Prefix 已释放、不重复清理、可完成恢复、不遗留阻塞状态。
+
+    /// 受控会话夹具：临时目录 + 假 game 脚本 + 假 runtime + 可切换成败并记录调用的假 wineserver。
+    /// 全程只写临时目录，不触碰真实 Prefix / 真实 wineserver / 真实 Wine/DXMT 资产。
+    struct RecoverableSessionFixture {
+        let store: PersistenceStore
+        let fileSystem: GameFileSystemRepository
+        let process: ProcessManager
+        let logger: LogWriter
+        let provider: WineRuntimeProvider
+        let game: Game
+        let marker: URL
+        let serverLog: URL
+        let directory: URL
+        let supportDirectory: URL
+
+        /// 假 wineserver 被调用 `-k` 的次数（用于证明"已释放的 Prefix 不会被重复清理"）。
+        func killCount() -> Int {
+            guard let content = try? String(contentsOf: serverLog, encoding: .utf8) else { return 0 }
+            return content.split(whereSeparator: \.isNewline).filter { $0 == "-k" }.count
+        }
+
+        func removeTemporaryDirectories() {
+            try? FileManager.default.removeItem(at: directory)
+            try? FileManager.default.removeItem(at: supportDirectory)
+        }
+
+        /// 构建一个会话。可多次调用以模拟应用重启：同一 store 与临时目录，独立的内存状态。
+        func makeSession() async throws -> (registry: GameRegistry, orchestrator: LaunchOrchestrator) {
+            let registry = GameRegistry(
+                persistenceStore: store,
+                fileSystemRepository: fileSystem,
+                stateMachine: GameStateMachine(),
+                systemDetector: SystemEnvironmentDetector(),
+                logWriter: logger
+            )
+            await registry.initialize()
+            let wineManager = WineVersionManager(
+                networkProvider: NetworkDownloadProvider(),
+                fileSystemRepository: fileSystem,
+                persistenceStore: store,
+                wineVersionDownloader: WineVersionDownloader(
+                    networkProvider: NetworkDownloadProvider(),
+                    fileSystemRepository: fileSystem,
+                    processManager: process,
+                    logWriter: logger
+                ),
+                logWriter: logger,
+                wineRuntimeProvider: provider
+            )
+            await wineManager.initialize()
+            let hash = try await fileSystem.calculateSHA256(
+                of: directory.appendingPathComponent("YuanShen.exe").path
+            )
+            let verifier = FileIntegrityVerifier(
+                fileSystemRepository: fileSystem,
+                manifests: [.genshinImpact: .init(
+                    gameID: GameType.genshinImpact.rawValue,
+                    version: "1.2.3",
+                    files: ["YuanShen.exe": hash]
+                )],
+                gameRegistry: registry
+            )
+            let validator = PreLaunchValidator(
+                fileSystemRepository: fileSystem,
+                systemDetector: SystemEnvironmentDetector { _ in
+                    (free: UInt64.max, total: UInt64.max)
+                },
+                wineRuntimeProvider: provider,
+                wineVersionManager: wineManager,
+                integrityVerifier: verifier,
+                gameRegistry: registry
+            )
+            let orchestrator = LaunchOrchestrator(
+                preLaunchValidator: validator,
+                wineRuntimeProvider: provider,
+                wineVersionManager: wineManager,
+                processManager: process,
+                performanceOptionManager: PerformanceOptionManager(
+                    persistenceStore: store,
+                    logWriter: logger
+                ),
+                gameRegistry: registry,
+                fileSystemRepository: fileSystem,
+                logWriter: logger
+            )
+            return (registry, orchestrator)
+        }
+    }
+
+    private func makeRecoverableSessionFixture() async throws -> RecoverableSessionFixture {
+        let directory = try makeTemporaryDirectory()
+        let executable = directory.appendingPathComponent("YuanShen.exe")
+        try Data("printf '%s' \"$0\" > \"$WINEPREFIX/launch-arg\"\nsleep 0.2\nexit 0\n".utf8)
+            .write(to: executable)
+        try Data("[General]\ngame_version=1.2.3\nchannel=1\nsub_channel=0\ncps=test\n".utf8)
+            .write(to: directory.appendingPathComponent("config.ini"))
+
+        let supportDirectory = try makeTemporaryDirectory()
+        let resolver = BookmarkResolver(
+            resolve: { _ in .init(url: directory, isStale: true) },
+            refresh: { _, _ in Data([2]) },
+            startAccessing: { _ in true },
+            stopAccessing: { _ in }
+        )
+        let fileSystem = GameFileSystemRepository(
+            appSupportDirectory: supportDirectory,
+            bookmarkResolver: resolver
+        )
+        let store = PersistenceStore(baseURL: try makeTemporaryDirectory())
+        let logger = LogWriter(fileSystemRepository: fileSystem)
+        let process = ProcessManager()
+        let pair = try makeFixedWineRuntimePair(appSupport: supportDirectory)
+        let provider = WineRuntimeProvider(processManager: process, fileSystemRepository: fileSystem)
+
+        // 受控 wineserver：默认 `-k` 失败（退出码 42），marker 存在时成功；每次调用都记录到 serverLog。
+        let marker = supportDirectory.appendingPathComponent("wineserver-ok")
+        let serverLog = supportDirectory.appendingPathComponent("wineserver-calls.log")
+        let server = supportDirectory
+            .appendingPathComponent("WineVersions")
+            .appendingPathComponent(WineVersionManager.fixedRuntimeTag)
+            .appendingPathComponent("bin/wineserver")
+        let serverScript = """
+        #!/bin/sh
+        echo "$1" >> "\(serverLog.path)"
+        case "$1" in
+          -w) exit 0 ;;
+          -k) if [ -f "\(marker.path)" ]; then exit 0; else exit 42; fi ;;
+          *) exit 0 ;;
+        esac
+        """
+        try Data(serverScript.utf8).write(to: server)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: server.path)
+
+        let game = Game(
+            id: GameType.genshinImpact.rawValue,
+            type: .genshinImpact,
+            location: GameLocation(
+                gameID: GameType.genshinImpact.rawValue,
+                bookmarkData: Data([1]),
+                lastKnownPath: directory.path,
+                resolutionState: .resolvable
+            ),
+            state: .installed,
+            version: "1.2.3",
+            lastLaunchDate: nil,
+            solutionApplications: []
+        )
+        try await store.writeAppData(AppData(
+            games: [game],
+            managedWineRuntime: pair.runtime,
+            sharedWinePrefix: pair.prefix
+        ))
+
+        return RecoverableSessionFixture(
+            store: store,
+            fileSystem: fileSystem,
+            process: process,
+            logger: logger,
+            provider: provider,
+            game: game,
+            marker: marker,
+            serverLog: serverLog,
+            directory: directory,
+            supportDirectory: supportDirectory
+        )
+    }
+
+    /// 等待"退出已提交 + 清理失败"的现场：状态回到 installed，且存在待恢复记录。
+    private func waitForPendingProcessExitRecord(
+        registry: GameRegistry,
+        gameID: String,
+        timeout: TimeInterval = 8
+    ) async throws -> RecoveryRecord? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let state = await registry.getGame(by: gameID)?.state
+            let pending = await registry.pendingRecoveryRecords(gameID: gameID)
+                .filter { $0.kind == "processExit" }
+            if state == .installed, let first = pending.first { return first }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return nil
+    }
+
+    /// A：Prefix 已释放、退出事实提交失败。
+    func testRecoveryAfterPrefixReleasedButExitCommitFails() async throws {
+        let fixture = try await makeRecoverableSessionFixture()
+        defer { fixture.removeTemporaryDirectories() }
+        let session = try await fixture.makeSession()
+
+        let launchResult = await session.orchestrator.launch(game: fixture.game)
+        guard case .success = launchResult else {
+            return XCTFail("Expected Wine binary launch, got \(launchResult)")
+        }
+        let pendingRecord = try await waitForPendingProcessExitRecord(
+            registry: session.registry, gameID: fixture.game.id
+        )
+        let record = try XCTUnwrap(pendingRecord, "wineserver 清理失败后应保留待恢复记录")
+
+        // 释放成功、提交失败：注入 AppData 写失败后在会话内重试。
+        try Data().write(to: fixture.marker)
+        let killsBeforeRetry = fixture.killCount()
+        await fixture.store.injectWriteFailure("退出提交失败注入")
+        do {
+            try await session.orchestrator.retryProcessExitRecovery(recordID: record.id)
+            XCTFail("提交失败时不应恢复成功")
+        } catch {
+            XCTAssertFalse(
+                error.localizedDescription.contains("启动进行中"),
+                "恢复入口必须可达: \(error)"
+            )
+        }
+        XCTAssertEqual(
+            fixture.killCount(), killsBeforeRetry + 1,
+            "本次重试应恰好执行一次 wineserver -k（释放成功）"
+        )
+        let stillPending = await session.registry.pendingRecoveryRecords(gameID: fixture.game.id)
+            .contains { $0.id == record.id }
+        XCTAssertTrue(stillPending, "提交失败后不得丢失恢复记录")
+
+        // 清除写失败 → 再次恢复：Prefix 已释放，不得重复清理，且应最终完成提交。
+        await fixture.store.clearWriteFailure()
+        try await session.orchestrator.retryProcessExitRecovery(recordID: record.id)
+        XCTAssertEqual(
+            fixture.killCount(), killsBeforeRetry + 1,
+            "Prefix 已释放时不得重复执行 wineserver -k"
+        )
+        let pendingAfter = await session.registry.pendingRecoveryRecords(gameID: fixture.game.id)
+        XCTAssertTrue(pendingAfter.isEmpty, "恢复完成后不应残留待恢复记录")
+        let stateAfter = await session.registry.getGame(by: fixture.game.id)?.state
+        XCTAssertEqual(stateAfter, .installed, "恢复后状态必须一致")
+
+        // 不误操作新会话：恢复完成后可以再次启动并正常取消。
+        let relaunch = await session.orchestrator.launch(game: fixture.game)
+        guard case .success = relaunch else {
+            return XCTFail("恢复后应可再次启动: \(relaunch)")
+        }
+        await session.orchestrator.cancelLaunch()
+    }
+
+    /// B：上述状态下应用重启（新实例 + restartReconciliation）。
+    func testRestartAfterPrefixReleasedButExitCommitFails() async throws {
+        let fixture = try await makeRecoverableSessionFixture()
+        defer { fixture.removeTemporaryDirectories() }
+        let firstSession = try await fixture.makeSession()
+
+        let launchResult = await firstSession.orchestrator.launch(game: fixture.game)
+        guard case .success = launchResult else {
+            return XCTFail("Expected Wine binary launch, got \(launchResult)")
+        }
+        let pendingRecord = try await waitForPendingProcessExitRecord(
+            registry: firstSession.registry, gameID: fixture.game.id
+        )
+        let record = try XCTUnwrap(pendingRecord, "wineserver 清理失败后应保留待恢复记录")
+        try Data().write(to: fixture.marker)
+        await fixture.store.injectWriteFailure("退出提交失败注入")
+        do {
+            try await firstSession.orchestrator.retryProcessExitRecovery(recordID: record.id)
+            XCTFail("提交失败时不应恢复成功")
+        } catch {
+            XCTAssertFalse(error.localizedDescription.contains("启动进行中"), "恢复入口必须可达: \(error)")
+        }
+        let killsAfterRelease = fixture.killCount()
+
+        // 模拟应用终止 + 重启：清除写失败，丢弃第一个实例的会话，用同一 store/临时目录建新实例。
+        await fixture.store.clearWriteFailure()
+        let restarted = try await fixture.makeSession()
+        _ = try await restarted.registry.reconcileInterruptedLaunches()
+
+        // 新实例无会话在途 → 恢复入口放行；Prefix 已释放 → 不得重复清理。
+        try await restarted.orchestrator.retryProcessExitRecovery(recordID: record.id)
+        XCTAssertEqual(
+            fixture.killCount(), killsAfterRelease,
+            "重启后不得重复清理已释放的 Prefix"
+        )
+        let pendingAfterRestart = await restarted.registry.pendingRecoveryRecords(gameID: fixture.game.id)
+        XCTAssertTrue(pendingAfterRestart.isEmpty, "重启恢复后不应残留待恢复记录")
+        let stateAfterRestart = await restarted.registry.getGame(by: fixture.game.id)?.state
+        XCTAssertEqual(stateAfterRestart, .installed)
+
+        // 不遗留阻止新启动的状态：新实例可以直接启动并正常取消。
+        let relaunch = await restarted.orchestrator.launch(game: fixture.game)
+        guard case .success = relaunch else {
+            return XCTFail("重启恢复后应可启动: \(relaunch)")
+        }
+        await restarted.orchestrator.cancelLaunch()
+    }
+
 }
