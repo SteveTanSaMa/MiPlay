@@ -11,6 +11,128 @@ import XCTest
 @testable import MiPlay
 
 @MainActor extension MiPlayCoreTests {
+    func testYAAGLGameLaunchProfilesKeepGameSpecificSynchronization() {
+        for game in [GameType.genshinImpact, .zenlessZoneZero] {
+            XCTAssertTrue(LaunchCompatibilityEnvironment.usesSteamCompatibilityStub(for: game))
+            XCTAssertEqual(LaunchCompatibilityEnvironment.additionalEnvironment(for: game)["WINE_ENABLE_TIMEOUT_FIX"], "1")
+        }
+        XCTAssertFalse(LaunchCompatibilityEnvironment.usesSteamCompatibilityStub(for: .honkaiStarRail))
+        XCTAssertEqual(LaunchCompatibilityEnvironment.additionalEnvironment(for: .genshinImpact)["WINEMSYNC"], "0")
+        XCTAssertEqual(LaunchCompatibilityEnvironment.additionalEnvironment(for: .zenlessZoneZero)["WINEESYNC"], "0")
+        XCTAssertEqual(LaunchCompatibilityEnvironment.additionalEnvironment(for: .honkaiStarRail)["WINE_ENABLE_TIMEOUT_FIX"], "0")
+    }
+
+    func testJadeiteStagingRequiresAllPayloadsAndPreservesGameFiles() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let assets = root.appendingPathComponent("assets")
+        let prefix = root.appendingPathComponent("prefix")
+        let game = root.appendingPathComponent("Star Rail")
+        try FileManager.default.createDirectory(at: assets.appendingPathComponent("jadeite"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: game, withIntermediateDirectories: true)
+        try Data("game".utf8).write(to: game.appendingPathComponent("StarRail.exe"))
+        for name in LaunchCompatibilityEnvironment.jadeiteFileNames {
+            try Data(name.utf8).write(to: assets.appendingPathComponent("jadeite/\(name)"))
+        }
+        let stage = LaunchCompatibilityEnvironment.stage(gameType: .honkaiStarRail, gameDirectory: game, prefixURL: prefix, runtimeRootURL: root.appendingPathComponent("wine"), assetRootURL: assets)
+        XCTAssertTrue(LaunchCompatibilityEnvironment.missingRequiredLaunchAssets(for: .honkaiStarRail, staging: stage).isEmpty)
+        for name in LaunchCompatibilityEnvironment.jadeiteFileNames {
+            XCTAssertEqual(try Data(contentsOf: LaunchCompatibilityEnvironment.jadeiteDirectory(prefixURL: prefix).appendingPathComponent(name)), Data(name.utf8))
+        }
+        XCTAssertEqual(try Data(contentsOf: game.appendingPathComponent("StarRail.exe")), Data("game".utf8))
+        try FileManager.default.removeItem(at: assets.appendingPathComponent("jadeite/game_payload.dll"))
+        let incomplete = LaunchCompatibilityEnvironment.stage(gameType: .honkaiStarRail, gameDirectory: game, prefixURL: prefix, runtimeRootURL: root.appendingPathComponent("wine"), assetRootURL: assets)
+        XCTAssertEqual(LaunchCompatibilityEnvironment.missingRequiredLaunchAssets(for: .honkaiStarRail, staging: incomplete), ["game_payload.dll"])
+    }
+
+    func testWebviewRepairSelectsOnlyKnownRegistryValues() {
+        let output = """
+        HKEY_CURRENT_USER\\Software\\miHoYo\\绝区零
+            OtherValue REG_SZ keep
+            MIHOYOSDK_WEBVIEW_RENDER_METHOD_h1573598267 REG_BINARY 49535200
+            HOYO_WEBVIEW_RENDER_METHOD_ABTEST_1_test REG_BINARY 1234
+        """
+        XCTAssertEqual(GameLaunchPreparation.webviewValues(in: output), ["MIHOYOSDK_WEBVIEW_RENDER_METHOD_h1573598267", "HOYO_WEBVIEW_RENDER_METHOD_ABTEST_1_test"])
+        XCTAssertTrue(GameLaunchPreparation.webviewRegistryKeys(for: .genshinImpact).isEmpty)
+        XCTAssertEqual(GameLaunchPreparation.webviewRegistryKeys(for: .honkaiStarRail).count, 2)
+    }
+
+    func testStarRailNetworkWindowRestoresOnlyOwnedLinesWithoutSystemHosts() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let hosts = root.appendingPathComponent("hosts fixture's file")
+        let original = "127.0.0.1 localhost\n0.0.0.0 globaldp-prod-cn01.bhsr.com # someone else\n"
+        try original.write(to: hosts, atomically: true, encoding: .utf8)
+        let script = GameLaunchPreparation.networkWindowScript(hostsPath: hosts.path, token: "TEST", duration: 0.3)
+        let manager = ProcessManager()
+        _ = try await manager.launchAndWait(executablePath: "/bin/sh", arguments: ["-c", script], timeout: 5)
+        XCTAssertTrue(try String(contentsOf: hosts, encoding: .utf8).contains("MiPlay-HSR-TEST"))
+        try await Task.sleep(for: .milliseconds(700))
+        let restored = try String(contentsOf: hosts, encoding: .utf8)
+        XCTAssertFalse(restored.contains("MiPlay-HSR-TEST"))
+        XCTAssertTrue(restored.contains(original))
+    }
+
+    func testStarRailAuthorizationScriptCompilesWithoutExecutingIt() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("authorize.applescript")
+        try GameLaunchPreparation.networkAuthorizationScript(token: UUID().uuidString).write(to: source, atomically: true, encoding: .utf8)
+        _ = try await ProcessManager().launchAndWait(executablePath: "/usr/bin/osacompile", arguments: ["-o", root.appendingPathComponent("compiled.scpt").path, source.path], timeout: 10)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("compiled.scpt").path))
+    }
+
+    func testStarRailVendorRegistryPreparationUsesManagedPrefixAndPropagatesFailure() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let binary = root.appendingPathComponent("fake-wine")
+        let script = #"""
+        #!/bin/sh
+        printf '%s\n' "$@" >> "$WINEPREFIX/registry-calls"
+        [ ! -f "$WINEPREFIX/fail" ]
+        """#
+        try script.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        let manager = ProcessManager()
+        try await GameLaunchPreparation.prepareStarRailVendorRegistry(wineBinary: binary.path, prefix: root.path, processManager: manager)
+        let calls = try String(contentsOf: root.appendingPathComponent("registry-calls"), encoding: .utf8)
+        XCTAssertTrue(calls.contains("NGXCore"))
+        XCTAssertTrue(calls.contains("C:\\Windows\\System32"))
+        XCTAssertEqual(calls.components(separatedBy: "REG_BINARY").count - 1, 2)
+        try Data().write(to: root.appendingPathComponent("fail"))
+        do {
+            try await GameLaunchPreparation.prepareStarRailVendorRegistry(wineBinary: binary.path, prefix: root.path, processManager: manager)
+            XCTFail("Registry preparation failures must block launch")
+        } catch ProcessManager.ProcessError.exitWithError(let code, _, _) {
+            XCTAssertEqual(code, 1)
+        }
+    }
+
+    func testGameLauncherWaitsForWineChildrenAndPreservesLauncherFailure() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = try XCTUnwrap(Bundle.main.resourceURL?.appendingPathComponent("GameLauncher"))
+        let wine = root.appendingPathComponent("wine")
+        let server = root.appendingPathComponent("wineserver")
+        let marker = root.appendingPathComponent("waited")
+        let status = root.appendingPathComponent("status")
+        try "#!/bin/sh\nexit 0\n".write(to: wine, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nsleep 0.3\nprintf '%s' \"$1\" > \(GameLaunchPreparation.shellQuote(marker.path))\n".write(to: server, atomically: true, encoding: .utf8)
+        for file in [wine, server] { try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path) }
+        let process = ProcessManager()
+        _ = try await process.launchAndWait(executablePath: helper.path, arguments: [wine.path, "fake-game"], environment: ["MIPLAY_WAIT_WINESERVER": server.path, "MIPLAY_LAUNCH_STATUS": status.path], timeout: 5)
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "-w")
+        XCTAssertEqual(try String(contentsOf: status, encoding: .utf8), "exit:0\n")
+        try FileManager.default.removeItem(at: marker)
+        try "#!/bin/sh\nexit 7\n".write(to: wine, atomically: true, encoding: .utf8)
+        do {
+            _ = try await process.launchAndWait(executablePath: helper.path, arguments: [wine.path, "fake-game"], environment: ["MIPLAY_WAIT_WINESERVER": server.path, "MIPLAY_LAUNCH_STATUS": status.path], timeout: 5)
+            XCTFail("Launcher failure must propagate")
+        } catch ProcessManager.ProcessError.exitWithError(let code, _, _) { XCTAssertEqual(code, 7) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(try String(contentsOf: status, encoding: .utf8), "exit:7\n")
+    }
+
     // MARK: - 搁置的 MetalFX 选项
 
     func testSuspendedMetalFXOptionNeverReachesLaunchEnvironment() async throws {
@@ -119,6 +241,59 @@ import XCTest
 
     // MARK: - 游戏运行设置（通用设置页）
 
+    func testDLSSSettingsMigrationAndFailClosedEnvironment() throws {
+        let legacy = Data(#"{"metalHUD":true,"fpsUnlock":false,"retinaMode":false,"leftCommandIsCtrl":true}"#.utf8)
+        let settings = try JSONDecoder().decode(GameEnvironmentSettings.self, from: legacy)
+        XCTAssertFalse(settings.dlssCompatibility)
+        XCTAssertTrue(settings.metalHUD)
+        XCTAssertFalse(settings.retinaMode)
+        XCTAssertTrue(settings.leftCommandIsCtrl)
+        XCTAssertEqual(settings.vendorExtensionEnvironment(assetsReady: true)["DXMT_ENABLE_NVEXT"], "0")
+
+        let enabled = GameEnvironmentSettings(dlssCompatibility: true)
+        XCTAssertEqual(enabled.vendorExtensionEnvironment(assetsReady: false)["DXMT_ENABLE_NVEXT"], "0")
+        XCTAssertEqual(
+            enabled.vendorExtensionEnvironment(assetsReady: true)["DXMT_ENABLE_NVEXT"],
+            GameEnvironmentSettings.supportsDLSSCompatibility ? "1" : "0"
+        )
+        XCTAssertEqual(try JSONDecoder().decode(GameEnvironmentSettings.self, from: JSONEncoder().encode(enabled)), enabled)
+    }
+
+    func testVendorExtensionsReplaceStaleCopiesOnlyWhenRequested() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let assets = root.appendingPathComponent("assets")
+        let runtime = root.appendingPathComponent("runtime")
+        let prefix = root.appendingPathComponent("prefix")
+        let game = root.appendingPathComponent("game")
+        let windows = runtime.appendingPathComponent("lib/wine/x86_64-windows")
+        let system32 = prefix.appendingPathComponent("drive_c/windows/system32")
+        for directory in [assets.appendingPathComponent("dxmt"), windows, runtime.appendingPathComponent("lib/wine/x86_64-unix"), system32, game] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        for name in ["d3d10core.dll", "d3d11.dll", "dxgi.dll", "winemetal.dll", "winemetal.so", "nvapi64.dll", "nvngx.dll"] {
+            try Data("bundled-\(name)".utf8).write(to: assets.appendingPathComponent("dxmt/\(name)"))
+        }
+        for name in ["nvapi64.dll", "nvngx.dll"] {
+            try Data("original-runtime".utf8).write(to: windows.appendingPathComponent(name))
+            try Data("stale-prefix".utf8).write(to: system32.appendingPathComponent(name))
+        }
+        let disabled = LaunchCompatibilityEnvironment.stage(gameType: .honkaiStarRail, gameDirectory: game, prefixURL: prefix, runtimeRootURL: runtime, assetRootURL: assets)
+        XCTAssertFalse(disabled.vendorExtensionsReady)
+        XCTAssertEqual(try Data(contentsOf: system32.appendingPathComponent("nvngx.dll")), Data("stale-prefix".utf8))
+        let enabled = LaunchCompatibilityEnvironment.stage(gameType: .honkaiStarRail, gameDirectory: game, prefixURL: prefix, runtimeRootURL: runtime, assetRootURL: assets, enableVendorExtensions: true)
+        XCTAssertTrue(enabled.vendorExtensionsReady)
+        for name in ["nvapi64.dll", "nvngx.dll"] {
+            XCTAssertEqual(try Data(contentsOf: windows.appendingPathComponent(name)), Data("bundled-\(name)".utf8))
+            XCTAssertEqual(try Data(contentsOf: system32.appendingPathComponent(name)), Data("bundled-\(name)".utf8))
+            XCTAssertEqual(try Data(contentsOf: windows.appendingPathComponent(name + ".bak")), Data("original-runtime".utf8))
+        }
+        try FileManager.default.removeItem(at: assets.appendingPathComponent("dxmt/nvngx.dll"))
+        let missing = LaunchCompatibilityEnvironment.stage(gameType: .honkaiStarRail, gameDirectory: game, prefixURL: prefix, runtimeRootURL: runtime, assetRootURL: assets, enableVendorExtensions: true)
+        XCTAssertFalse(missing.vendorExtensionsReady)
+        XCTAssertTrue(missing.missingAssetNames.contains("nvngx.dll"))
+    }
+
     func testGameEnvironmentSettingsRegistryAndEnvironmentValues() {
         XCTAssertEqual(
             GameEnvironmentSettings(retinaMode: true, leftCommandIsCtrl: false).registryValues,
@@ -222,14 +397,17 @@ import XCTest
             ["-platform_type", "CLOUD_THIRD_PARTY_PC", "-is_cloud", "1"]
         )
 
-        // 其它游戏不带附加参数、不经存根。
+        // 绝区零共用 Steam 兼容入口；崩铁保持独立的 Jadeite 路径。
         let zzz = LaunchCompatibilityEnvironment.launchInvocation(
             gameType: .zenlessZoneZero,
             executablePath: "/tmp/game/ZenlessZoneZero.exe",
             prefixURL: prefixURL
         )
-        XCTAssertEqual(zzz.program, "/tmp/game/ZenlessZoneZero.exe")
-        XCTAssertTrue(zzz.arguments.isEmpty)
+        XCTAssertEqual(zzz.program, "C:\\windows\\system32\\steam.exe")
+        XCTAssertEqual(zzz.arguments, ["Z:\\tmp\\game\\ZenlessZoneZero.exe"])
+        let hsr = LaunchCompatibilityEnvironment.launchInvocation(gameType: .honkaiStarRail, executablePath: "/tmp/Star Rail/StarRail.exe", prefixURL: prefixURL)
+        XCTAssertTrue(hsr.program.hasSuffix("\\MiPlay\\Jadeite\\jadeite.exe"))
+        XCTAssertEqual(hsr.arguments, ["Z:\\tmp\\Star Rail\\StarRail.exe"])
     }
 
     // MARK: - staging 跳过未变化拷贝
@@ -269,6 +447,12 @@ import XCTest
             )
         }
         try Data("driver".utf8).write(to: gameDirectory.appendingPathComponent("HoYoKProtect.sys"))
+
+        try fileManager.createDirectory(at: prefixURL.appendingPathComponent("drive_c/windows/syswow64"), withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: assetRootURL.appendingPathComponent("protonextras"), withIntermediateDirectories: true)
+        for name in ["steam64.exe", "steam32.exe", "lsteamclient64.dll", "lsteamclient32.dll"] {
+            try Data(name.utf8).write(to: assetRootURL.appendingPathComponent("protonextras/\(name)"))
+        }
 
         let first = LaunchCompatibilityEnvironment.stage(
             gameType: .zenlessZoneZero,
@@ -429,6 +613,87 @@ import XCTest
         XCTAssertEqual(viewModel.startupPhase, .ready)
         XCTAssertFalse(viewModel.isStartupPreparationVisible)
         XCTAssertNil(viewModel.startupDetail)
+    }
+
+    func testStartupMediaFinishesWhileWineIsStillPreparingAndWineFailureKeepsOverlay() async throws {
+        let fixture = try await makeScheduler(
+            networkProvider: makeWineNetwork(metadataDelay: 3, catalogStatus: 403)
+        )
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let image = directory.appendingPathComponent("background.png")
+        try Data("local background".utf8).write(to: image)
+        try await fixture.persistence.updateAppData { data in
+            for game in GameType.allCases {
+                data.backgroundModes[game.rawValue] = BackgroundMediaService.BackgroundMode.custom.rawValue
+                data.customImagePaths[game.rawValue] = image.path
+            }
+        }
+        let viewModel = LibraryViewModel(
+            gameRegistry: fixture.registry,
+            launchOrchestrator: fixture.launchOrchestrator,
+            backgroundMediaService: fixture.backgroundMediaService,
+            persistenceStore: fixture.persistence,
+            taskScheduler: fixture.scheduler,
+            logWriter: fixture.logger,
+            wineVersionManager: fixture.wineManager
+        )
+        let initialization = Task { await viewModel.initialize() }
+        let deadline = ContinuousClock.now + .seconds(5)
+        var overlapped = false
+        while ContinuousClock.now < deadline {
+            let tasks = await fixture.scheduler.allTaskSnapshots()
+            let mediaFinished = tasks.filter { $0.type == .backgroundMediaLoad && $0.state == .completed }.count == GameType.allCases.count
+            let wineRunning = tasks.contains { $0.type == .wineRuntimeSetup && $0.state == .running }
+            if mediaFinished && wineRunning {
+                overlapped = true
+                break
+            }
+            if viewModel.isInitialized { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertTrue(overlapped, "素材应在 Wine 尚未完成时准备完毕")
+        XCTAssertEqual(viewModel.startupPhase, .preparingWine)
+        XCTAssertTrue(viewModel.isStartupPreparationVisible)
+        await initialization.value
+        XCTAssertNotNil(viewModel.startupFailure)
+        XCTAssertTrue(viewModel.isStartupPreparationVisible, "素材已完成也不能放行失败的 Wine 环境")
+    }
+
+    func testStartupWaitsForRemainingMediaWhenWineFinishesFirst() async throws {
+        MockURLProtocol.configure { _ in
+            .init(data: Data(), statusCode: 404, delay: 0.5)
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockURLProtocol.self]
+        let fixture = try await makeScheduler(
+            networkProvider: NetworkDownloadProvider(session: URLSession(configuration: configuration))
+        )
+        let viewModel = LibraryViewModel(
+            gameRegistry: fixture.registry,
+            launchOrchestrator: fixture.launchOrchestrator,
+            backgroundMediaService: fixture.backgroundMediaService,
+            persistenceStore: fixture.persistence,
+            taskScheduler: fixture.scheduler,
+            logWriter: fixture.logger
+        )
+        // 无 Wine 依赖模拟 Wine 即时就绪；素材请求仍在网络等待中。
+        let initialization = Task { await viewModel.initialize() }
+        let deadline = ContinuousClock.now + .seconds(3)
+        while viewModel.startupPhase == .preparingWine, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(viewModel.startupPhase, .preparingMedia)
+        XCTAssertTrue(viewModel.isStartupPreparationVisible)
+        let running = await fixture.scheduler.allTaskSnapshots()
+        XCTAssertTrue(running.contains { $0.type == .backgroundMediaLoad && $0.state == .running })
+        await initialization.value
+        XCTAssertEqual(viewModel.startupPhase, .ready)
+        XCTAssertFalse(viewModel.isStartupPreparationVisible)
+        let finished = await fixture.scheduler.allTaskSnapshots()
+        XCTAssertFalse(finished.contains {
+            $0.type == .backgroundMediaLoad && ($0.state == .pending || $0.state == .running)
+        })
     }
 
     func testGameEnvironmentTogglesApplySynchronouslyAndPersist() async throws {

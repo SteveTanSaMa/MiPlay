@@ -72,6 +72,25 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Steam/Jadeite may finish before the game child. Match YAAGL's
+       wineserver -w boundary before publishing an exit and releasing prefix. */
+    const char *server = getenv("MIPLAY_WAIT_WINESERVER");
+    if (server && *server && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        pid_t waiter = fork();
+        if (waiter == 0) {
+            execl(server, server, "-w", (char *)NULL);
+            perror("GameLauncher: wineserver -w");
+            _exit(127);
+        }
+        if (waiter < 0) {
+            status = 70 << 8;
+        } else {
+            while (waitpid(waiter, &status, 0) < 0) {
+                if (errno != EINTR) { status = 70 << 8; break; }
+            }
+        }
+    }
+
     if (statusPath && *statusPath) {
         int fd = open(statusPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {

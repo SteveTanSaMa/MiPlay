@@ -1,0 +1,13 @@
+# Pinned renderer initialization fix
+
+MiPlay ships `654f547+miplay-fb45156`: upstream base `654f547` plus the unchanged upstream patch [fb451568](https://github.com/3Shain/dxmt/commit/fb4515681daefb789a4d0f403c4bdbca88f3b3de). `version.h.in` adds the local suffix; no unrelated renderer behavior is changed. This is a locally rebuilt patched version, **not official DXMT 0.80**.
+
+`ArgumentEncodingContext::device_` must be declared before helpers whose constructors call `getComputePipeline()`. An initializer-list reorder alone is insufficient in C++. The patch changes both declaration and initializer order.
+
+Build on macOS with the upstream toolchain requirements: LLVM 15.0.7 **x86_64 static libraries**, LLVM-MinGW, a Wine development SDK, Meson/Ninja and Xcode Metal tools. `build_patched.py --help` lists explicit path arguments; pass fresh work/output directories. It builds all seven renderer/bridge/vendor files together, checks Mach-O dependencies and writes a SHA-256 manifest. It never installs into Wine or modifies the source repository. Toolchains used for the verified build: LLVM-MinGW 20260908 and upstream Wine SDK v8.16-3shain; runtime remains Wine CrossOver 11.0-1.
+
+The application bundles `RuntimeAssets/dxmt`. Existing production staging replaces the runtime D3D/Metal files on every launch, and prefix winemetal.dll. D3D prefix copies intentionally remain the pristine Wine builtin stubs. NVAPI/NGX staging remains opt-in. The startup control is not an official runtime version upgrade.
+
+`device_repro.c` is an opt-in diagnostic, not a game acceptance test. Build it with x86_64 LLVM-MinGW and `-ld3d11`, then run **only in an isolated Wine runtime/prefix** with the candidate DLLs. The heap block size `0x10410` is the `CommandQueue` size from this exact build's DWARF. All heap writes precede free; it makes later uninitialized reads reproducible by reusing nonzero heap contents. Recheck the size before adapting it to another source revision. The unpatched build reproduces the same invalid Objective-C receiver; the patched build completes 40 device create/release cycles. No injection is required for the regression.
+
+Keep original application assets before deployment. A rollback must restore the complete asset directory and rebuild MiPlay; do not overwrite an active Wine runtime. Source patches, compiler logs, full debug symbols, original assets and runtime evidence for the 2026-10-10 investigation remain in ignored `QAArtifacts/ZZZ-Repair-20261010`. See the investigation report for actual game acceptance status. None of the diagnostic injectors are bundled with the application.

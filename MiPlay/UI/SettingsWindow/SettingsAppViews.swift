@@ -53,6 +53,22 @@ struct GeneralSettingsView: View {
                 .accessibilityHint("适用于原神和崩坏：星穹铁道。")
 
                 Toggle(isOn: Binding(
+                    get: { settingsViewModel.gameEnvironmentSettings.dlssCompatibility },
+                    set: { settingsViewModel.applyDLSSCompatibility($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("DLSS 兼容（实验性）")
+                        Text("支持的 DirectX 11 游戏可使用 MetalFX 时间缩放。开启后，在游戏内选择 DLSS 质量档位；不支持帧生成。可能影响兼容性，建议仅在需要时开启。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .disabled(!GameEnvironmentSettings.supportsDLSSCompatibility)
+                .accessibilityHint("需要 Apple Silicon 和游戏原生 DLSS 支持。下次启动生效。")
+
+                Toggle(isOn: Binding(
                     get: { settingsViewModel.gameEnvironmentSettings.retinaMode },
                     set: { settingsViewModel.applyRetinaMode($0) }
                 )) {

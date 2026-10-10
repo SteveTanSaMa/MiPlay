@@ -223,6 +223,10 @@ public final class SettingsViewModel {
         updateGameEnvironmentSettings { $0.fpsUnlock = isEnabled }
     }
 
+    public func applyDLSSCompatibility(_ isEnabled: Bool) {
+        updateGameEnvironmentSettings { $0.dlssCompatibility = isEnabled }
+    }
+
     /// 切换 Retina 模式（`RetinaMode`：y = 按设备像素渲染）。
     public func applyRetinaMode(_ isEnabled: Bool) {
         updateGameEnvironmentSettings { $0.retinaMode = isEnabled }

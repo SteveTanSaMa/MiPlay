@@ -273,16 +273,32 @@ import XCTest
         try FileManager.default.createDirectory(at: binaryDirectory, withIntermediateDirectories: true)
         let binary = binaryDirectory.appendingPathComponent("wine")
         if !FileManager.default.fileExists(atPath: binary.path) {
-            try FileManager.default.createSymbolicLink(
-                at: binary,
-                withDestinationURL: URL(fileURLWithPath: "/bin/sh")
-            )
+            // Simulate the Wine argument boundary, including the shared Steam route.
+            // Game fixtures are shell scripts; bundled PE binaries are never executed.
+            let script = #"""
+            #!/bin/sh
+            case "$1" in
+              'C:\windows\system32\steam.exe')
+                shift
+                target="${1#Z:}"
+                shift
+                target=$(printf '%s' "$target" | /usr/bin/tr '\\' '/')
+                exec /bin/sh "$target" "$@"
+                ;;
+              *) exec /bin/sh "$@" ;;
+            esac
+            """#
+            try Data(script.utf8).write(to: binary)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
         }
 
         let prefixURL = appSupport
             .appendingPathComponent("WinePrefixes", isDirectory: true)
             .appendingPathComponent("shared", isDirectory: true)
         if createPrefix {
+            for name in ["system32", "syswow64"] {
+                try FileManager.default.createDirectory(at: prefixURL.appendingPathComponent("drive_c/windows/\(name)"), withIntermediateDirectories: true)
+            }
             try FileManager.default.createDirectory(
                 at: prefixURL.appendingPathComponent("drive_c", isDirectory: true),
                 withIntermediateDirectories: true

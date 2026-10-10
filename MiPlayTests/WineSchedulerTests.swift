@@ -242,11 +242,19 @@ import XCTest
     }
 
     func testLaunchOrchestratorRefreshesStaleBookmarkAndCommitsExitState() async throws {
+        try await exerciseLaunchExit(cancelAndRelaunch: false)
+    }
+
+    func testCancellationWaitsForExitCommitAndAllowsConsecutiveRelaunch() async throws {
+        try await exerciseLaunchExit(cancelAndRelaunch: true)
+    }
+
+    private func exerciseLaunchExit(cancelAndRelaunch: Bool) async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let executable = directory.appendingPathComponent("YuanShen.exe")
         try Data(
-            "printf '%s' \"$0\" > \"$WINEPREFIX/launch-arg\"\nsleep 0.2\nexit 0\n".utf8
+            "printf '%s' \"$0\" > \"$WINEPREFIX/launch-arg\"\nsleep \(cancelAndRelaunch ? "30" : "0.2")\nexit 0\n".utf8
         ).write(to: executable)
         try Data("[General]\ngame_version=1.2.3\nchannel=1\nsub_channel=0\ncps=test\n".utf8)
             .write(to: directory.appendingPathComponent("config.ini"))
@@ -353,6 +361,16 @@ import XCTest
         let result = await launch.launch(game: game)
         guard case .success = result else {
             return XCTFail("Expected Wine binary launch, got \(result)")
+        }
+        if cancelAndRelaunch {
+            async let firstStop: Void = launch.cancelLaunch()
+            async let duplicateStop: Void = launch.cancelLaunch()
+            _ = await (firstStop, duplicateStop)
+            let second = await launch.launch(game: game)
+            guard case .success = second else { return XCTFail("Relaunch after cancellation failed: \(second)") }
+            await launch.cancelLaunch()
+            let data = try await store.readAppData()
+            XCTAssertFalse(data.recoveryRecords.contains { $0.kind == "processExit" && $0.resolvedAt == nil })
         }
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
@@ -892,7 +910,8 @@ import XCTest
             fileManager: fileManager
         )
 
-        XCTAssertEqual(staging.missingAssetNames.count, 5)
+        XCTAssertEqual(staging.missingAssetNames.count, 9)
+        XCTAssertEqual(LaunchCompatibilityEnvironment.missingRequiredLaunchAssets(for: .zenlessZoneZero, staging: staging).count, 4)
         XCTAssertEqual(staging.stagedGameFiles.count, 1)
         XCTAssertTrue(fileManager.fileExists(atPath: vulkanURL.path + ".bak"))
 
@@ -913,4 +932,267 @@ import XCTest
         XCTAssertTrue(fileManager.fileExists(atPath: vulkanURL.path))
     }
 
+}
+
+// Opt-in real-game acceptance. Never runs as part of ordinary unit tests.
+@MainActor extension MiPlayCoreTests {
+    func testZZZFreshRuntimeAcceptance() async throws {
+        guard let requestedRoot = ProcessInfo.processInfo.environment["MIPLAY_ZZZ_ACCEPTANCE_ROOT"] else {
+            throw XCTSkip("Set TEST_RUNNER_MIPLAY_ZZZ_ACCEPTANCE_ROOT for explicit real-game testing")
+        }
+        let root = URL(fileURLWithPath: requestedRoot, isDirectory: true)
+        let support = root.appendingPathComponent("FreshSupport", isDirectory: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: support.path), "Must start with an empty runtime/prefix")
+        let fs = GameFileSystemRepository(appSupportDirectory: support)
+        let logs = LogWriter(fileSystemRepository: fs)
+        let store = PersistenceStore(baseURL: support, logWriter: logs)
+        let process = ProcessManager(logWriter: logs)
+        let network = NetworkDownloadProvider()
+        let provider = WineRuntimeProvider(processManager: process, fileSystemRepository: fs, logWriter: logs, persistenceStore: store)
+        let downloader = WineVersionDownloader(networkProvider: network, fileSystemRepository: fs, processManager: process, logWriter: logs)
+        let manager = WineVersionManager(networkProvider: network, fileSystemRepository: fs, persistenceStore: store, wineVersionDownloader: downloader, logWriter: logs, wineRuntimeProvider: provider)
+        await manager.initialize()
+        var complete = false
+        let transferredArchive = root.appendingPathComponent("Downloads/wine.tar.xz")
+        if FileManager.default.fileExists(atPath: root.appendingPathComponent("Downloads/transfer-complete.json").path) {
+            // An explicitly recorded external transfer can bypass TLS failures;
+            // extraction/tree validation and prefix preparation still use production code.
+            let stagingRoot = support.appendingPathComponent("WineVersions/.staging")
+            let staging = try WineVersionDownloader.ManagedStaging(rootURL: stagingRoot, directoryURL: stagingRoot.appendingPathComponent("fresh"))
+            try FileManager.default.createDirectory(at: staging.directoryURL, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: transferredArchive, to: staging.archiveURL)
+            _ = try await downloader.extractArchive(archive: staging.archiveURL, staging: staging, wineTag: WineVersionManager.fixedRuntimeTag)
+            if FileManager.default.fileExists(atPath: staging.archiveURL.path) {
+                try FileManager.default.removeItem(at: staging.archiveURL)
+            }
+            let final = support.appendingPathComponent("WineVersions/\(WineVersionManager.fixedRuntimeTag)")
+            try FileManager.default.moveItem(at: staging.directoryURL, to: final)
+            complete = try await manager.setupExistingManagedRuntimeIfPresent()
+            print("ZZZ_ACCEPTANCE external fresh transfer + production extraction/validation/setup")
+        } else {
+            let versions = try await manager.fetchAvailableVersions()
+            let version = try XCTUnwrap(versions.first)
+            print("ZZZ_ACCEPTANCE downloading \(version.assetName)")
+            for await phase in await manager.downloadAndInstall(version: version) {
+                switch phase {
+                case .completed: complete = true
+                case .failed(let reason), .recoveryRequired(let reason): XCTFail(reason); return
+                case .failedWithFailure(let error): XCTFail(error.localizedDescription); return
+                default: break
+                }
+            }
+        }
+        XCTAssertTrue(complete)
+        guard complete, let runtime = await manager.validatedRuntime() else { return }
+        if ProcessInfo.processInfo.environment["MIPLAY_ZZZ_DIAGNOSTICS"] == "1" {
+            try await runIsolatedZZZDiagnostics(root: root, runtime: runtime, manager: manager, provider: provider, process: process)
+            return
+        }
+        let game = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support/CrossOver/Bottles/Mihoyo/drive_c/Program Files/miHoYo Launcher/games/ZenlessZoneZero Game", isDirectory: true)
+        let executable = try XCTUnwrap(GameType.zenlessZoneZero.firstExistingExecutable(at: game.path))
+        let launcher = ApplicationLauncher()
+        let bundle = try XCTUnwrap(LaunchCompatibilityEnvironment.prepareAppBundle(gameType: .zenlessZoneZero, assetRootURL: support.appendingPathComponent("RuntimeAssets")))
+        for iteration in 1...5 {
+            let lease = try await manager.acquireSharedPrefixLease()
+            let prefix = try await provider.prepareSharedPrefix(runtime: runtime, lease: lease)
+            let staging = LaunchCompatibilityEnvironment.stage(gameType: .zenlessZoneZero, gameDirectory: game, prefixURL: prefix.url, runtimeRootURL: runtime.rootURL)
+            try await GameLaunchPreparation.fixWebview(gameType: .zenlessZoneZero, wineBinary: runtime.binaryURL.path, prefix: prefix.url.path, processManager: process)
+            let invocation = LaunchCompatibilityEnvironment.launchInvocation(gameType: .zenlessZoneZero, executablePath: executable, prefixURL: prefix.url)
+            var overrides = LaunchCompatibilityEnvironment.additionalEnvironment(for: .zenlessZoneZero)
+            overrides.merge(["WINEPREFIX": prefix.url.path, "WINEDLLOVERRIDES": "winemenubuilder.exe=d", "MTL_HUD_ENABLED": "1", "DXMT_ENABLE_NVEXT": "0", "MIPLAY_LAUNCH_LOG": bundle.logURL.path, "MIPLAY_LAUNCH_STATUS": bundle.statusURL.path, "MIPLAY_LAUNCH_CWD": game.path]) { _, new in new }
+            let start = ContinuousClock.now
+            overrides["MIPLAY_WAIT_WINESERVER"] = runtime.rootURL.appendingPathComponent("bin/wineserver").path
+            let pid = try await launcher.launch(bundleURL: bundle.bundleURL, arguments: [runtime.binaryURL.path, invocation.program] + invocation.arguments, environment: ProcessManager.childEnvironment(overrides: overrides), logURL: bundle.logURL, statusURL: bundle.statusURL)
+            print("ZZZ_ACCEPTANCE launch \(iteration) pid=\(pid)")
+            var passed = true
+            for seconds in [40, 140] {
+                while ContinuousClock.now < start.advanced(by: .seconds(seconds)) {
+                    try await Task.sleep(for: .seconds(1))
+                }
+                let alive = launcher.isRunning(pid: pid)
+                let image = root.appendingPathComponent("run-\(iteration)-t\(seconds).png")
+                // Full desktop evidence is visually checked; a desktop-only shot never counts as game success.
+                // A separately authorized terminal observer captures with screencapture:
+                // screen-recording permission belongs to the responsible process.
+                // Images must still be visually checked before this counts as success.
+                let request = root.appendingPathComponent("run-\(iteration)-t\(seconds).request.json")
+                let response = root.appendingPathComponent("run-\(iteration)-t\(seconds).capture.json")
+                try JSONSerialization.data(withJSONObject: ["iteration": iteration, "seconds": seconds, "pid": Int(pid), "alive": alive, "requestedAt": Date().timeIntervalSince1970]).write(to: request, options: .atomic)
+                let captureDeadline = ContinuousClock.now.advanced(by: .seconds(10))
+                while alive && !FileManager.default.fileExists(atPath: response.path) && ContinuousClock.now < captureDeadline {
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                let captured = FileManager.default.fileExists(atPath: image.path)
+                print("ZZZ_ACCEPTANCE screenshot \(iteration) t=\(seconds) alive=\(alive) captured=\(captured)")
+                passed = passed && alive && captured
+                if !alive { break }
+            }
+            let evidenceLog = root.appendingPathComponent("run-\(iteration).log")
+            if FileManager.default.fileExists(atPath: bundle.logURL.path) {
+                try FileManager.default.copyItem(at: bundle.logURL, to: evidenceLog)
+            }
+            if launcher.isRunning(pid: pid) { try await launcher.terminate(pid: pid, force: false) }
+            try await provider.shutdownSharedPrefix(runtime: runtime, lease: lease)
+            try await provider.releaseSharedPrefixLease(lease)
+            LaunchCompatibilityEnvironment.restore(staging.stagedGameFiles)
+            XCTAssertTrue(passed, "Consecutive series failed at launch \(iteration); stop without selecting retries")
+            if !passed { return }
+        }
+    }
+}
+
+@MainActor extension MiPlayCoreTests {
+    private func runIsolatedZZZDiagnostics(root: URL, runtime: ManagedWineRuntime, manager: WineVersionManager, provider: WineRuntimeProvider, process: ProcessManager) async throws {
+        let fm = FileManager.default
+        let originals = root.appendingPathComponent("OriginalNV")
+        try fm.createDirectory(at: originals, withIntermediateDirectories: true)
+        for name in ["nvapi64.dll", "nvngx.dll"] {
+            try fm.copyItem(at: runtime.rootURL.appendingPathComponent("lib/wine/x86_64-windows/\(name)"), to: originals.appendingPathComponent(name))
+        }
+        let game = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support/CrossOver/Bottles/Mihoyo/drive_c/Program Files/miHoYo Launcher/games/ZenlessZoneZero Game")
+        let executable = try XCTUnwrap(GameType.zenlessZoneZero.firstExistingExecutable(at: game.path))
+        let appLauncher = ApplicationLauncher()
+        let bundle = try XCTUnwrap(LaunchCompatibilityEnvironment.prepareAppBundle(gameType: .zenlessZoneZero, assetRootURL: root.appendingPathComponent("FreshSupport/RuntimeAssets")))
+        let baseline = root.appendingPathComponent("BaselinePrefix")
+        // NVEXT stays off. Only DLL pair and launch parent vary; each case gets
+        // the same cold prefix snapshot. System/game caches remain shared.
+        let cases = [("original-nv-launchservices", false, true), ("original-nv-direct-helper", false, false), ("dxmt-nv-launchservices", true, true)]
+        for (offset, configuration) in cases.enumerated() {
+            let iteration = offset + 1
+            let (name, extensionFiles, launchServices) = configuration
+            let lease = try await manager.acquireSharedPrefixLease()
+            let prefix = try await provider.prepareSharedPrefix(runtime: runtime, lease: lease)
+            try await provider.shutdownSharedPrefix(runtime: runtime, lease: lease)
+            if fm.fileExists(atPath: baseline.path) {
+                try fm.removeItem(at: prefix.url)
+                try fm.copyItem(at: baseline, to: prefix.url)
+            } else {
+                try fm.copyItem(at: prefix.url, to: baseline)
+            }
+            let staging = LaunchCompatibilityEnvironment.stage(gameType: .zenlessZoneZero, gameDirectory: game, prefixURL: prefix.url, runtimeRootURL: runtime.rootURL, enableVendorExtensions: extensionFiles)
+            defer { LaunchCompatibilityEnvironment.restore(staging.stagedGameFiles) }
+            if !extensionFiles {
+                for dll in ["nvapi64.dll", "nvngx.dll"] {
+                    for destination in [runtime.rootURL.appendingPathComponent("lib/wine/x86_64-windows/\(dll)"), prefix.url.appendingPathComponent("drive_c/windows/system32/\(dll)")] {
+                        try fm.removeItem(at: destination)
+                        try fm.copyItem(at: originals.appendingPathComponent(dll), to: destination)
+                    }
+                }
+            }
+            try await GameLaunchPreparation.fixWebview(gameType: .zenlessZoneZero, wineBinary: runtime.binaryURL.path, prefix: prefix.url.path, processManager: process)
+            let invocation = LaunchCompatibilityEnvironment.launchInvocation(gameType: .zenlessZoneZero, executablePath: executable, prefixURL: prefix.url)
+            let arguments = [runtime.binaryURL.path, invocation.program] + invocation.arguments
+            var environment = LaunchCompatibilityEnvironment.additionalEnvironment(for: .zenlessZoneZero)
+            environment.merge(["WINEPREFIX": prefix.url.path, "WINEDLLOVERRIDES": "", "WINEDEBUG": "fixme-all,err-unwind,+timestamp", "MTL_HUD_ENABLED": "1", "DXMT_ENABLE_NVEXT": "0", "DXMT_LOG_PATH": root.path, "DXMT_CONFIG_FILE": root.appendingPathComponent("absent-dxmt.conf").path, "MIPLAY_WAIT_WINESERVER": runtime.rootURL.appendingPathComponent("bin/wineserver").path, "MIPLAY_LAUNCH_LOG": bundle.logURL.path, "MIPLAY_LAUNCH_STATUS": bundle.statusURL.path, "MIPLAY_LAUNCH_CWD": game.path]) { _, new in new }
+            let fullEnvironment = ProcessManager.childEnvironment(overrides: environment)
+            // Exclude secrets from parent environment; record every Wine/DXMT/Metal
+            // variable and the exact executable/argument boundary sent to launch.
+            let recordedEnvironment = fullEnvironment.filter { key, _ in ["PATH", "HOME", "TMPDIR"].contains(key) || ["WINE", "DXMT", "MTL_", "METAL_", "MIPLAY_", "GST_", "DYLD_"].contains(where: key.hasPrefix) }
+            var evidence: [String: Any] = ["case": name, "iteration": iteration, "argv": arguments, "environment": recordedEnvironment, "cwd": game.path, "launchServices": launchServices, "debugger": false]
+            let start = ContinuousClock.now
+            var managedID: UUID?
+            let pid: Int32
+            if launchServices {
+                pid = try await appLauncher.launch(bundleURL: bundle.bundleURL, arguments: arguments, environment: fullEnvironment, logURL: bundle.logURL, statusURL: bundle.statusURL)
+            } else {
+                try? fm.removeItem(at: bundle.logURL)
+                try? fm.removeItem(at: bundle.statusURL)
+                let helper = try XCTUnwrap(Bundle.main.url(forResource: "GameLauncher", withExtension: nil))
+                let id = try await process.launch(executablePath: helper.path, arguments: arguments, environment: fullEnvironment, workingDirectory: game.path)
+                managedID = id
+                guard case .running(let processPID) = await process.status(processID: id) else { throw LaunchOrchestrator.LaunchError.processLaunchFailed("Diagnostic helper not running") }
+                pid = processPID
+            }
+            evidence["pid"] = Int(pid)
+            evidence["startedAt"] = Date().timeIntervalSince1970
+            try JSONSerialization.data(withJSONObject: evidence, options: [.prettyPrinted, .sortedKeys]).write(to: root.appendingPathComponent("run-\(iteration)-launch.json"), options: .atomic)
+            print("ZZZ_DIAGNOSTIC \(name) pid=\(pid)")
+            for seconds in [40, 140] {
+                while ContinuousClock.now < start.advanced(by: .seconds(seconds)) { try await Task.sleep(for: .milliseconds(200)) }
+                let alive: Bool
+                if let id = managedID { alive = await process.isRunning(processID: id) } else { alive = appLauncher.isRunning(pid: pid) }
+                try JSONSerialization.data(withJSONObject: ["iteration": iteration, "seconds": seconds, "pid": Int(pid), "alive": alive, "requestedAt": Date().timeIntervalSince1970]).write(to: root.appendingPathComponent("run-\(iteration)-t\(seconds).request.json"), options: .atomic)
+                try await Task.sleep(for: .seconds(1))
+                print("ZZZ_DIAGNOSTIC \(name) t=\(seconds) alive=\(alive)")
+                if !alive { break }
+            }
+            if fm.fileExists(atPath: bundle.logURL.path) { try fm.copyItem(at: bundle.logURL, to: root.appendingPathComponent("run-\(iteration).log")) }
+            if fm.fileExists(atPath: bundle.statusURL.path) { try fm.copyItem(at: bundle.statusURL, to: root.appendingPathComponent("run-\(iteration).status")) }
+            if let id = managedID {
+                if await process.isRunning(processID: id) { _ = try await process.terminateAndWait(processID: id, force: true, timeout: 5) }
+            } else if appLauncher.isRunning(pid: pid) { try await appLauncher.terminate(pid: pid, force: true) }
+            try await provider.shutdownSharedPrefix(runtime: runtime, lease: lease)
+            try await provider.releaseSharedPrefixLease(lease)
+        }
+    }
+}
+
+@MainActor extension MiPlayCoreTests {
+    /// Opt-in real-game driver. Uses the production orchestrator; an external
+    /// observer must independently verify game PID, gameplay, window and 180 s.
+    /// A test-framework pass alone is never a game acceptance result.
+    func testZZZProductionAcceptance() async throws {
+        guard let path = ProcessInfo.processInfo.environment["MIPLAY_ZZZ_PRODUCTION_ROOT"] else {
+            throw XCTSkip("Explicit real-game acceptance only")
+        }
+        let root = URL(fileURLWithPath: path, isDirectory: true)
+        let support = root.appendingPathComponent("Support", isDirectory: true)
+        let source = try await PersistenceStore().readAppData()
+        var game = try XCTUnwrap(source.games.first { $0.type == .zenlessZoneZero })
+        game.state = .installed
+        let fs = GameFileSystemRepository(appSupportDirectory: support)
+        // Security-scoped bookmarks belong to their creating app identity.
+        // This independently built test host creates its own bookmark; it does
+        // not rewrite the signed production app's stored authorization.
+        let gamePath = try XCTUnwrap(game.location?.lastKnownPath)
+        game.location = try fs.makeGameLocation(gameID: game.id, for: URL(fileURLWithPath: gamePath), scope: .readWrite)
+        let logs = LogWriter(fileSystemRepository: fs)
+        let store = PersistenceStore(baseURL: support, logWriter: logs)
+        var data = AppData(games: [game])
+        data.gameEnvironmentSettings = source.gameEnvironmentSettings
+        data.gameEnvironmentSettings.dlssCompatibility = false
+        data.gameEnvironmentSettings.metalHUD = true
+        try await store.writeAppData(data)
+        let process = ProcessManager(logWriter: logs)
+        let network = NetworkDownloadProvider()
+        let wine = WineRuntimeProvider(processManager: process, fileSystemRepository: fs, logWriter: logs, persistenceStore: store)
+        let downloader = WineVersionDownloader(networkProvider: network, fileSystemRepository: fs, processManager: process, logWriter: logs)
+        let manager = WineVersionManager(networkProvider: network, fileSystemRepository: fs, persistenceStore: store, wineVersionDownloader: downloader, logWriter: logs, wineRuntimeProvider: wine)
+        await manager.initialize()
+        let ready = try await manager.setupExistingManagedRuntimeIfPresent()
+        guard ready else { XCTFail("Isolated runtime not installed"); return }
+        let registry = GameRegistry(persistenceStore: store, fileSystemRepository: fs, stateMachine: GameStateMachine(), systemDetector: SystemEnvironmentDetector(), logWriter: logs)
+        await registry.initialize()
+        let validator = PreLaunchValidator(fileSystemRepository: fs, systemDetector: SystemEnvironmentDetector(), wineRuntimeProvider: wine, wineVersionManager: manager)
+        let orchestrator = LaunchOrchestrator(preLaunchValidator: validator, wineRuntimeProvider: wine, wineVersionManager: manager, processManager: process, performanceOptionManager: PerformanceOptionManager(persistenceStore: store, logWriter: logs), gameRegistry: registry, fileSystemRepository: fs, logWriter: logs)
+        for iteration in 1...5 {
+            let directory = root.appendingPathComponent("round-\(iteration)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let result = await orchestrator.launch(game: game)
+            guard case .success = result else {
+                try String(describing: result).write(to: directory.appendingPathComponent("launch-failure.txt"), atomically: true, encoding: .utf8)
+                await orchestrator.cancelLaunch()
+                XCTFail("Production launch failed; consecutive series reset")
+                return
+            }
+            do {
+                try JSONSerialization.data(withJSONObject: ["iteration": iteration, "launchReturnedAt": Date().timeIntervalSince1970, "acceptanceClockStarted": false]).write(to: directory.appendingPathComponent("observe.json"), options: .atomic)
+                let response = directory.appendingPathComponent("observer-result.json")
+                // Leave time for visual review and user messages without terminating a healthy game.
+                let deadline = ContinuousClock.now.advanced(by: .seconds(3600))
+                while !FileManager.default.fileExists(atPath: response.path) && ContinuousClock.now < deadline {
+                    try await Task.sleep(for: .seconds(1))
+                }
+                let evidence = try JSONSerialization.jsonObject(with: Data(contentsOf: response)) as? [String: Any]
+                await orchestrator.cancelLaunch()
+                guard evidence?["passed"] as? Bool == true else {
+                    XCTFail("External game acceptance failed or blocked; consecutive series reset")
+                    return
+                }
+            } catch {
+                await orchestrator.cancelLaunch()
+                throw error
+            }
+        }
+    }
 }

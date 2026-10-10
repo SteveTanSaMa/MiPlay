@@ -1,0 +1,19 @@
+{
+  "rendererBuild": "654f547+miplay-fb45156",
+  "upstreamBase": "654f547ffab4e0c395ee368aad52bb4586b04576",
+  "upstreamFix": "fb4515681daefb789a4d0f403c4bdbca88f3b3de",
+  "source": "https://github.com/3Shain/dxmt",
+  "patch": "Tools/DXMT/patches/fb45156-device-initialization.patch",
+  "profile": "x86_64 Wine builtin; debugoptimized, DWARF stripped from shipped files; NVAPI and NGX enabled",
+  "wineSDK": "v8.16-3shain (build only)",
+  "wineRuntime": "wine-crossover-11.0-1-signed (unchanged)",
+  "files": {
+    "d3d10core.dll": "b06d88bd208d045194caa146929312b39704a4d8c8c1f24c0bfc2aef403b40d2",
+    "d3d11.dll": "a0293693e0762b869f9e52d1a948ce66a076df84b65f22172304800b4b9a4e8c",
+    "dxgi.dll": "91566b27b493a365e6cdbab10247cb57fae4681aed0eec38750aa01767b41148",
+    "nvapi64.dll": "c7d161e092a41114c74b50861c72294969664a63547d957398dfba44e54e2bbc",
+    "nvngx.dll": "24cc8a50655868b295a1a43f25b8dcc85c68b5d09eb4c11837e51de0e77a544a",
+    "winemetal.dll": "dbb36567ff8312a27c1c37facdea706ff202116a6bbbe344e28abc91c47a23fb",
+    "winemetal.so": "7002ba66d7c7690dc553d66c4d75f92b1546f5a6bca21d3d2618be3342562bc8"
+  }
+}

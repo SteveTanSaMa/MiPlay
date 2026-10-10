@@ -1,0 +1,11 @@
+{
+  "version": "4.1.0",
+  "source": "https://codeberg.org/mkrsym1/jadeite/releases/download/v4.1.0/v4.1.0.zip",
+  "archiveSHA256": "12d4c37b09d3e81640536fd68c2c62913fc4b4a90c0183e4dec845e4934a9858",
+  "files": {
+    "jadeite.exe": "b784e84924ff6e62050bf0d41272cd54a9e71881f77d4bfc8fe1fc52ed81eed9",
+    "game_payload.dll": "08dc4aff0008aa3752e58a7d922986906f7e39c34cc6b52b44394ac5cf9e1fd9",
+    "launcher_payload.dll": "165d7efbf854367ff06c4a2404687680765e0f5ca3acb13de84e7c4b018f65ff",
+    "LICENSE.txt": "8857555c6f26947270b1a7312c69a277eef127b28ae6ecfb593348c2533e4a1d"
+  }
+}

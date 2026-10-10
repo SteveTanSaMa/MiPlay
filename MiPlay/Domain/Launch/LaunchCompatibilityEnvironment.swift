@@ -20,9 +20,8 @@ import Foundation
 ///    pristine build files are preserved as `.bak` on the first patch.
 /// 3. The game-bundled Vulkan runtime loader must be moved aside while the
 ///    DXMT renderer is active, and restored after the process exits.
-/// 4. Genshin Impact is launched through the staged Steam compatibility stub,
-///    which keeps the game off the kernel-driver anti-cheat path that
-///    terminates it under Wine.
+/// 4. Genshin Impact and ZZZ use a staged Steam compatibility stub; Star Rail
+///    uses Jadeite with its two payloads in the same directory.
 ///
 /// Every step is idempotent and best-effort; missing runtime assets are
 /// reported to the caller instead of blocking the launch.
@@ -34,17 +33,20 @@ enum LaunchCompatibilityEnvironment {
         var stagedGameFiles: [StagedGameFile]
         /// 本次 staging 使用的资产来源标识（`bundledRuntimeAssets` / `appSupportRuntimeAssets`）。
         var assetSource: String
+        var vendorExtensionsReady: Bool
 
         nonisolated init(
             stagedFileCount: Int,
             missingAssetNames: [String],
             stagedGameFiles: [StagedGameFile],
-            assetSource: String
+            assetSource: String,
+            vendorExtensionsReady: Bool = false
         ) {
             self.stagedFileCount = stagedFileCount
             self.missingAssetNames = missingAssetNames
             self.stagedGameFiles = stagedGameFiles
             self.assetSource = assetSource
+            self.vendorExtensionsReady = vendorExtensionsReady
         }
     }
 
@@ -143,6 +145,7 @@ enum LaunchCompatibilityEnvironment {
         prefixURL: URL,
         runtimeRootURL: URL,
         assetRootURL: URL = resolvedAssetSourceRootURL(),
+        enableVendorExtensions: Bool = false,
         fileManager: FileManager = .default
     ) -> StagingResult {
         var stagedFileCount = 0
@@ -154,16 +157,19 @@ enum LaunchCompatibilityEnvironment {
         let windowsRuntimeLibURL = runtimeRootURL.appendingPathComponent("lib/wine/x86_64-windows", isDirectory: true)
         let unixRuntimeLibURL = runtimeRootURL.appendingPathComponent("lib/wine/x86_64-unix", isDirectory: true)
         let dxmtURL = assetRootURL.appendingPathComponent("dxmt", isDirectory: true)
+        var vendorExtensionsReady = false
 
         // 1. Anti-cheat driver file provided by the game installation.
         let driverSourceURL = gameDirectory.appendingPathComponent("HoYoKProtect.sys")
-        switch copyOutcome(from: driverSourceURL, to: system32URL.appendingPathComponent("HoYoKProtect.sys"), fileManager: fileManager) {
-        case .copied:
-            stagedFileCount += 1
-        case .unchanged:
-            break
-        case .sourceMissing:
-            missingAssetNames.append("HoYoKProtect.sys")
+        if gameType != .honkaiStarRail {
+            switch copyOutcome(from: driverSourceURL, to: system32URL.appendingPathComponent("HoYoKProtect.sys"), fileManager: fileManager) {
+            case .copied:
+                stagedFileCount += 1
+            case .unchanged:
+                break
+            case .sourceMissing:
+                missingAssetNames.append("HoYoKProtect.sys")
+            }
         }
 
         // 2. DXMT renderer frontend. The prefix keeps the pristine build copy
@@ -223,6 +229,37 @@ enum LaunchCompatibilityEnvironment {
             }
         }
 
+        // Opt-in NGX/NVAPI deployment. Use the bundled pair in BOTH locations;
+        // stale prefix copies must not win over the selected renderer's assets.
+        if enableVendorExtensions {
+            let names = ["nvapi64.dll", "nvngx.dll"]
+            let required = rendererFileNames + ["winemetal.dll", "winemetal.so"] + names
+            let missing = required.filter { !fileManager.fileExists(atPath: dxmtURL.appendingPathComponent($0).path) }
+            missingAssetNames.append(contentsOf: missing)
+            if missing.isEmpty {
+                vendorExtensionsReady = true
+                for name in names {
+                    let source = dxmtURL.appendingPathComponent(name)
+                    let runtimeFile = windowsRuntimeLibURL.appendingPathComponent(name)
+                    let backup = URL(fileURLWithPath: runtimeFile.path + ".bak")
+                    if !fileManager.fileExists(atPath: backup.path), fileManager.fileExists(atPath: runtimeFile.path) {
+                        try? fileManager.copyItem(at: runtimeFile, to: backup)
+                    }
+                    for destination in [runtimeFile, system32URL.appendingPathComponent(name)] {
+                        switch copyOutcome(from: source, to: destination, fileManager: fileManager) {
+                        case .copied: stagedFileCount += 1
+                        case .unchanged: break
+                        case .sourceMissing:
+                            vendorExtensionsReady = false
+                            missingAssetNames.append(name)
+                        }
+                    }
+                }
+                // Core staging errors must also prevent enabling the extension.
+                vendorExtensionsReady = vendorExtensionsReady && missingAssetNames.allSatisfy { !required.contains($0) }
+            }
+        }
+
         // 5. The game-bundled Vulkan runtime loader conflicts with the DXMT
         // renderer; it is moved aside for the launch and restored on exit.
         if let relativePath = bundledVulkanRelativePath(for: gameType) {
@@ -239,10 +276,8 @@ enum LaunchCompatibilityEnvironment {
             }
         }
 
-        // 6. Steam compatibility stub used by Genshin Impact. Only staged when
-        // the Steam launch path is selected (see `usesSteamCompatibilityStub`);
-        // the current direct-launch path does not read these files.
-        if gameType == .genshinImpact, usesSteamCompatibilityStub {
+        // 6. Shared Steam compatibility stub for Genshin Impact and ZZZ.
+        if usesSteamCompatibilityStub(for: gameType) {
             let protonextrasURL = assetRootURL.appendingPathComponent("protonextras", isDirectory: true)
             let steamFiles: [(assetName: String, destination: URL)] = [
                 ("steam64.exe", system32URL.appendingPathComponent("steam.exe")),
@@ -256,8 +291,22 @@ enum LaunchCompatibilityEnvironment {
                     missingAssetNames.append(file.assetName)
                     continue
                 }
-                if copyOutcome(from: assetURL, to: file.destination, fileManager: fileManager) == .copied {
-                    stagedFileCount += 1
+                switch copyOutcome(from: assetURL, to: file.destination, fileManager: fileManager) {
+                case .copied: stagedFileCount += 1
+                case .unchanged: break
+                case .sourceMissing: missingAssetNames.append(file.assetName)
+                }
+            }
+        }
+
+        if gameType == .honkaiStarRail {
+            let destination = jadeiteDirectory(prefixURL: prefixURL)
+            try? fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+            for name in jadeiteFileNames {
+                switch copyOutcome(from: assetRootURL.appendingPathComponent("jadeite/\(name)"), to: destination.appendingPathComponent(name), fileManager: fileManager) {
+                case .copied: stagedFileCount += 1
+                case .unchanged: break
+                case .sourceMissing: missingAssetNames.append(name)
                 }
             }
         }
@@ -269,7 +318,8 @@ enum LaunchCompatibilityEnvironment {
             stagedFileCount: stagedFileCount,
             missingAssetNames: uniqueMissingAssetNames,
             stagedGameFiles: stagedGameFiles,
-            assetSource: assetSourceIdentifier(for: assetRootURL)
+            assetSource: assetSourceIdentifier(for: assetRootURL),
+            vendorExtensionsReady: vendorExtensionsReady
         )
     }
 
@@ -374,25 +424,8 @@ enum LaunchCompatibilityEnvironment {
 
     /// The Wine program and following arguments for the staged environment.
     ///
-    /// 原神有两条启动路径（对照 YAAGL 的 `config.steamPatch` 分支），本机实测
-    /// （2026-10-07，国服 7.1.0 + CrossOver 11 runtime）：
-    /// - **Steam 兼容存根（当前，`usesSteamCompatibilityStub == true`）**：
-    ///   `wine C:\windows\system32\steam.exe <exe>`。存根让游戏不再走内核驱动路径，
-    ///   实测启动正常（671 行日志、无 `WDFLDR`/`ZwLoadDriver` 报错、游戏保持运行）。
-    ///   代价：存根会再拉起游戏进程，强制退出菜单里因此有两个条目
-    ///   （"原神" = LaunchServices 启动的 bundle；"wine" = 实际游戏进程，
-    ///   `lsappinfo` 显示其可执行文件为 `<runtime>/lib/wine/x86_64-unix/wine`）。
-    ///   这是抗作弊绕行带来的固有结果：游戏进程不是 LS 启动的进程。
-    /// - **直启 + 云平台参数**（`usesSteamCompatibilityStub == false`，对照 YAAGL
-    ///   `clients/mhy/hk4e/program-launch-game.ts` 的 `config.bat`）：`-platform_type
-    ///   CLOUD_THIRD_PARTY_PC -is_cloud 1`。实测 7.1.0 国服下**失败**：
-    ///   `err:module:import_dll Library WDFLDR.SYS ... not found` →
-    ///   `ZwLoadDriver failed c0000142` → `initDriver Failed: Error [4,1114,0]`，
-    ///   退出码 5。Wine 无法提供 WDFLDR（WineHQ bug 49193），YAAGL 同样如此
-    ///   （yaagl issue #763）。保留代码以便上游修复后切回；切回后游戏进程就是
-    ///   LS 启动的进程，强制退出菜单只剩一个「原神」条目。
-    ///
-    /// 其它游戏直接启动可执行文件。
+    /// 原神与绝区零共用 YAAGL 推荐的 Steam 存根入口；崩铁使用 Jadeite。
+    /// 启动器在调用前检查必需资产。下方直启分支只保留给诊断与旧路径测试。
     nonisolated static func launchInvocation(
         gameType: GameType,
         executablePath: String,
@@ -400,13 +433,15 @@ enum LaunchCompatibilityEnvironment {
         fileManager: FileManager = .default
     ) -> LaunchInvocation {
         let steamStubURL = prefixURL.appendingPathComponent("drive_c/windows/system32/steam.exe")
-        if gameType == .genshinImpact,
-           usesSteamCompatibilityStub,
+        if usesSteamCompatibilityStub(for: gameType),
            fileManager.fileExists(atPath: steamStubURL.path) {
             return LaunchInvocation(
                 program: "C:\\windows\\system32\\steam.exe",
                 arguments: [windowsPath(for: executablePath)]
             )
+        }
+        if gameType == .honkaiStarRail {
+            return LaunchInvocation(program: windowsPath(for: jadeiteDirectory(prefixURL: prefixURL).appendingPathComponent("jadeite.exe").path), arguments: [windowsPath(for: executablePath)])
         }
         return LaunchInvocation(
             program: executablePath,
@@ -419,6 +454,23 @@ enum LaunchCompatibilityEnvironment {
     /// `false`：直启 + 云平台参数；当前版本会被 HoYoKProtect 内核驱动加载失败挡住。
     /// 存根资产（`protonextras/`）只在 `true` 时 staging。
     nonisolated static let usesSteamCompatibilityStub = true
+
+    nonisolated static func usesSteamCompatibilityStub(for gameType: GameType) -> Bool {
+        usesSteamCompatibilityStub && gameType != .honkaiStarRail
+    }
+
+    nonisolated static let jadeiteFileNames = ["jadeite.exe", "game_payload.dll", "launcher_payload.dll"]
+
+    nonisolated static func jadeiteDirectory(prefixURL: URL) -> URL {
+        prefixURL.appendingPathComponent("drive_c/MiPlay/Jadeite", isDirectory: true)
+    }
+
+    /// Production launches require the selected compatibility route; never silently
+    /// switch to the direct route when one of its bundled components is missing.
+    nonisolated static func missingRequiredLaunchAssets(for gameType: GameType, staging: StagingResult) -> [String] {
+        let required = gameType == .honkaiStarRail ? jadeiteFileNames : ["steam64.exe", "steam32.exe", "lsteamclient64.dll", "lsteamclient32.dll"]
+        return staging.missingAssetNames.filter { required.contains($0) }
+    }
 
     /// 直启需要的附加参数（目前只有原神使用；对照 YAAGL 的 `config.bat`）。
     nonisolated private static func cloudLaunchArguments(for gameType: GameType) -> [String] {
@@ -436,13 +488,20 @@ enum LaunchCompatibilityEnvironment {
         case .genshinImpact:
             return [
                 "WINEESYNC": "1",
+                "WINEMSYNC": "0",
+                "WINE_ENABLE_TIMEOUT_FIX": "1",
                 "GST_PLUGIN_FEATURE_RANK": videoDecodeRank,
             ]
-        case .honkaiStarRail, .zenlessZoneZero:
+        case .zenlessZoneZero:
             return [
                 "WINEMSYNC": "1",
+                "WINEESYNC": "0",
+                "WINE_ENABLE_TIMEOUT_FIX": "1",
                 "GST_PLUGIN_FEATURE_RANK": videoDecodeRank,
             ]
+        case .honkaiStarRail:
+            return ["WINEMSYNC": "1", "WINEESYNC": "0", "WINE_ENABLE_TIMEOUT_FIX": "0", "GST_PLUGIN_FEATURE_RANK": videoDecodeRank,
+                    "DXMT_CONFIG": "d3d11.preferredMaxFrameRate=60;dxgi.customVendorId=10de;dxgi.customDeviceId=2684;"]
         }
     }
 

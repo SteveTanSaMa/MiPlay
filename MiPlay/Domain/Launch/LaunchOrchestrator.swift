@@ -86,6 +86,7 @@ public actor LaunchOrchestrator {
     private var activeManagedRuntime: ManagedWineRuntime?
     private var activeStagedGameFiles: [LaunchCompatibilityEnvironment.StagedGameFile] = []
     private var activeApplication: ActiveApplication?
+    private var processMonitorTask: (sessionID: UUID, task: Task<Void, Never>)?
 
     public init(
         preLaunchValidator: PreLaunchValidator,
@@ -216,13 +217,30 @@ public actor LaunchOrchestrator {
 
                 // Source: Docs/05-implementation/implementation-notes.md
                 // -> Launch Compatibility Environment -> staged before spawn.
+                let environmentSettings = await wineVersionManager.gameEnvironmentSettings()
+                let wantsVendorExtensions = (environmentSettings.dlssCompatibility || game.type == .honkaiStarRail)
+                    && GameEnvironmentSettings.supportsDLSSCompatibility
                 let staging = LaunchCompatibilityEnvironment.stage(
                     gameType: game.type,
                     gameDirectory: URL(fileURLWithPath: resolvedURL.path, isDirectory: true),
                     prefixURL: URL(fileURLWithPath: prefix, isDirectory: true),
-                    runtimeRootURL: runtime.rootURL
+                    runtimeRootURL: runtime.rootURL,
+                    enableVendorExtensions: wantsVendorExtensions
                 )
                 activeStagedGameFiles = staging.stagedGameFiles
+                let missingLaunchAssets = LaunchCompatibilityEnvironment.missingRequiredLaunchAssets(for: game.type, staging: staging)
+                guard missingLaunchAssets.isEmpty else {
+                    throw LaunchError.wineEnvironmentError("启动兼容组件缺失或安装失败: \(missingLaunchAssets.joined(separator: ", "))")
+                }
+                if game.type == .honkaiStarRail, wantsVendorExtensions, !staging.vendorExtensionsReady {
+                    throw LaunchError.wineEnvironmentError("崩铁所需的 NV 扩展组件安装失败")
+                }
+                if game.type != .genshinImpact {
+                    try await GameLaunchPreparation.fixWebview(gameType: game.type, wineBinary: wineBinary, prefix: prefix, processManager: processManager)
+                }
+                if game.type == .honkaiStarRail, staging.vendorExtensionsReady {
+                    try await GameLaunchPreparation.prepareStarRailVendorRegistry(wineBinary: wineBinary, prefix: prefix, processManager: processManager)
+                }
                 await logWriter.record(.init(
                     level: staging.missingAssetNames.isEmpty ? .info : .warning,
                     module: "LaunchOrchestrator",
@@ -242,6 +260,20 @@ public actor LaunchOrchestrator {
                     ]
                 ))
 
+                if wantsVendorExtensions {
+                    await logWriter.record(.init(
+                        level: staging.vendorExtensionsReady ? .info : .warning,
+                        module: "LaunchOrchestrator",
+                        eventName: "launch.nvext",
+                        operationID: operationID,
+                        gameID: game.id,
+                        phase: "prepared",
+                        result: staging.vendorExtensionsReady ? "completed" : "unavailable",
+                        messageCode: staging.vendorExtensionsReady ? "launch.nvext_prepared" : "launch.nvext_unavailable",
+                        fields: ["reasonCode": staging.vendorExtensionsReady ? "assetsReady" : "unsupportedHostOrMissingAssets"]
+                    ))
+                }
+
                 let invocation = LaunchCompatibilityEnvironment.launchInvocation(
                     gameType: game.type,
                     executablePath: executablePath,
@@ -253,19 +285,36 @@ public actor LaunchOrchestrator {
                     "WINEPREFIX": prefix,
                     "WINEDLLOVERRIDES": "winemenubuilder.exe=d"
                 ]
+                let server = runtime.rootURL.appendingPathComponent("bin/wineserver")
+                if FileManager.default.isExecutableFile(atPath: server.path) {
+                    environment["MIPLAY_WAIT_WINESERVER"] = server.path
+                }
                 for (key, value) in LaunchCompatibilityEnvironment.additionalEnvironment(for: game.type) {
                     environment[key] = value
                 }
                 // 性能选项的固定环境变量与 `{value}` 模板（如 DXMT 的
                 // `d3d11.metalSpatialUpscaleFactor`）统一在此展开。
                 for (key, value) in PerformanceOption.launchEnvironment(for: options) {
-                    environment[key] = value
+                    if key == "DXMT_CONFIG", let compatibilityConfig = environment[key] {
+                        environment[key] = compatibilityConfig + value
+                    } else {
+                        environment[key] = value
+                    }
                 }
                 // 应用级游戏运行设置（通用设置页）：Metal HUD 等环境变量在此注入；
                 // Retina / 左 Command 通过准备 prefix 时写注册表生效。
-                let environmentSettings = await wineVersionManager.gameEnvironmentSettings()
                 for (key, value) in environmentSettings.environmentVariables {
                     environment[key] = value
+                }
+                var vendorSettings = environmentSettings
+                if game.type == .honkaiStarRail { vendorSettings.dlssCompatibility = true }
+                for (key, value) in vendorSettings.vendorExtensionEnvironment(assetsReady: staging.vendorExtensionsReady) {
+                    environment[key] = value
+                }
+
+                if game.type == .honkaiStarRail {
+                    try await GameLaunchPreparation.beginStarRailNetworkWindow(processManager: processManager)
+                    try Task.checkCancellation()
                 }
                 // Xcode 注入的 `MTL_*` / `METAL_*`（Metal API 校验、帧捕获等）
                 // 会被 ProcessManager 在建子进程时剔除；这里记录一次剔除事实，
@@ -350,9 +399,13 @@ public actor LaunchOrchestrator {
                     // LaunchServices 已确认应用在运行；若它在确认后立刻结束，
                     // 由退出事实路径（monitorProcess）提交，不在这里重复判定。
                 } else {
+                    // The direct ProcessManager fallback retains the same child
+                    // lifetime boundary as the named LaunchServices bundle.
+                    let helper = Bundle.main.resourceURL?.appendingPathComponent("GameLauncher")
+                    let useHelper = environment["MIPLAY_WAIT_WINESERVER"] != nil && helper.map { FileManager.default.isExecutableFile(atPath: $0.path) } == true
                     let launchedProcessID = try await processManager.launch(
-                        executablePath: wineBinary,
-                        arguments: arguments,
+                        executablePath: useHelper ? helper!.path : wineBinary,
+                        arguments: useHelper ? [wineBinary] + arguments : arguments,
                         environment: environment,
                         workingDirectory: resolvedURL.path,
                         captureOutput: true
@@ -430,7 +483,9 @@ public actor LaunchOrchestrator {
                 messageCode: "launch.running_confirmed",
                 fields: ["launchMode": "applicationBundle", "durationMs": elapsedMilliseconds()]
             ))
-            Task { [weak self] in await self?.monitorProcess(processID: processID, game: game) }
+            processMonitorTask = (processID, Task { [weak self] in
+                await self?.monitorProcess(processID: processID, game: game)
+            })
             return .success(processId: processID)
         } catch is CancellationError {
             return await cancelAfterFailure(gameID: game.id)
@@ -505,10 +560,11 @@ public actor LaunchOrchestrator {
     // MARK: - Lifecycle helpers
 
     private func cleanup(processID: UUID, gameID: String?) async throws {
+        let monitor = processMonitorTask.flatMap { $0.sessionID == processID ? $0.task : nil }
         do {
             if let application = activeApplication, application.sessionID == processID {
                 try await applicationLauncher.terminate(pid: application.pid, force: true, timeout: .seconds(8))
-                activeApplication = nil
+                if monitor == nil { activeApplication = nil }
             } else {
                 _ = try await processManager.terminateAndWait(processID: processID, force: true, timeout: 8)
             }
@@ -516,6 +572,17 @@ public actor LaunchOrchestrator {
             // The termination handler already finalized the process; this is clean.
         } catch {
             throw LaunchError.recoveryRequired(error.localizedDescription)
+        }
+        // Once monitoring has started it owns the exit commit and prefix release.
+        // Actor reentrancy otherwise lets cancellation and monitorProcess release
+        // the same lease while either awaits wineserver shutdown.
+        if let monitor {
+            await monitor.value
+            guard currentLaunchProcessID != processID else {
+                throw LaunchError.recoveryRequired("进程已结束，但退出状态或共享 prefix 清理尚未提交")
+            }
+            if processMonitorTask?.sessionID == processID { processMonitorTask = nil }
+            return
         }
         if let gameID {
             guard let currentGame = await gameRegistry.getGame(by: gameID) else {
@@ -666,8 +733,10 @@ public actor LaunchOrchestrator {
                 // never see Installed with an outstanding bookmark lease.
                 activeSecurityScopes.removeValue(forKey: processID)?.stop()
                 try await releaseSharedPrefixLease()
-                if currentLaunchProcessID == processID { currentLaunchProcessID = nil }
-                if currentGameID == game.id { currentGameID = nil }
+                if currentLaunchProcessID == processID {
+                    currentLaunchProcessID = nil
+                    currentGameID = nil
+                }
                 await logWriter.record(.init(
                     level: statusCode == 0 && !terminatedBySignal ? .info : .warning,
                     module: "LaunchOrchestrator",

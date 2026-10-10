@@ -318,17 +318,47 @@ nonisolated public struct GameEnvironmentSettings: Codable, Sendable, Equatable 
     public var retinaMode: Bool
     /// `LeftCommandIsCtrl`：把左 Command 键映射为 Control（游戏内快捷键）。
     public var leftCommandIsCtrl: Bool
+    /// Opt-in NGX Super Resolution compatibility; quality is selected in the game.
+    public var dlssCompatibility: Bool
+
+    nonisolated public static var supportsDLSSCompatibility: Bool {
+        #if arch(arm64)
+        true
+        #else
+        false
+        #endif
+    }
 
     public init(
         metalHUD: Bool = false,
         fpsUnlock: Bool = false,
         retinaMode: Bool = true,
-        leftCommandIsCtrl: Bool = false
+        leftCommandIsCtrl: Bool = false,
+        dlssCompatibility: Bool = false
     ) {
         self.metalHUD = metalHUD
         self.fpsUnlock = fpsUnlock
         self.retinaMode = retinaMode
         self.leftCommandIsCtrl = leftCommandIsCtrl
+        self.dlssCompatibility = dlssCompatibility
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case metalHUD, fpsUnlock, retinaMode, leftCommandIsCtrl, dlssCompatibility
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        metalHUD = try values.decodeIfPresent(Bool.self, forKey: .metalHUD) ?? false
+        fpsUnlock = try values.decodeIfPresent(Bool.self, forKey: .fpsUnlock) ?? false
+        retinaMode = try values.decodeIfPresent(Bool.self, forKey: .retinaMode) ?? true
+        leftCommandIsCtrl = try values.decodeIfPresent(Bool.self, forKey: .leftCommandIsCtrl) ?? false
+        dlssCompatibility = try values.decodeIfPresent(Bool.self, forKey: .dlssCompatibility) ?? false
+    }
+
+    /// Always override inheritance, including when disabled or staging failed.
+    nonisolated public func vendorExtensionEnvironment(assetsReady: Bool) -> [String: String] {
+        ["DXMT_ENABLE_NVEXT": dlssCompatibility && Self.supportsDLSSCompatibility && assetsReady ? "1" : "0"]
     }
 
     /// 需要写入注册表的值（`REG_SZ`，Wine 认 `y`/`n`）。
