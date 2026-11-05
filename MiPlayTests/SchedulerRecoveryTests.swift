@@ -1,8 +1,316 @@
 // Source: Implementation maintenance split -> task scheduling and restart recovery
 import XCTest
+import Darwin
 @testable import MiPlay
 
+private final class PatchCancellationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var checks = 0
+    func cancelled() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        checks += 1
+        return checks >= 4
+    }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return checks }
+}
+
 @MainActor extension MiPlayCoreTests {
+    func testContentCapabilitiesGateOperationsIndependentlyWithoutBlockingRecovery() {
+        let noDownloads = GameContentCapabilities(sophonInstall: false, sophonUpdate: false, sophonPredownload: false)
+        XCTAssertFalse(TaskScheduler.allowsContentTask(.gameInstall, context: [:], capabilities: noDownloads))
+        XCTAssertFalse(TaskScheduler.allowsContentTask(.gameUpdate, context: [:], capabilities: noDownloads))
+        XCTAssertFalse(TaskScheduler.allowsContentTask(.gamePredownload, context: [:], capabilities: noDownloads))
+        XCTAssertTrue(TaskScheduler.allowsContentTask(.gameUpdate, context: ["recoveryOnly": "true"], capabilities: noDownloads))
+        XCTAssertTrue(TaskScheduler.allowsContentTask(.gameLaunch, context: [:], capabilities: noDownloads))
+
+        let onlyPredownload = GameContentCapabilities(sophonInstall: false, sophonUpdate: false, sophonPredownload: true)
+        XCTAssertTrue(TaskScheduler.allowsContentTask(.gamePredownload, context: [:], capabilities: onlyPredownload))
+        XCTAssertFalse(TaskScheduler.allowsContentTask(.gameUpdate, context: [:], capabilities: onlyPredownload))
+        let onlyInstall = GameContentCapabilities(sophonInstall: true, sophonUpdate: false, sophonPredownload: false)
+        XCTAssertTrue(TaskScheduler.allowsContentTask(.gameInstall, context: [:], capabilities: onlyInstall))
+        XCTAssertFalse(TaskScheduler.allowsContentTask(.gamePredownload, context: [:], capabilities: onlyInstall))
+    }
+
+    func testPatchDecoderDistinguishesIOFailuresFromInvalidPatch() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let old = Data((0..<2048).map { UInt8($0 % 256) })
+        let patch = try XCTUnwrap(Data(base64Encoded: "SERJRkYxMyYAkACQAAIIAAIAAAAFAAAAhTwFBYo/L39BQkNERQ=="))
+        let oldURL = directory.appendingPathComponent("old")
+        let patchURL = directory.appendingPathComponent("patch")
+        let badURL = directory.appendingPathComponent("invalid-patch")
+        let outputURL = directory.appendingPathComponent("output")
+        try old.write(to: oldURL)
+        try patch.write(to: patchURL)
+        try Data(repeating: 0, count: patch.count).write(to: badURL)
+        XCTAssertTrue(FileManager.default.createFile(atPath: outputURL.path, contents: nil))
+
+        let oldFD = Darwin.open(oldURL.path, O_RDONLY)
+        let oldWriteOnlyFD = Darwin.open(oldURL.path, O_WRONLY)
+        let patchFD = Darwin.open(patchURL.path, O_RDONLY)
+        let patchWriteOnlyFD = Darwin.open(patchURL.path, O_WRONLY)
+        let badFD = Darwin.open(badURL.path, O_RDONLY)
+        let outputFD = Darwin.open(outputURL.path, O_RDWR)
+        let outputReadOnlyFD = Darwin.open(outputURL.path, O_RDONLY)
+        let descriptors = [oldFD, oldWriteOnlyFD, patchFD, patchWriteOnlyFD, badFD, outputFD, outputReadOnlyFD]
+        defer { for descriptor in descriptors where descriptor >= 0 { Darwin.close(descriptor) } }
+        XCTAssertTrue(descriptors.allSatisfy { $0 >= 0 })
+
+        func assertIOError(old: Int32, diff: Int32, output: Int32,
+                           file: StaticString = #filePath, line: UInt = #line) {
+            XCTAssertThrowsError(try SophonHDiff.apply(oldFD: old, diffFD: diff, outputFD: output,
+                offset: 0, length: UInt64(patch.count), oldSize: 2048, newSize: 2048),
+                file: file, line: line) { error in
+                    XCTAssertEqual((error as? POSIXError)?.code, .EBADF, file: file, line: line)
+                }
+        }
+        // The descriptors all pass fstat, but the requested read or write is
+        // rejected by the kernel. None should be treated as a bad patch.
+        assertIOError(old: oldFD, diff: patchWriteOnlyFD, output: outputFD)
+        assertIOError(old: oldWriteOnlyFD, diff: patchFD, output: outputFD)
+        assertIOError(old: oldFD, diff: patchFD, output: outputReadOnlyFD)
+        assertIOError(old: -1, diff: patchFD, output: outputFD)
+        XCTAssertThrowsError(try SophonHDiff.apply(oldFD: oldFD, diffFD: badFD, outputFD: outputFD,
+            offset: 0, length: UInt64(patch.count), oldSize: UInt64(old.count), newSize: UInt64(old.count))) { error in
+                XCTAssertTrue(error is SophonHDiff.Error, "Malformed patch must remain eligible for fallback")
+            }
+        XCTAssertEqual(try Data(contentsOf: oldURL), old)
+        XCTAssertEqual(try Data(contentsOf: outputURL), Data())
+    }
+
+    func testPatchDecoderStopsWhenCancellationArrivesDuringRead() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let old = Data((0..<2048).map { UInt8($0 % 256) })
+        let patch = try XCTUnwrap(Data(base64Encoded: "SERJRkYxMyYAkACQAAIIAAIAAAAFAAAAhTwFBYo/L39BQkNERQ=="))
+        let oldURL = directory.appendingPathComponent("old")
+        let patchURL = directory.appendingPathComponent("patch")
+        let outputURL = directory.appendingPathComponent("output")
+        try old.write(to: oldURL)
+        try patch.write(to: patchURL)
+        XCTAssertTrue(FileManager.default.createFile(atPath: outputURL.path, contents: nil))
+        let oldFD = Darwin.open(oldURL.path, O_RDONLY)
+        let patchFD = Darwin.open(patchURL.path, O_RDONLY)
+        let outputFD = Darwin.open(outputURL.path, O_RDWR)
+        defer { Darwin.close(oldFD); Darwin.close(patchFD); Darwin.close(outputFD) }
+        XCTAssertGreaterThanOrEqual(min(oldFD, patchFD, outputFD), 0)
+        let counter = PatchCancellationCounter()
+        XCTAssertThrowsError(try SophonHDiff.apply(oldFD: oldFD, diffFD: patchFD, outputFD: outputFD,
+            offset: 0, length: UInt64(patch.count), oldSize: UInt64(old.count), newSize: UInt64(old.count),
+            isCancelled: { counter.cancelled() })) { error in
+                XCTAssertTrue(error is CancellationError)
+            }
+        XCTAssertGreaterThanOrEqual(counter.count, 4, "Cancellation must be observed inside the decoder")
+        XCTAssertEqual(try Data(contentsOf: oldURL), old)
+    }
+
+    func testProcessExitPromotesOnlyFreshAndStillMatchingUpdateEvidence() async throws {
+        let cases = ["valid", "stale", "future", "gameID", "metadataGameID", "revision", "relocated", "resolvedPathChanged", "scopeDenied", "staleBookmark",
+                     "metadataFailure", "conflicting", "sameVersion", "olderVersion", "invalidVersion",
+                     "gameVersion", "pkgMismatch", "missingChannel", "configVersion", "configChannel", "configIdentity", "duplicateChannel"]
+        for scenario in cases {
+            let directory = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let type = GameType.genshinImpact
+            let launched = Date(timeIntervalSinceNow: -120)
+            let readAt = scenario == "stale" ? launched.addingTimeInterval(-10) :
+                (scenario == "future" ? Date(timeIntervalSinceNow: 120) : Date(timeIntervalSinceNow: -10))
+            let identity = "{\"hk4e_cn\":{}}"
+            let diskIdentity = scenario == "configIdentity" ? "{\"hk4e_global\":{}}" : identity
+            let diskVersion = scenario == "configVersion" ? "1.0.1" : "1.0.0"
+            let diskChannel = scenario == "configChannel" ? "14" : "1"
+            let duplicate = scenario == "duplicateChannel" ? "channel=1\n" : ""
+            let config = "[General]\ngame_version=\(diskVersion)\nchannel=\(diskChannel)\n\(duplicate)sub_channel=1\ncps=mihoyo\nuapc=\(diskIdentity)\n"
+            try config.write(to: directory.appendingPathComponent("config.ini"), atomically: true, encoding: .utf8)
+            let resolved = scenario == "resolvedPathChanged" ? directory.appendingPathComponent("other", isDirectory: true) : directory
+            if scenario == "resolvedPathChanged" {
+                try FileManager.default.createDirectory(at: resolved, withIntermediateDirectories: true)
+                try config.write(to: resolved.appendingPathComponent("config.ini"), atomically: true, encoding: .utf8)
+            }
+            let location = GameLocation(gameID: type.rawValue, bookmarkData: Data([1]), lastKnownPath: directory.path,
+                                        scope: .readWrite, resolutionState: .resolvable,
+                                        lastResolvedAt: scenario == "relocated" ? readAt.addingTimeInterval(1) : nil,
+                                        bookmarkVersion: 1)
+            let evidence = VersionChecker.LocalEvidence(
+                gameVersion: "1.0.0", channel: scenario == "missingChannel" ? nil : "1", subChannel: "1", cps: "mihoyo", sdkVersion: nil,
+                configFields: [.init(section: "General", key: "uapc", value: identity)],
+                pkgVersionValidationErrors: scenario == "pkgMismatch" ? ["mismatch"] : [],
+                gameID: scenario == "gameID" ? "other-game" : type.rawValue,
+                locationRevision: scenario == "revision" ? 2 : 1, readAt: readAt
+            )
+            let latest = scenario == "sameVersion" ? "1.0.0" :
+                (scenario == "olderVersion" ? "0.9.0" : (scenario == "invalidVersion" ? "test-release" : "1.1.0"))
+            let metadata = GameMetadata(gameID: scenario == "metadataGameID" ? "other-game" : type.rawValue, latestVersion: latest, outcome: .updateAvailable,
+                                        localEvidence: evidence, conflictDetails: scenario == "conflicting" ? ["conflict"] : [])
+            let game = Game(id: type.rawValue, type: type, location: location, state: .installed,
+                            version: scenario == "gameVersion" ? "1.0.1" : "1.0.0", lastMetadata: metadata,
+                            metadataFailure: scenario == "metadataFailure" ? "untrusted" : nil,
+                            lastLaunchDate: nil, solutionApplications: [])
+            let store = PersistenceStore(baseURL: try makeTemporaryDirectory())
+            try await store.writeAppData(AppData(games: [game]))
+            let repository = GameFileSystemRepository(bookmarkResolver: BookmarkResolver(
+                resolve: { _ in .init(url: resolved, isStale: scenario == "staleBookmark") },
+                refresh: { _, _ in Data([2]) },
+                startAccessing: { _ in scenario != "scopeDenied" }, stopAccessing: { _ in }
+            ))
+            let registry = GameRegistry(persistenceStore: store, fileSystemRepository: repository,
+                                        stateMachine: GameStateMachine(), systemDetector: SystemEnvironmentDetector(),
+                                        logWriter: LogWriter(fileSystemRepository: repository))
+            await registry.initialize()
+            try await registry.transitionGame(id: type.rawValue, to: .launching)
+            try await registry.recordLaunchConfirmed(id: type.rawValue, date: launched)
+            let processID = UUID()
+            try await registry.commitProcessExit(gameID: type.rawValue, processID: processID, statusCode: 0, terminatedBySignal: false)
+            let expected: GameBusinessState = scenario == "valid" ? .updateAvailable : .installed
+            let first = await registry.getGame(by: type)
+            XCTAssertEqual(first?.state, expected, "\(scenario)")
+            let persisted = try await store.readAppData()
+            XCTAssertEqual(persisted.games.first?.state, expected, "\(scenario)")
+            try await registry.commitProcessExit(gameID: type.rawValue, processID: processID, statusCode: 0, terminatedBySignal: false)
+            let repeated = await registry.getGame(by: type)
+            XCTAssertEqual(repeated?.state, expected, "重复退出必须保持结果：\(scenario)")
+        }
+    }
+
+    func testPredownloadUsesGameFileLocksAndCanRunInBackground() async throws {
+        let fixture = try await makeScheduler()
+        let gameID = GameType.genshinImpact.rawValue
+        let task = ScheduledTask(type: .gamePredownload, gameId: gameID, context: ["predownloadVersion": "9.9.0"])
+        let keys = await fixture.scheduler.resourceKeys(for: task)
+        for type in [ScheduledTaskType.gameInstall, .gameUpdate, .gamePredownload, .integrityVerification, .versionCheck] {
+            let competing = ScheduledTask(type: type, gameId: gameID)
+            let competingKeys = await fixture.scheduler.resourceKeys(for: competing)
+            XCTAssertFalse(keys.isDisjoint(with: competingKeys), "\(type) must not race a predownload")
+        }
+        let launch = ScheduledTask(type: .gameLaunch, gameId: gameID)
+        let launchKeys = await fixture.scheduler.resourceKeys(for: launch)
+        XCTAssertTrue(keys.isDisjoint(with: launchKeys), "启动和预下载应可并行")
+        let other = ScheduledTask(type: .gameUpdate, gameId: GameType.honkaiStarRail.rawValue)
+        let otherKeys = await fixture.scheduler.resourceKeys(for: other)
+        XCTAssertTrue(keys.isDisjoint(with: otherKeys))
+        XCTAssertTrue(ScheduledTaskType.gamePredownload.isBackground)
+        XCTAssertEqual(task.cancellationPolicy, .cleanupAfterSideEffect)
+    }
+
+    func testQueuedBackgroundTasksRecheckLocksBeforeStarting() async throws {
+        let fixture = try await makeScheduler()
+        let (started, waiting) = await fixture.scheduler.probeConflictingBackgroundTasks()
+        XCTAssertEqual(started, 1)
+        XCTAssertEqual(waiting, 1)
+    }
+
+    func testWaitingForegroundKeepsPriorityOverConflictingBackground() async throws {
+        let fixture = try await makeScheduler()
+        let (conflictingStarted, unrelatedStarted, foregroundStillWaiting) = await fixture.scheduler.probeForegroundPriority()
+        XCTAssertFalse(conflictingStarted)
+        XCTAssertTrue(unrelatedStarted)
+        XCTAssertTrue(foregroundStillWaiting)
+    }
+
+    func testPredownloadProgressThrottlesPersistenceButEmitsEveryTick() async throws {
+        let fixture = try await makeScheduler()
+        await fixture.scheduler.initialize()
+        let id = ScheduledTaskID()
+        var task = ScheduledTask(id: id, type: .gamePredownload, gameId: "fixture")
+        task.state = .running
+        await fixture.scheduler.prepareProgressProbe(task, id: id)
+        let stream = await fixture.scheduler.makeEventStream()
+        var iterator = stream.makeAsyncIterator()
+
+        try await fixture.scheduler.phase(id, "正在预下载", progress: 0)
+        try await fixture.scheduler.phase(id, "正在预下载", progress: 0)
+        try await fixture.scheduler.phase(id, "正在预下载", progress: 0.4)
+        let persistedBeforeInterval = try await fixture.persistence.readAppData().taskHistory.first { $0.id == id.id }
+        XCTAssertEqual(persistedBeforeInterval?.progress, 0)
+        let snapshot = try await fixture.scheduler.taskSnapshot(id: id)
+        XCTAssertEqual(snapshot.progress, 0.4)
+        let firstValue = await iterator.next()
+        let secondValue = await iterator.next()
+        let thirdValue = await iterator.next()
+        let first = try XCTUnwrap(firstValue)
+        let second = try XCTUnwrap(secondValue)
+        let third = try XCTUnwrap(thirdValue)
+        XCTAssertEqual(first.persistence, .committed)
+        XCTAssertEqual(second.persistence, .memoryOnly)
+        XCTAssertEqual(third.persistence, .memoryOnly)
+        XCTAssertEqual([first.snapshot.progress, second.snapshot.progress, third.snapshot.progress], [0, 0, 0.4])
+        XCTAssertTrue(first.sequence < second.sequence && second.sequence < third.sequence)
+
+        await fixture.scheduler.expireProgressProbe(id)
+        try await fixture.scheduler.phase(id, "正在预下载", progress: 0.5)
+        let afterInterval = try await fixture.persistence.readAppData().taskHistory.first { $0.id == id.id }
+        XCTAssertEqual(afterInterval?.progress, 0.5)
+        try await fixture.scheduler.phase(id, "正在预下载", progress: 1)
+        try await fixture.scheduler.phase(id, "正在预下载", progress: 1)
+        let boundary = try await fixture.persistence.readAppData().taskHistory.first { $0.id == id.id }
+        XCTAssertEqual(boundary?.progress, 1)
+        try await fixture.scheduler.phase(id, "正在校验", progress: nil)
+        let afterPhaseChange = try await fixture.persistence.readAppData().taskHistory.first { $0.id == id.id }
+        XCTAssertEqual(afterPhaseChange?.phase, "正在校验")
+        XCTAssertNil(afterPhaseChange?.progress)
+        try await fixture.scheduler.finish(id, state: .cancelled, outcome: "downloadInterrupted", error: nil,
+                                           recovery: "可继续下载", phase: "预下载已取消")
+        let cancelled = try await fixture.persistence.readAppData().taskHistory.first { $0.id == id.id }
+        XCTAssertEqual(cancelled?.status, ScheduledTaskState.cancelled.rawValue)
+        XCTAssertEqual(cancelled?.phase, "预下载已取消")
+    }
+
+    func testPredownloadOfUninstalledGameFailsWithoutChangingItsState() async throws {
+        let game = Game(id: GameType.genshinImpact.rawValue, type: .genshinImpact, location: nil,
+                        state: .notInstalled, version: nil, lastLaunchDate: nil, solutionApplications: [])
+        let fixture = try await makeScheduler(games: [game])
+        let taskID = try await fixture.scheduler.enqueue(type: .gamePredownload, gameId: game.id,
+                                                          context: ["predownloadVersion": "9.9.0"])
+        let task = try await waitForTask(taskID, scheduler: fixture.scheduler)
+        XCTAssertEqual(task.state, .failed)
+        let after = await fixture.registry.getGame(by: game.id)
+        XCTAssertEqual(after?.state, .notInstalled)
+        XCTAssertNil(after?.version)
+    }
+
+    func testPredownloadRejectsMissingOrChangedDirectoryAuthorization() async throws {
+        let gameID = GameType.genshinImpact.rawValue
+        let location = GameLocation(gameID: gameID, bookmarkData: Data([1, 2]), lastKnownPath: "/unused",
+                                    scope: .readWrite, resolutionState: .resolvable)
+        let game = Game(id: gameID, type: .genshinImpact, location: location,
+                        state: .installed, version: "1.0.0", lastLaunchDate: nil, solutionApplications: [])
+        for raw in [nil, "", "not base64", Data([3, 4]).base64EncodedString()] as [String?] {
+            let fixture = try await makeScheduler(games: [game])
+            var context = ["predownloadVersion": "2.0.0"]
+            if let raw { context["predownloadLocationBookmark"] = raw }
+            let taskID = try await fixture.scheduler.enqueue(type: .gamePredownload, gameId: gameID, context: context)
+            let task = try await waitForTask(taskID, scheduler: fixture.scheduler)
+            XCTAssertEqual(task.state, .failed)
+            XCTAssertTrue(task.error?.contains("预下载目录授权已变化") == true, "\(task.error ?? "missing error")")
+            let after = await fixture.registry.getGame(by: gameID)
+            XCTAssertEqual(after?.state, .installed)
+            XCTAssertEqual(after?.version, "1.0.0")
+        }
+    }
+
+    func testInterruptedPredownloadRestoresRetryableTaskWithoutChangingVersion() async throws {
+        let base = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let game = Game(id: GameType.genshinImpact.rawValue, type: .genshinImpact, location: nil,
+                        state: .installed, version: "1.0.0", lastLaunchDate: nil, solutionApplications: [])
+        let record = PersistedTaskRecord(id: "interrupted-predownload", type: ScheduledTaskType.gamePredownload.rawValue,
+                                         gameID: game.id, status: ScheduledTaskState.running.rawValue,
+                                         phase: "预下载中", progress: 0.4, outcome: nil, error: nil, recovery: nil,
+                                         createdAt: Date(), context: ["predownloadVersion": "2.0.0",
+                                                                       "predownloadLocationBookmark": Data([1, 2]).base64EncodedString()])
+        let store = PersistenceStore(baseURL: base)
+        try await store.writeAppData(AppData(games: [game], taskHistory: [record]))
+        let fixture = try await makeScheduler(store: store)
+        await fixture.scheduler.initialize()
+        let restored = try await fixture.scheduler.taskSnapshot(id: ScheduledTaskID(record.id))
+        XCTAssertEqual(restored.state, .failed)
+        XCTAssertEqual(restored.context["predownloadVersion"], "2.0.0")
+        XCTAssertEqual(restored.context["predownloadLocationBookmark"], Data([1, 2]).base64EncodedString())
+        XCTAssertEqual(restored.phaseDescription, "预下载中断，可继续下载")
+        let after = await fixture.registry.getGame(by: game.id)
+        XCTAssertEqual(after?.version, "1.0.0")
+    }
+
     func testTaskSchedulerRunsVersionCheckProjectsProgressAndPersistsOutcome() async throws {
         let gameDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: gameDirectory) }
@@ -114,6 +422,54 @@ import XCTest
         XCTAssertEqual(repaired.error, "应用退出时任务被中断")
         XCTAssertEqual(persisted.taskHistory.first?.status, ScheduledTaskState.failed.rawValue)
         XCTAssertNil(persisted.taskHistory.first?.progress)
+    }
+
+    func testInterruptedGameRecoveryIsNotPresentedAsDownload() async throws {
+        let baseURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+        let store = PersistenceStore(baseURL: baseURL)
+        let record = PersistedTaskRecord(
+            id: "interrupted-game-recovery", type: ScheduledTaskType.gameUpdate.rawValue,
+            gameID: GameType.zenlessZoneZero.rawValue, status: ScheduledTaskState.running.rawValue,
+            phase: "正在恢复", progress: nil, outcome: nil, error: nil, recovery: nil,
+            createdAt: Date(), context: ["recoveryOnly": "true"]
+        )
+        try await store.writeAppData(AppData(taskHistory: [record]))
+        let fixture = try await makeScheduler(store: store)
+        await fixture.scheduler.initialize()
+        let task = try await fixture.scheduler.taskSnapshot(id: ScheduledTaskID(record.id))
+        XCTAssertEqual(task.state, .failed)
+        XCTAssertEqual(task.phaseDescription, "更新恢复中断，可继续更新")
+        XCTAssertEqual(task.recovery, "继续更新")
+    }
+
+    func testInterruptedUpdateKeepsGameBlockedAndPreservesResumeContext() async throws {
+        let base = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let bookmark = Data("partial-update-bookmark".utf8)
+        let game = Game(id: GameType.genshinImpact.rawValue, type: .genshinImpact,
+                        location: GameLocation(gameID: GameType.genshinImpact.rawValue,
+                                               bookmarkData: bookmark, lastKnownPath: base.path,
+                                               scope: .readWrite, resolutionState: .resolvable),
+                        state: .gameUpdating, version: "1.0.0", lastLaunchDate: nil, solutionApplications: [])
+        let context = ["confirmedMainland": "true", "confirmedLocationBookmark": bookmark.base64EncodedString()]
+        let record = PersistedTaskRecord(id: "paused-partial-update", type: ScheduledTaskType.gameUpdate.rawValue,
+                                         gameID: game.id, status: ScheduledTaskState.running.rawValue,
+                                         phase: "正在分批安装游戏文件", progress: 0.4, outcome: nil, error: nil,
+                                         recovery: nil, createdAt: Date(), context: context)
+        let store = PersistenceStore(baseURL: base)
+        try await store.writeAppData(AppData(games: [game], taskHistory: [record]))
+        let fixture = try await makeScheduler(store: store)
+        await fixture.scheduler.initialize()
+        let task = try await fixture.scheduler.taskSnapshot(id: ScheduledTaskID(record.id))
+        let restoredGame = await fixture.registry.getGame(by: game.id)
+        XCTAssertEqual(task.state, .failed)
+        XCTAssertEqual(task.phaseDescription, "更新中断，可继续更新")
+        XCTAssertEqual(task.recovery, "继续更新")
+        XCTAssertEqual(task.context, context)
+        XCTAssertEqual(restoredGame?.state, .gameUpdating)
+        XCTAssertEqual(restoredGame?.version, "1.0.0")
+        XCTAssertNil(task.outcome)
     }
 
     func testProcessExitPersistenceFailureCreatesRetryableRecoveryFact() async throws {
@@ -957,4 +1313,161 @@ import XCTest
         await restarted.orchestrator.cancelLaunch()
     }
 
+}
+
+private extension TaskScheduler {
+    func prepareProgressProbe(_ task: ScheduledTask, id: ScheduledTaskID) { tasks[id] = task }
+    func expireProgressProbe(_ id: ScheduledTaskID) { lastProgressPersistAt[id] = .now - .seconds(6) }
+
+    /// Arrange both tasks before the scheduler runs, as when a foreground
+    /// task releases a lock that multiple background tasks were waiting for.
+    func probeConflictingBackgroundTasks() -> (Int, Int) {
+        let firstID = ScheduledTaskID()
+        let secondID = ScheduledTaskID()
+        let first = ScheduledTask(id: firstID, type: .gamePredownload, gameId: "missing-game")
+        let second = ScheduledTask(id: secondID, type: .versionCheck, gameId: "missing-game")
+        tasks[firstID] = first
+        tasks[secondID] = second
+        queue.append(contentsOf: [firstID, secondID])
+        schedule()
+        return (activeBackground.count, queue.count)
+    }
+
+    func probeForegroundPriority() -> (Bool, Bool, Bool) {
+        let foregroundID = ScheduledTaskID()
+        let conflictingID = ScheduledTaskID()
+        let unrelatedID = ScheduledTaskID()
+        tasks[foregroundID] = ScheduledTask(id: foregroundID, type: .gameUpdate, gameId: "first-game")
+        tasks[conflictingID] = ScheduledTask(id: conflictingID, type: .gamePredownload, gameId: "first-game")
+        tasks[unrelatedID] = ScheduledTask(id: unrelatedID, type: .gamePredownload, gameId: "other-game")
+        queue.append(contentsOf: [foregroundID, conflictingID, unrelatedID])
+        // A different foreground task is running, leaving the first game's
+        // update waiting until the foreground slot becomes available.
+        activeForeground = ScheduledTaskID("already-running")
+        schedule()
+        return (activeBackground.contains(conflictingID), activeBackground.contains(unrelatedID), queue.contains(foregroundID))
+    }
+}
+@preconcurrency @MainActor final class SophonDirectoryLockTests: XCTestCase {
+    private func temporaryDirectory() throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MiPlayDirectoryLockTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    private func python(_ script: String, directory: URL) throws -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-c", script, directory.path]
+        return process
+    }
+
+    func testDirectoryLockExcludesOtherProcessAndCrashReleasesIt() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("game-data")
+        try Data("game can still read".utf8).write(to: file)
+        let lock = try SophonDirectoryLock.acquire(at: root)
+        let probe = try python("""
+            import fcntl, os, sys
+            fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+            try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: sys.exit(17)
+            sys.exit(0)
+            """, directory: root)
+        try probe.run()
+        probe.waitUntilExit()
+        XCTAssertEqual(probe.terminationStatus, 17)
+        XCTAssertEqual(try Data(contentsOf: file), Data("game can still read".utf8))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["game-data"])
+        let body = Data("""
+            {"retcode":0,"data":{"game_branches":[{"game":{"id":"1Z8W5NHUQb"},
+             "main":{"branch":"main","tag":"1.0.0"},
+             "pre_download":{"branch":"predownload","tag":"2.0.0"}}]}}
+            """.utf8)
+        MockURLProtocol.configure { _ in .init(data: body) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockURLProtocol.self]
+        let metadata = SophonMetadataClient(session: URLSession(configuration: configuration))
+        let available = try await metadata.fetchPreDownloadVersion(for: .genshinImpact)
+        XCTAssertEqual(available, "2.0.0", "只读网络检查不应被游戏目录锁阻塞")
+        lock.release()
+
+        let process = try python("""
+            import fcntl, os, sys, time
+            fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            print('locked', flush=True)
+            time.sleep(60)
+            """, directory: root)
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        defer { if process.isRunning { process.terminate(); process.waitUntilExit() } }
+        let ready = output.fileHandleForReading.readData(ofLength: 7)
+        XCTAssertEqual(String(data: ready, encoding: .utf8), "locked\n")
+        XCTAssertThrowsError(try SophonDirectoryLock.acquire(at: root))
+        XCTAssertEqual(Darwin.kill(process.processIdentifier, SIGKILL), 0)
+        process.waitUntilExit()
+        let afterCrash = try SophonDirectoryLock.acquire(at: root)
+        afterCrash.release()
+    }
+
+    func testInstallerRejectsConcurrentOperationsAndAliases() async throws {
+        let parent = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("game", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let alias = parent.appendingPathComponent("alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: root)
+        let first = SophonInstaller()
+        let held = try await first.acquireExclusiveAccess(destination: root)
+        defer { held.release() }
+        let second = SophonInstaller()
+        do {
+            _ = try await second.acquireExclusiveAccess(destination: alias)
+            XCTFail("A path alias must resolve to the already locked physical directory")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("另一个 MiPlay")) }
+        do {
+            _ = try await second.run(game: .genshinImpact, destination: root, mode: .install) { _ in }
+            XCTFail("Installation must be excluded")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("另一个 MiPlay")) }
+        do {
+            _ = try await second.run(game: .genshinImpact, destination: root, mode: .update) { _ in }
+            XCTFail("Update must be excluded")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("另一个 MiPlay")) }
+        do {
+            _ = try await second.preDownload(game: .genshinImpact, destination: root, expectedVersion: "9.9.0") { _ in }
+            XCTFail("Predownload must be excluded")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("另一个 MiPlay")) }
+        do {
+            _ = try await second.recover(destination: root, game: .genshinImpact)
+            XCTFail("Recovery must be excluded")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("另一个 MiPlay")) }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
+    }
+
+    func testRecoveryReusesHeldLockAndRestoresOriginalFile() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let transaction = root.appendingPathComponent(SophonInstaller.transactionDirectoryName, isDirectory: true)
+        let backup = transaction.appendingPathComponent("backup", isDirectory: true)
+        try FileManager.default.createDirectory(at: backup, withIntermediateDirectories: true)
+        let original = Data("original".utf8), replacement = Data("replacement".utf8)
+        try original.write(to: backup.appendingPathComponent("YuanShen.exe"))
+        try replacement.write(to: root.appendingPathComponent("YuanShen.exe"))
+        let journal: [String: Any] = ["version": 1, "game": GameType.genshinImpact.rawValue,
+                                      "destination": root.path, "committed": false, "createdDirectories": [],
+                                      "operations": [["path": "YuanShen.exe", "hadExisting": true,
+                                                      "installedMD5": SophonMetadataClient.md5(replacement)]]]
+        try JSONSerialization.data(withJSONObject: journal).write(to: transaction.appendingPathComponent("journal.json"))
+        let installer = SophonInstaller()
+        let lock = try await installer.acquireExclusiveAccess(destination: root)
+        defer { lock.release() }
+        _ = try await installer.recover(destination: root, game: .genshinImpact, holding: lock)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("YuanShen.exe")), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: transaction.path))
+        XCTAssertThrowsError(try SophonDirectoryLock.acquire(at: root), "The lock must remain held after recovery")
+    }
 }

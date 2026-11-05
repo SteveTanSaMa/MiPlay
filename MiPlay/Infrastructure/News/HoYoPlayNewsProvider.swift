@@ -50,13 +50,9 @@ actor HoYoPlayNewsProvider: GameNewsProviding {
         cacheDirectory.appendingPathComponent("\(game.rawValue)-cn-zh-cn.json")
     }
 
-    // Same official China source as MiPlay's background service. Keep API IDs separate from GameType.
+    // Use the same official mainland identity as version and background data.
     nonisolated static func identity(for game: GameType) -> (id: String, biz: String) {
-        switch game {
-        case .genshinImpact: ("1Z8W5NHUQb", "hk4e_cn")
-        case .honkaiStarRail: ("64kMb5iAWu", "hkrpg_cn")
-        case .zenlessZoneZero: ("x6znKlJ0xK", "nap_cn")
-        }
+        (game.definition.mainlandGameID, game.definition.mainlandBiz)
     }
 
     nonisolated static func endpoint(for game: GameType) throws -> URL {

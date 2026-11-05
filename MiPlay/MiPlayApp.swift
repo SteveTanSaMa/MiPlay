@@ -7,6 +7,14 @@
 
 import SwiftUI
 
+/// Set only by the shared scheme's Test action. XCTest loads this application
+/// as its host, but individual tests construct and initialize their own fixtures.
+enum UnitTestHost {
+    static func isEnabled(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        environment["MIPLAY_UNIT_TEST_HOST"] == "1"
+    }
+}
+
 // Source: Architecture Design → 分层架构
 // Source: UI Design → Screen Inventory → 主界面/设置窗口
 
@@ -103,16 +111,24 @@ struct MiPlayApp: App {
     let settingsViewModel: SettingsViewModel
     let newsProvider: HoYoPlayNewsProvider
     let newsImageCache: NewsBannerImageCache
+    private let isUnitTestHost: Bool
 
     init() {
+        let isUnitTestHost = UnitTestHost.isEnabled()
+        self.isUnitTestHost = isUnitTestHost
+        // Defense in depth: even if a test explicitly opens another scene, its
+        // app-owned repositories must never point at the user's real data.
+        let testRoot = isUnitTestHost
+            ? FileManager.default.temporaryDirectory.appendingPathComponent("MiPlayTestHost-\(UUID().uuidString)", isDirectory: true)
+            : nil
         // 基础设施层初始化
-        let fileSystem = GameFileSystemRepository()
+        let fileSystem = GameFileSystemRepository(appSupportDirectory: testRoot)
         let network = NetworkDownloadProvider()
         let system = SystemEnvironmentDetector()
         let log = LogWriter(fileSystemRepository: fileSystem)
         self.newsProvider = HoYoPlayNewsProvider(network: network, logger: log)
         self.newsImageCache = NewsBannerImageCache(network: network)
-        let persistence = PersistenceStore(logWriter: log)
+        let persistence = PersistenceStore(baseURL: testRoot, logWriter: log)
         let process = ProcessManager(logWriter: log)
         let wine = WineRuntimeProvider(
             processManager: process,
@@ -196,7 +212,7 @@ struct MiPlayApp: App {
             fileSystemRepository: fileSystem,
             logWriter: log
         )
-        let mediaCache = MediaCacheManager()
+        let mediaCache = MediaCacheManager(baseURL: testRoot)
         let backgroundMedia = BackgroundMediaService(
             mediaTranscoder: mediaTranscoder,
             mediaCacheManager: mediaCache,
@@ -227,7 +243,8 @@ struct MiPlayApp: App {
             // 启动准备第一阶段（Wine 运行时 + 共享 prefix）由主界面视图模型驱动
             wineVersionManager: wineVersionMgr,
             // 官方游戏图标（侧栏显示 + 游戏 .app 打包）由视图模型在启动准备时补齐
-            gameIconProvider: gameIconProvider
+            gameIconProvider: gameIconProvider,
+            predownloadLookup: { try await SophonMetadataClient().fetchPreDownloadVersion(for: $0) }
         )
         self.settingsViewModel = SettingsViewModel(
             systemDetector: system,
@@ -235,24 +252,27 @@ struct MiPlayApp: App {
             gameRegistry: registry,
             fileSystemRepository: fileSystem,
             taskScheduler: scheduler,
-            performanceOptionManager: performance
+            performanceOptionManager: performance,
+            backgroundMediaService: backgroundMedia
         )
 
         // Source: QA Report → F-007 — 初始化 Wine 版本管理器
-        Task {
-            await log.record(.init(
-                level: .info,
-                module: "App",
-                eventName: "app.dependencies.initialized",
-                phase: "initialized",
-                result: "completed",
-                messageCode: "app.dependencies.initialized"
-            ))
-            await wineVersionMgr.initialize()
-            await scheduler.initialize()
+        if !isUnitTestHost {
+            Task {
+                await log.record(.init(
+                    level: .info,
+                    module: "App",
+                    eventName: "app.dependencies.initialized",
+                    phase: "initialized",
+                    result: "completed",
+                    messageCode: "app.dependencies.initialized"
+                ))
+                await wineVersionMgr.initialize()
+                await scheduler.initialize()
 
-            // Wine 与素材的并行启动准备由 LibraryViewModel 统一驱动。
-            // 这里只保留管理器初始化，让设置窗口能尽早读到状态。
+                // Wine 与素材的并行启动准备由 LibraryViewModel 统一驱动。
+                // 这里只保留管理器初始化，让设置窗口能尽早读到状态。
+            }
         }
     }
 
@@ -262,6 +282,7 @@ struct MiPlayApp: App {
             libraryViewModel: libraryViewModel,
             newsProvider: newsProvider,
             newsImageCache: newsImageCache,
+            isUnitTestHost: isUnitTestHost,
             registerWindow: appDelegate.registerMainWindow
         )
         .commands {

@@ -87,7 +87,7 @@
 - **失败恢复**：网络/固定资源失败只影响获取任务；安装身份或提交失败只影响固定 runtime；prefix 初始化失败影响三款游戏；路径、manifest、兼容方案或启动进程失败只影响目标游戏。任何失败都不切换系统 Wine、CrossOver、Whisky 或其他 prefix。
 - **终态**：公共环境可为 `NoManagedRuntime`、`Installed`、`PrefixUnset`、`PrefixPreparing`、`PrefixReady`、`PrefixNotReady` 或 `RecoveryRequired`；目标游戏只有在公共环境和自身前置都通过时才为 `WineReady`。
 
-> 详细状态和刷新规则见 [ux-runtime-revision-2026-08-05.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/02-ux/ux-runtime-revision-2026-08-05.md) 与 [ux-state-flow.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/02-ux/ux-state-flow.md)。
+> 详细状态和刷新规则见 [ux-runtime-revision-2026-08-05.md](ux-runtime-revision-2026-08-05.md) 与 [ux-state-flow.md](ux-state-flow.md)。
 
 ## 8. TaskScheduler 任务管理（P0/P1）
 

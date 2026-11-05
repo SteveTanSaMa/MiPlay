@@ -5,7 +5,7 @@
 > **角色**：UX Agent
 > **范围**：只定义用户任务、信息关系、状态语义、恢复动作和无障碍语义；不定义 SwiftUI 布局、ViewModel 实现或 Architecture 契约。
 
-> **后续有效回溯**：2026-08-05 Wine 设置、下载状态和“此 Mac”语义以 [ux-runtime-revision-2026-08-05.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/02-ux/ux-runtime-revision-2026-08-05.md) 为准。
+> **后续有效回溯**：2026-08-05 Wine 设置、下载状态和“此 Mac”语义以 [ux-runtime-revision-2026-08-05.md](ux-runtime-revision-2026-08-05.md) 为准。
 
 ## 1. 修订边界
 

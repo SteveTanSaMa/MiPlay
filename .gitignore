@@ -23,6 +23,11 @@ xcuserdata/
 *.trace/
 QAArtifacts/
 
+# Local maintenance evidence and Python caches
+Docs/maintenance/
+__pycache__/
+*.pyc
+
 # Local secrets and signing files
 
 .env

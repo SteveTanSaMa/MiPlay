@@ -21,7 +21,8 @@ struct PrimaryActionButton: View {
         switch state.action {
         case .locate: return "folder.badge.plus"
         case .launch: return "play.fill"
-        case .update: return "arrow.down.circle"
+        case .update, .resumeDownload: return "arrow.down.circle"
+        case .recoverGame: return "arrow.counterclockwise.circle"
         case .none: return nil
         }
     }

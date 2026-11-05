@@ -2,6 +2,7 @@
 // MiPlay
 
 @preconcurrency import Foundation
+import CryptoKit
 
 // Source: Architecture Design -> Service Contract -> BackgroundMediaService
 // Media mode selection, remote loading, and presentation.
@@ -38,6 +39,10 @@ extension BackgroundMediaService {
     /// 加载指定游戏的背景素材
     public func loadMedia(for gameId: String) async {
         let operationID = UUID()
+        backgroundRetentionTasks.removeValue(forKey: gameId)?.cancel()
+        backgroundRetentionTokens.removeValue(forKey: gameId)
+        backgroundLoadGenerations[gameId] = operationID
+        var backgroundsToRetain: [HoyoPlayBackground]?
         await logWriter.record(.init(
             level: .info,
             module: "BackgroundMediaService",
@@ -49,33 +54,43 @@ extension BackgroundMediaService {
             messageCode: "background.load_started"
         ))
         mediaStates[gameId] = .loading
+        themeImagePaths.removeValue(forKey: gameId)
+        backgroundStillImagePaths.removeValue(forKey: gameId)
 
         let mode = backgroundModes[gameId] ?? .dynamic
 
         // Source: ADR 019 — content-addressable 缓存策略
-        // 非 custom 模式：先计算 API 背景集合指纹，仅在集合内容变化时按
-        // diff 清理；缓存按组目录保留。
+        // 非 custom 模式：按资源身份更新缓存；是否保留过时素材由设置控制。
         if mode != .custom {
             do {
                 let entries = try await fetchGameBackgrounds()
                 if let backgrounds = findBackgrounds(in: entries, for: gameId) {
+                    backgroundsToRetain = backgrounds
                     let fingerprint = collectionFingerprint(
                         from: backgrounds,
                         sourceID: backgroundSourceID
                     )
-                    if let persisted = await loadPersistedCollectionFingerprint(for: gameId),
-                       persisted != fingerprint {
-                        await pruneCacheForCollectionChange(
+                    let persisted = await loadPersistedCollectionFingerprint(for: gameId)
+                    do {
+                        try await reconcileBackgroundCache(
                             gameId: gameId,
                             currentBackgrounds: backgrounds,
                             persisted: persisted
                         )
+                    } catch {
+                        // 归档失败时不能继续下载覆盖旧资源或提交新指纹。
+                        await logWriter.error("背景缓存维护失败: \(error.localizedDescription)", module: "BackgroundMediaService")
+                        mediaStates[gameId] = .failed("背景缓存维护失败")
+                        return
                     }
                     await persistCollectionFingerprint(fingerprint, for: gameId)
 
-                    if let currentBgId = resolveCurrentBackgroundId(from: backgrounds),
+                    if let currentBgId = resolveCurrentBackground(from: backgrounds)?.id,
                        await allCacheFilesExist(for: gameId, backgroundId: currentBgId) {
                         await presentLoadedMedia(for: gameId, backgroundId: currentBgId)
+                        if retainsOutdatedBackgrounds(for: gameId) {
+                            scheduleRetainedBackgrounds(backgrounds, for: gameId, generation: operationID)
+                        }
                         return
                     }
                 }
@@ -84,6 +99,8 @@ extension BackgroundMediaService {
                     "API 请求失败，保留现有缓存与指纹: \(error.localizedDescription)",
                     module: "BackgroundMediaService"
                 )
+                mediaStates[gameId] = .failed("API 不可用")
+                return
             }
         }
 
@@ -94,6 +111,9 @@ extension BackgroundMediaService {
             await loadStaticMedia(for: gameId)
         case .custom:
             await loadCustomMedia(for: gameId)
+        }
+        if mode != .custom, retainsOutdatedBackgrounds(for: gameId), let backgroundsToRetain {
+            scheduleRetainedBackgrounds(backgroundsToRetain, for: gameId, generation: operationID)
         }
     }
 
@@ -131,7 +151,28 @@ extension BackgroundMediaService {
     /// 在 API 返回中找到匹配游戏的素材条目
     internal func findBackgrounds(in entries: [HoyoPlayGameEntry], for gameId: String) -> [HoyoPlayBackground]? {
         guard let biz = gameKeyMap[gameId] else { return nil }
-        return entries.first { $0.game.biz == biz }?.backgrounds
+        guard let backgrounds = entries.first(where: { $0.game.biz == biz })?.backgrounds else { return nil }
+        // API identifiers are external data, not trusted filesystem paths.
+        // Disambiguate duplicate identifiers by the actual resource identity.
+        let counts = Dictionary(backgrounds.map { ($0.id.lowercased(), 1) }, uniquingKeysWith: +)
+        return backgrounds.map { background in
+            let id = background.id
+            let safe = !id.isEmpty && id.utf8.count <= 128 && id != "." && id != ".." &&
+                id.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_" }
+            guard !safe || counts[id.lowercased(), default: 0] > 1 else { return background }
+            let components = [id, background.type ?? "", background.background?.url ?? "",
+                              background.video?.url ?? "", background.theme?.url ?? "",
+                              background.icon?.url ?? "", background.icon?.hoverURL ?? ""]
+            let identity = (try? JSONEncoder().encode(components)) ?? Data()
+            let digest = SHA256.hash(data: identity).map { String(format: "%02x", $0) }.joined()
+            return background.withCacheID("group-" + digest)
+        }
+    }
+
+    /// 按 API 顺序优先选择含视频 URL 的背景组；没有视频时回退到第一组。
+    /// 缓存检查、动态与静态加载共用同一选择，保持组内素材一致。
+    internal func resolveCurrentBackground(from backgrounds: [HoyoPlayBackground]) -> HoyoPlayBackground? {
+        backgrounds.first(where: { ($0.video?.url ?? "").isEmpty == false }) ?? backgrounds.first
     }
 
     // MARK: - Dynamic Mode（视频背景 + theme 叠加）
@@ -144,18 +185,12 @@ extension BackgroundMediaService {
                 return
             }
 
-            // 用户指令（2026-10-05）：固定使用 API 解析到的第一个背景资源，
-            // 不再提供背景组切换。首个条目有可播放视频时走视频管线，
-            // 否则展示其静态背景图。
-            guard let current = backgrounds.first(where: {
-                ($0.background?.url ?? "").isEmpty == false || ($0.video?.url ?? "").isEmpty == false
-            }) else {
-                await loadBackgroundFromAPI(backgrounds: backgrounds, gameId: gameId)
+            guard let current = resolveCurrentBackground(from: backgrounds) else {
+                mediaStates[gameId] = .failed("无可用背景素材")
                 return
             }
-            guard current.type == "BACKGROUND_TYPE_VIDEO",
-                  (current.video?.url ?? "").isEmpty == false else {
-                // 首个条目无视频素材 → 使用其背景图
+            guard (current.video?.url ?? "").isEmpty == false else {
+                // 没有视频组时使用第一组的静态背景图。
                 await loadBackgroundFromAPI(backgrounds: backgrounds, gameId: gameId)
                 return
             }
@@ -176,11 +211,13 @@ extension BackgroundMediaService {
             if let bgURLStr = videoBg.background?.url, !bgURLStr.isEmpty,
                let bgURL = URL(string: bgURLStr) {
                 let bgWebpDest = await cacheURL(gameId: gameId, backgroundId: bgId, type: .background, ext: "webp").path
-                await downloadFile(from: bgURL, to: bgWebpDest)
+                if !(await hasSubCache(for: gameId, backgroundId: bgId, type: .background, ext: "webp")) {
+                    await downloadFile(from: bgURL, to: bgWebpDest)
+                }
                 if FileManager.default.fileExists(atPath: bgWebpDest) {
                     let bgPngDest = await cacheURL(gameId: gameId, backgroundId: bgId, type: .background, ext: "png").path
                     _ = try? await mediaTranscoder.transcodeWebPToPNG(inputPath: bgWebpDest, outputPath: bgPngDest)
-                    _ = try? FileManager.default.removeItem(atPath: bgWebpDest)
+                    if !retainsOutdatedBackgrounds(for: gameId) { _ = try? FileManager.default.removeItem(atPath: bgWebpDest) }
                 }
             }
 
@@ -189,11 +226,13 @@ extension BackgroundMediaService {
             if let videoURLStr = videoBg.video?.url, !videoURLStr.isEmpty,
                let videoURL = URL(string: videoURLStr) {
                 let webmDest = await cacheURL(gameId: gameId, backgroundId: bgId, type: .video, ext: "webm").path
-                await downloadFile(from: videoURL, to: webmDest)
+                if !(await hasSubCache(for: gameId, backgroundId: bgId, type: .video, ext: "webm")) {
+                    await downloadFile(from: videoURL, to: webmDest)
+                }
                 if FileManager.default.fileExists(atPath: webmDest) {
                     let mp4Dest = await cacheURL(gameId: gameId, backgroundId: bgId, type: .video, ext: "mp4").path
                     _ = try? await mediaTranscoder.transcodeWebMToMP4(inputPath: webmDest, outputPath: mp4Dest)
-                    _ = try? FileManager.default.removeItem(atPath: webmDest)
+                    if !retainsOutdatedBackgrounds(for: gameId) { _ = try? FileManager.default.removeItem(atPath: webmDest) }
                 }
             }
 
@@ -231,9 +270,9 @@ extension BackgroundMediaService {
 
     /// 从 API backgrounds 中加载背景图（.webp → .png），同时异步加载 theme
     internal func loadBackgroundFromAPI(backgrounds: [HoyoPlayBackground], gameId: String) async {
-        // 固定使用第一个有背景图的条目（忽略 type）
-        guard let bgEntry = backgrounds.first(where: { ($0.background?.url ?? "").isEmpty == false }),
+        guard let bgEntry = resolveCurrentBackground(from: backgrounds),
               let bgURLStr = bgEntry.background?.url,
+              !bgURLStr.isEmpty,
               let bgURL = URL(string: bgURLStr) else {
             mediaStates[gameId] = .failed("无可用背景素材")
             return
@@ -254,12 +293,14 @@ extension BackgroundMediaService {
         // 下载 background.webp → 转码 → .png
         // Source: ADR 019 — 空 URL 跳过
         let webpDest = await cacheURL(gameId: gameId, backgroundId: bgId, type: .background, ext: "webp").path
-        await downloadFile(from: bgURL, to: webpDest)
+        if !(await hasSubCache(for: gameId, backgroundId: bgId, type: .background, ext: "webp")) {
+            await downloadFile(from: bgURL, to: webpDest)
+        }
 
         if FileManager.default.fileExists(atPath: webpDest) {
             let pngDest = await cacheURL(gameId: gameId, backgroundId: bgId, type: .background, ext: "png").path
             _ = try? await mediaTranscoder.transcodeWebPToPNG(inputPath: webpDest, outputPath: pngDest)
-            _ = try? FileManager.default.removeItem(atPath: webpDest)
+            if !retainsOutdatedBackgrounds(for: gameId) { _ = try? FileManager.default.removeItem(atPath: webpDest) }
         }
 
         await presentLoadedMedia(for: gameId, backgroundId: bgId)
@@ -302,12 +343,14 @@ extension BackgroundMediaService {
         }
 
         let webpDest = await cacheURL(gameId: gameId, backgroundId: backgroundId, type: .theme, ext: "webp").path
-        await downloadFile(from: url, to: webpDest)
+        if !(await hasSubCache(for: gameId, backgroundId: backgroundId, type: .theme, ext: "webp")) {
+            await downloadFile(from: url, to: webpDest)
+        }
 
         if FileManager.default.fileExists(atPath: webpDest) {
             let pngDest = await cacheURL(gameId: gameId, backgroundId: backgroundId, type: .theme, ext: "png").path
             _ = try? await mediaTranscoder.transcodeWebPToPNG(inputPath: webpDest, outputPath: pngDest)
-            _ = try? FileManager.default.removeItem(atPath: webpDest)
+            if !retainsOutdatedBackgrounds(for: gameId) { _ = try? FileManager.default.removeItem(atPath: webpDest) }
             if await hasSubCache(for: gameId, backgroundId: backgroundId, type: .theme, ext: "png") {
                 themeImagePaths[gameId] = pngDest
                 await logWriter.debug("Theme 图已缓存: \(gameId)/\(backgroundId)", module: "BackgroundMediaService")
@@ -323,14 +366,15 @@ extension BackgroundMediaService {
         }
     }
 
-    /// 展示已加载的媒体（优先视频 mp4，降级背景 png）
+    /// 展示已加载的媒体（动态模式优先视频 mp4，静态模式使用背景 png）
     /// Source: ADR 019 — 接受 backgroundId，使用子目录缓存，成功后持久化
     internal func presentLoadedMedia(for gameId: String, backgroundId: String? = nil) async {
+        let useVideo = (backgroundModes[gameId] ?? .dynamic) == .dynamic
         guard let bgId = backgroundId else {
             // 降级：无 backgroundId 时尝试旧版扁平缓存
             let mp4Key = cacheKey(gameId: gameId, type: .video, ext: "mp4")
             let bgKey = cacheKey(gameId: gameId, type: .background, ext: "png")
-            if await mediaCacheManager.hasCachedFile(for: mp4Key) {
+            if useVideo, await mediaCacheManager.hasCachedFile(for: mp4Key) {
                 mediaStates[gameId] = .ready(localPath: await mediaCacheManager.cachedFileURL(for: mp4Key).path, isVideo: true)
             } else if await mediaCacheManager.hasCachedFile(for: bgKey) {
                 mediaStates[gameId] = .ready(localPath: await mediaCacheManager.cachedFileURL(for: bgKey).path, isVideo: false)
@@ -347,7 +391,7 @@ extension BackgroundMediaService {
             backgroundStillImagePaths[gameId] = bgSub.path
         }
 
-        if FileManager.default.fileExists(atPath: mp4Sub.path) {
+        if useVideo, FileManager.default.fileExists(atPath: mp4Sub.path) {
             mediaStates[gameId] = .ready(localPath: mp4Sub.path, isVideo: true)
             await tryLoadThemeFromCache(for: gameId, backgroundId: bgId)
         } else if FileManager.default.fileExists(atPath: bgSub.path) {

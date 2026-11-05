@@ -26,6 +26,39 @@ import Foundation
 /// Every step is idempotent and best-effort; missing runtime assets are
 /// reported to the caller instead of blocking the launch.
 enum LaunchCompatibilityEnvironment {
+    /// Launch behavior is deliberately selected for each supported game.
+    /// A new GameType must choose its route and preparation explicitly.
+    nonisolated enum LaunchRoute: Sendable, Equatable {
+        case steamStub
+        case jadeite
+    }
+
+    nonisolated struct GameLaunchProfile: Sendable, Equatable {
+        let route: LaunchRoute
+        let stagesGameDriver: Bool
+        let cleansWebviewRegistry: Bool
+        let requiresVendorExtensions: Bool
+        let usesStarRailVendorRegistry: Bool
+        let usesStarRailNetworkWindow: Bool
+    }
+
+    nonisolated static func profile(for gameType: GameType) -> GameLaunchProfile {
+        switch gameType {
+        case .genshinImpact:
+            return .init(route: .steamStub, stagesGameDriver: true, cleansWebviewRegistry: false,
+                         requiresVendorExtensions: false, usesStarRailVendorRegistry: false,
+                         usesStarRailNetworkWindow: false)
+        case .honkaiStarRail:
+            return .init(route: .jadeite, stagesGameDriver: false, cleansWebviewRegistry: true,
+                         requiresVendorExtensions: true, usesStarRailVendorRegistry: true,
+                         usesStarRailNetworkWindow: true)
+        case .zenlessZoneZero:
+            return .init(route: .steamStub, stagesGameDriver: true, cleansWebviewRegistry: true,
+                         requiresVendorExtensions: false, usesStarRailVendorRegistry: false,
+                         usesStarRailNetworkWindow: false)
+        }
+    }
+
     /// Facts about one staging pass for structured launch diagnostics.
     struct StagingResult: Sendable, Equatable {
         var stagedFileCount: Int
@@ -161,7 +194,7 @@ enum LaunchCompatibilityEnvironment {
 
         // 1. Anti-cheat driver file provided by the game installation.
         let driverSourceURL = gameDirectory.appendingPathComponent("HoYoKProtect.sys")
-        if gameType != .honkaiStarRail {
+        if profile(for: gameType).stagesGameDriver {
             switch copyOutcome(from: driverSourceURL, to: system32URL.appendingPathComponent("HoYoKProtect.sys"), fileManager: fileManager) {
             case .copied:
                 stagedFileCount += 1
@@ -299,7 +332,7 @@ enum LaunchCompatibilityEnvironment {
             }
         }
 
-        if gameType == .honkaiStarRail {
+        if profile(for: gameType).route == .jadeite {
             let destination = jadeiteDirectory(prefixURL: prefixURL)
             try? fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
             for name in jadeiteFileNames {
@@ -440,7 +473,7 @@ enum LaunchCompatibilityEnvironment {
                 arguments: [windowsPath(for: executablePath)]
             )
         }
-        if gameType == .honkaiStarRail {
+        if profile(for: gameType).route == .jadeite {
             return LaunchInvocation(program: windowsPath(for: jadeiteDirectory(prefixURL: prefixURL).appendingPathComponent("jadeite.exe").path), arguments: [windowsPath(for: executablePath)])
         }
         return LaunchInvocation(
@@ -456,7 +489,7 @@ enum LaunchCompatibilityEnvironment {
     nonisolated static let usesSteamCompatibilityStub = true
 
     nonisolated static func usesSteamCompatibilityStub(for gameType: GameType) -> Bool {
-        usesSteamCompatibilityStub && gameType != .honkaiStarRail
+        usesSteamCompatibilityStub && profile(for: gameType).route == .steamStub
     }
 
     nonisolated static let jadeiteFileNames = ["jadeite.exe", "game_payload.dll", "launcher_payload.dll"]
@@ -468,7 +501,11 @@ enum LaunchCompatibilityEnvironment {
     /// Production launches require the selected compatibility route; never silently
     /// switch to the direct route when one of its bundled components is missing.
     nonisolated static func missingRequiredLaunchAssets(for gameType: GameType, staging: StagingResult) -> [String] {
-        let required = gameType == .honkaiStarRail ? jadeiteFileNames : ["steam64.exe", "steam32.exe", "lsteamclient64.dll", "lsteamclient32.dll"]
+        let required: [String]
+        switch profile(for: gameType).route {
+        case .jadeite: required = jadeiteFileNames
+        case .steamStub: required = ["steam64.exe", "steam32.exe", "lsteamclient64.dll", "lsteamclient32.dll"]
+        }
         return staging.missingAssetNames.filter { required.contains($0) }
     }
 

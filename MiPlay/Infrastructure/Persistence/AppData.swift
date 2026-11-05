@@ -15,6 +15,9 @@ public struct AppData: Codable, Sendable {
 
     public var schemaVersion: Int
     public var games: [Game]
+    /// Built-in game types already introduced to this library. Missing means
+    /// the snapshot predates catalog tracking, not that no games were seen.
+    public var knownBuiltInGameTypes: [String]?
     public var backgroundModes: [String: String]
     public var customImagePaths: [String: String]
     public var performanceOptions: [String: [PerformanceOptionDTO]]
@@ -38,6 +41,7 @@ public struct AppData: Codable, Sendable {
     nonisolated public init(
         schemaVersion: Int = AppData.currentSchemaVersion,
         games: [Game] = [],
+        knownBuiltInGameTypes: [String]? = nil,
         backgroundModes: [String: String] = [:],
         customImagePaths: [String: String] = [:],
         performanceOptions: [String: [PerformanceOptionDTO]] = [:],
@@ -55,6 +59,7 @@ public struct AppData: Codable, Sendable {
     ) {
         self.schemaVersion = schemaVersion
         self.games = games
+        self.knownBuiltInGameTypes = knownBuiltInGameTypes
         self.backgroundModes = backgroundModes
         self.customImagePaths = customImagePaths
         self.performanceOptions = performanceOptions
@@ -83,6 +88,7 @@ public struct AppData: Codable, Sendable {
         }
         self.schemaVersion = version
         self.games = try container.decodeIfPresent([Game].self, forKey: .games) ?? []
+        self.knownBuiltInGameTypes = try container.decodeIfPresent([String].self, forKey: .knownBuiltInGameTypes)
         self.backgroundModes = try container.decodeIfPresent([String: String].self, forKey: .backgroundModes) ?? [:]
         self.customImagePaths = try container.decodeIfPresent([String: String].self, forKey: .customImagePaths) ?? [:]
         self.performanceOptions = try container.decodeIfPresent([String: [PerformanceOptionDTO]].self, forKey: .performanceOptions) ?? [:]
@@ -103,6 +109,7 @@ public struct AppData: Codable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(schemaVersion, forKey: .schemaVersion)
         try container.encode(games, forKey: .games)
+        try container.encodeIfPresent(knownBuiltInGameTypes, forKey: .knownBuiltInGameTypes)
         try container.encode(backgroundModes, forKey: .backgroundModes)
         try container.encode(customImagePaths, forKey: .customImagePaths)
         try container.encode(performanceOptions, forKey: .performanceOptions)
@@ -119,6 +126,7 @@ public struct AppData: Codable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case schemaVersion
         case games
+        case knownBuiltInGameTypes
         case backgroundModes
         case customImagePaths
         case performanceOptions
@@ -142,19 +150,22 @@ nonisolated public struct PerGameSettings: Codable, Sendable, Equatable {
     public var wineVersionOverride: String?
     public var compatibilityCapabilityStatus: [String: String]
     public var lastFailure: String?
+    public var lsfg: LSFGSettings
 
     public init(
         gameID: String,
         metadataDisplayEnabled: Bool = true,
         wineVersionOverride: String? = nil,
         compatibilityCapabilityStatus: [String: String] = [:],
-        lastFailure: String? = nil
+        lastFailure: String? = nil,
+        lsfg: LSFGSettings = LSFGSettings()
     ) {
         self.gameID = gameID
         self.metadataDisplayEnabled = metadataDisplayEnabled
         self.wineVersionOverride = wineVersionOverride
         self.compatibilityCapabilityStatus = compatibilityCapabilityStatus
         self.lastFailure = lastFailure
+        self.lsfg = lsfg
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -163,6 +174,7 @@ nonisolated public struct PerGameSettings: Codable, Sendable, Equatable {
         case wineVersionOverride
         case compatibilityCapabilityStatus
         case lastFailure
+        case lsfg
     }
 
     public init(from decoder: any Decoder) throws {
@@ -172,6 +184,7 @@ nonisolated public struct PerGameSettings: Codable, Sendable, Equatable {
         self.wineVersionOverride = try container.decodeIfPresent(String.self, forKey: .wineVersionOverride)
         self.compatibilityCapabilityStatus = try container.decodeIfPresent([String: String].self, forKey: .compatibilityCapabilityStatus) ?? [:]
         self.lastFailure = try container.decodeIfPresent(String.self, forKey: .lastFailure)
+        self.lsfg = try container.decodeIfPresent(LSFGSettings.self, forKey: .lsfg) ?? LSFGSettings()
     }
 
     /// The old override remains decodable for schema migration, but never
@@ -182,6 +195,7 @@ nonisolated public struct PerGameSettings: Codable, Sendable, Equatable {
         try container.encode(metadataDisplayEnabled, forKey: .metadataDisplayEnabled)
         try container.encode(compatibilityCapabilityStatus, forKey: .compatibilityCapabilityStatus)
         try container.encodeIfPresent(lastFailure, forKey: .lastFailure)
+        try container.encode(lsfg, forKey: .lsfg)
     }
 }
 
@@ -321,14 +335,6 @@ nonisolated public struct GameEnvironmentSettings: Codable, Sendable, Equatable 
     /// Opt-in NGX Super Resolution compatibility; quality is selected in the game.
     public var dlssCompatibility: Bool
 
-    nonisolated public static var supportsDLSSCompatibility: Bool {
-        #if arch(arm64)
-        true
-        #else
-        false
-        #endif
-    }
-
     public init(
         metalHUD: Bool = false,
         fpsUnlock: Bool = false,
@@ -358,7 +364,7 @@ nonisolated public struct GameEnvironmentSettings: Codable, Sendable, Equatable 
 
     /// Always override inheritance, including when disabled or staging failed.
     nonisolated public func vendorExtensionEnvironment(assetsReady: Bool) -> [String: String] {
-        ["DXMT_ENABLE_NVEXT": dlssCompatibility && Self.supportsDLSSCompatibility && assetsReady ? "1" : "0"]
+        ["DXMT_ENABLE_NVEXT": dlssCompatibility && assetsReady ? "1" : "0"]
     }
 
     /// 需要写入注册表的值（`REG_SZ`，Wine 认 `y`/`n`）。

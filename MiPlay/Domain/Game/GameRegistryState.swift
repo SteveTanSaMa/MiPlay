@@ -183,7 +183,11 @@ extension GameRegistry {
 
     public func refreshGameState(id: String) async {
         guard let index = games.firstIndex(where: { $0.id == id }) else { return }
-        guard games[index].state != .running, games[index].state != .launching else { return }
+        // An interrupted update may temporarily have no executable or an
+        // expired bookmark. Preserve its recovery state until the user can
+        // renew authorization and the transaction has been restored.
+        guard games[index].state != .running, games[index].state != .launching,
+              games[index].state != .gameUpdating else { return }
         guard let location = games[index].location else {
             guard games[index].state != .notInstalled else { return }
             let previous = games[index]

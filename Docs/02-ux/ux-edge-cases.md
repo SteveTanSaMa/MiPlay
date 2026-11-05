@@ -5,7 +5,7 @@
 > **更新日期**：2026-08-03
 > **继承自**：Product Features、Product Domain、UX State Flow、Architecture Communication
 
-> **运行环境后续口径**：2026-08-05 起，Wine 设置、下载、安装、当前选中版本和 readiness 以 [ux-runtime-revision-2026-08-05.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/02-ux/ux-runtime-revision-2026-08-05.md) 为准；本表中的终态不得把 Task `failed` 简化为“已完成”或把失败提升为 `WineReady`。
+> **运行环境后续口径**：2026-08-05 起，Wine 设置、下载、安装、当前选中版本和 readiness 以 [ux-runtime-revision-2026-08-05.md](ux-runtime-revision-2026-08-05.md) 为准；本表中的终态不得把 Task `failed` 简化为“已完成”或把失败提升为 `WineReady`。
 
 ## 处理规则
 

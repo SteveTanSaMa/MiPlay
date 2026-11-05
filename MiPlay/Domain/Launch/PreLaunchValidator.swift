@@ -135,6 +135,9 @@ public actor PreLaunchValidator {
         let scopedValidation: (FileIntegrityVerifier.VerificationResult?, UInt64)
         do {
             scopedValidation = try await fileSystemRepository.withSecurityScopedAccess(location) { resolvedURL, resolvedLocation in
+                if FileManager.default.fileExists(atPath: resolvedURL.appendingPathComponent(SophonInstaller.transactionDirectoryName).path) {
+                    throw ValidationError.invalidFileState(gameName: displayName, detail: "游戏存在未完成的下载事务，请先恢复更新")
+                }
                 if resolvedLocation.requiresPersistenceUpdate(from: location) {
                     guard let gameRegistry else {
                         throw ValidationError.permissionDenied(gameName: displayName, detail: "stale bookmark 刷新后缺少持久化边界")

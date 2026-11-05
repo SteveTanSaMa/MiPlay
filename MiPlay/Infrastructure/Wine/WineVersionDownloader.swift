@@ -98,19 +98,22 @@ public actor WineVersionDownloader {
         let url: URL
         let assetName: String
         let fileSize: Int64
+        let expectedSHA256: String?
 
         nonisolated init(
             sourceID: String,
             tagName: String,
             url: URL,
             assetName: String,
-            fileSize: Int64
+            fileSize: Int64,
+            expectedSHA256: String? = nil
         ) {
             self.sourceID = sourceID
             self.tagName = tagName
             self.url = url
             self.assetName = assetName
             self.fileSize = fileSize
+            self.expectedSHA256 = expectedSHA256
         }
     }
 

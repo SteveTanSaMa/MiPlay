@@ -3,7 +3,7 @@
 > **文档状态**：UX 回溯补充稿
 > **更新日期**：2026-08-27
 > **修订（R-1/R-2/R-4）**：2026-08-27 覆盖此前 I-4 的版本作用域设计，冻结单一 Wine runtime、单一共享 prefix 与简化设置流程
-> **依据**：[product-runtime-revision-2026-08-05.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/00-product/product-runtime-revision-2026-08-05.md)、[research-wine-shared-prefix-2026-08-27.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/01-research/research-wine-shared-prefix-2026-08-27.md)、[research-wine-archive-and-mac-info-2026-08-05.md](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/Docs/01-research/research-wine-archive-and-mac-info-2026-08-05.md)
+> **依据**：[product-runtime-revision-2026-08-05.md](../00-product/product-runtime-revision-2026-08-05.md)、[research-wine-shared-prefix-2026-08-27.md](../01-research/research-wine-shared-prefix-2026-08-27.md)、[research-wine-archive-and-mac-info-2026-08-05.md](../01-research/research-wine-archive-and-mac-info-2026-08-05.md)
 > **范围**：用户任务、信息模型、状态文案、刷新和恢复语义；不定义 SwiftUI、下载协议或安装实现。
 
 ## 1. 冻结事实与术语

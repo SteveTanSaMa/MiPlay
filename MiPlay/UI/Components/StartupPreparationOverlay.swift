@@ -5,6 +5,18 @@
 
 import SwiftUI
 
+/// Keep network diagnostics in the task and logs, but avoid displaying raw
+/// GitHub response bodies and shared public IP addresses in the startup UI.
+enum WinePreparationFailurePresentation {
+    static func message(_ detail: String) -> String {
+        let normalized = detail.lowercased()
+        if normalized.contains("api rate limit exceeded") || normalized.contains("ratelimitremaining=0") {
+            return "GitHub 请求次数已达上限，请稍后重试。如果使用共享网络，同一公网地址的请求会共用额度。"
+        }
+        return detail
+    }
+}
+
 // Source: 用户指令（2026-10-09）— 素材准备与 Wine 下载/配置并行，
 // Wine 先完成时继续显示剩余素材进度。
 //
@@ -105,11 +117,15 @@ struct StartupPreparationOverlay: View {
 
     private var messageText: String? {
         guard let message = failure ?? detail, !message.isEmpty, message != title else { return nil }
-        return message
+        return failure != nil && phase == .preparingWine
+            ? WinePreparationFailurePresentation.message(message)
+            : message
     }
 
     private var accessibilityValue: String {
-        if let failure { return failure }
+        if let failure {
+            return phase == .preparingWine ? WinePreparationFailurePresentation.message(failure) : failure
+        }
         if let value = clampedProgress {
             return "\(Int(value * 100))%，\(detail ?? "")"
         }

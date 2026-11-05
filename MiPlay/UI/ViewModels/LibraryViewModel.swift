@@ -39,6 +39,11 @@ public final class LibraryViewModel {
     private(set) var activeTaskId: ScheduledTaskID?
     private(set) var recoveryRecords: [RecoveryRecord] = []
     private(set) var recoveryRequired: String?
+    private(set) var gameDownloadTasks: [String: ScheduledTask] = [:]
+    private(set) var gameDownloadProgress: [String: TaskDownloadProgress] = [:]
+    private(set) var gamePredownloadVersions: [String: String] = [:]
+    private var gameDownloadSubmissions: Set<String> = []
+    private var predownloadChecks: Set<String> = []
 
     /// 官方游戏图标缓存路径（`GameIcons/<GameType>.icns`）。
     /// 侧栏（`GameSelectionRailView`）与打包的游戏 `.app` 共用同一份缓存。
@@ -55,8 +60,21 @@ public final class LibraryViewModel {
     /// 主按钮状态
     public var primaryButtonState: PrimaryButtonState {
         guard let game = selectedGame else { return .disabled("请选择游戏") }
+        if gameDownloadSubmissions.contains(game.id) || (GameDownloadPresentation.isActive(gameDownloadTasks[game.id]) && gameDownloadTasks[game.id]?.type != .gamePredownload) {
+            return .disabled(gameDownloadTasks[game.id]?.type == .gameInstall ? "安装中…" : "更新中…")
+        }
+        if GameDownloadPresentation.isActive(gameDownloadTasks[game.id]), gameDownloadTasks[game.id]?.type == .gamePredownload,
+           game.state == .updateAvailable || game.state == .gameUpdating {
+            return .disabled("预下载中…")
+        }
         if recoveryRecords.contains(where: { $0.gameID == game.id && $0.resolvedAt == nil }) {
             return .disabled("需要恢复")
+        }
+        if game.state == .gameUpdating {
+            return .enabled(label: "继续更新", action: .recoverGame)
+        }
+        if canResumeGameDownload(for: game.id), gameDownloadTasks[game.id]?.type != .gamePredownload {
+            return .enabled(label: gameDownloadTasks[game.id]?.type == .gameInstall ? "继续安装" : "继续更新", action: .resumeDownload)
         }
 
         switch game.state {
@@ -65,11 +83,16 @@ public final class LibraryViewModel {
         case .installed:
             return .enabled(label: "启动", action: .launch)
         case .updateAvailable:
-            return .disabled("有可用更新，暂不自动更新")
+            guard game.type.definition.contentCapabilities.sophonUpdate else {
+                return .disabled("暂不支持更新")
+            }
+            return GameDownloadPresentation.supportsChinaUpdate(game)
+                ? .enabled(label: "下载更新", action: .update)
+                : .disabled("仅支持国服官方客户端更新")
         case .launchFailed:
             return .enabled(label: "启动", action: .launch)
         case .gameUpdating:
-            return .disabled("更新中…")
+            return .enabled(label: "继续更新", action: .recoverGame)
         case .launching:
             return .disabled("启动中…")
         case .running:
@@ -102,6 +125,7 @@ public final class LibraryViewModel {
     /// 官方游戏图标获取（best-effort）。nil（测试或未接线）时跳过图标补齐，
     /// 仍会读取本地已有缓存。
     private let gameIconProvider: GameIconProvider?
+    private let predownloadLookup: (@Sendable (GameType) async throws -> String?)?
     private var taskObservation: Task<Void, Never>?
     private var progressObservation: Task<Void, Never>?
     private var registryObservation: Task<Void, Never>?
@@ -112,6 +136,12 @@ public final class LibraryViewModel {
     private var selectionPersistenceTask: Task<Void, Never>?
     private var backgroundMediaTaskIDs: [String: ScheduledTaskID] = [:]
     private var versionCheckTaskIDs: [String: ScheduledTaskID] = [:]
+    /// Use a monotonic clock so repeated activation events or wall-clock
+    /// changes do not generate a burst of official API requests.
+    internal static let foregroundUpdateRefreshInterval: Duration = .seconds(300)
+    private(set) var lastAutomaticVersionRefresh: ContinuousClock.Instant?
+    private var versionCheckSubmissions: Set<String> = []
+    private var postInstallDiscoveryTaskIDs: Set<ScheduledTaskID> = []
     /// 已自动尝试过恢复的记录（每个记录每会话只自动重试一次，失败则保留手动入口）。
     private var autoRecoveryAttemptedRecordIDs: Set<String> = []
 
@@ -123,7 +153,8 @@ public final class LibraryViewModel {
         taskScheduler: TaskScheduler,
         logWriter: LogWriter,
         wineVersionManager: WineVersionManager? = nil,
-        gameIconProvider: GameIconProvider? = nil
+        gameIconProvider: GameIconProvider? = nil,
+        predownloadLookup: (@Sendable (GameType) async throws -> String?)? = nil
     ) {
         self.gameRegistry = gameRegistry
         self.launchOrchestrator = launchOrchestrator
@@ -133,6 +164,7 @@ public final class LibraryViewModel {
         self.logWriter = logWriter
         self.wineVersionManager = wineVersionManager
         self.gameIconProvider = gameIconProvider
+        self.predownloadLookup = predownloadLookup
     }
 
     // MARK: - Startup preparation
@@ -170,8 +202,13 @@ public final class LibraryViewModel {
         await startRegistryObservation()
         await startTaskObservation()
         await refreshGames()
+        await restoreGameDownloadProjections()
         await refreshRecoveryRecords()
+        lastAutomaticVersionRefresh = ContinuousClock.now
         await scheduleAutomaticVersionChecks()
+        for game in games where game.location?.bookmarkData != nil && game.state != .notInstalled {
+            Task { await refreshPredownloadAvailability(for: game.type) }
+        }
         // 官方图标与启动准备并行（best-effort，不阻塞任何阶段）。
         Task { await refreshGameIcons() }
 
@@ -197,7 +234,7 @@ public final class LibraryViewModel {
         isInitialized = true
 
         // 确保选中在有效游戏上
-        if let sid = selectedGameId, !games.contains(where: { $0.id == sid }) {
+        if let sid = selectedGameId, !games.contains(where: { $0.id == sid }), GameType(rawValue: sid) == nil {
             selectedGameId = games.first?.id
         }
     }
@@ -376,34 +413,51 @@ public final class LibraryViewModel {
         startupProgress = 1
     }
 
-    /// Runs the opt-in startup version check for already located games. The
+    /// Runs the startup version check for already located games. The
     /// scheduler owns deduplication and persistence; this projection only
     /// retains task IDs so repeated state events cannot submit duplicates.
     private func scheduleAutomaticVersionChecks() async {
-        guard UserDefaults.standard.object(forKey: "gameUpdateNotificationsEnabled") as? Bool ?? true else {
-            return
+        for game in games where game.location?.bookmarkData != nil && game.state != .notInstalled && game.state != .gameUpdating {
+            await scheduleAutomaticVersionCheck(for: game.id)
         }
+    }
 
-        for game in games where game.location?.bookmarkData != nil && game.state != .notInstalled {
-            if let taskID = versionCheckTaskIDs[game.id],
-               let task = try? await taskScheduler.taskSnapshot(id: taskID),
-               task.state == .pending || task.state == .running {
-                continue
-            }
-            do {
-                let receipt = try await taskScheduler.enqueueReceipt(
-                    type: .versionCheck,
-                    gameId: game.id
-                )
-                versionCheckTaskIDs[game.id] = receipt.taskID
-            } catch TaskScheduler.SchedulerError.conflict {
-                continue
-            } catch {
-                await logWriter.warning(
-                    "启动版本检查未提交（\(game.type.displayName)）: \(error.localizedDescription)",
-                    module: "LibraryViewModel"
-                )
-            }
+    /// Location, installation, and foreground events can race. Reserve the
+    /// game ID before awaiting the scheduler, then inspect its authoritative
+    /// snapshots so a running or queued check is never submitted twice.
+    internal func scheduleAutomaticVersionCheck(for gameID: String) async {
+        guard let game = games.first(where: { $0.id == gameID }), game.location?.bookmarkData != nil,
+              game.state != .notInstalled, game.state != .gameUpdating,
+              versionCheckSubmissions.insert(gameID).inserted else { return }
+        defer { versionCheckSubmissions.remove(gameID) }
+        let snapshots = await taskScheduler.allTaskSnapshots()
+        guard !snapshots.contains(where: {
+            $0.type == .versionCheck && $0.gameId == gameID && ($0.state == .pending || $0.state == .running)
+        }) else { return }
+        do {
+            let receipt = try await taskScheduler.enqueueReceipt(type: .versionCheck, gameId: gameID)
+            versionCheckTaskIDs[gameID] = receipt.taskID
+        } catch TaskScheduler.SchedulerError.conflict {
+            return
+        } catch {
+            await logWriter.warning(
+                "自动版本检查未提交（\(game.type.displayName)）: \(error.localizedDescription)",
+                module: "LibraryViewModel"
+            )
+        }
+    }
+
+    /// Refresh on return to the foreground (or a wake while foregrounded).
+    /// Existing active/pending checks are reused, and predownload metadata is
+    /// refreshed independently without interrupting any download task.
+    public func refreshUpdatesOnActivation(now: ContinuousClock.Instant = ContinuousClock.now) async {
+        guard isInitialized else { return }
+        if let previous = lastAutomaticVersionRefresh,
+           previous.duration(to: now) < Self.foregroundUpdateRefreshInterval { return }
+        lastAutomaticVersionRefresh = now
+        await scheduleAutomaticVersionChecks()
+        for game in games where game.location?.bookmarkData != nil && game.state != .notInstalled && game.state != .gameUpdating {
+            await refreshPredownloadAvailability(for: game.type)
         }
     }
 
@@ -414,7 +468,7 @@ public final class LibraryViewModel {
 
         // Validate selected game still exists
         if let selectedId = selectedGameId {
-            if !games.contains(where: { $0.id == selectedId }) {
+            if !games.contains(where: { $0.id == selectedId }), GameType(rawValue: selectedId) == nil {
                 // 选中游戏已被移除，自动选中列表中的第一款
                 selectedGameId = games.first?.id
             }
@@ -430,6 +484,9 @@ public final class LibraryViewModel {
         selectionMediaTask?.cancel()
         selectionPersistenceTask?.cancel()
         selectedGameId = id
+        if let type = GameType(rawValue: id), games.contains(where: { $0.id == id && $0.location?.bookmarkData != nil }) {
+            Task { await refreshPredownloadAvailability(for: type) }
+        }
         // Recovery facts are game-scoped: the previous game's records must not
         // keep the new selection's primary action enabled. Refresh before any
         // action can be submitted for the newly selected game.
@@ -563,8 +620,254 @@ public final class LibraryViewModel {
             // Review Issue: P1-007 — 启动请求通过 TaskScheduler 提交
             await launchGame(game: game)
         case .update:
-            errorMessage = "已检测到新版本，但当前版本不执行游戏文件更新"
-            break
+            await updateGame(game: game)
+        case .resumeDownload:
+            await resumeGameDownload(for: game.id)
+        case .recoverGame:
+            await recoverGameFiles(for: game.id)
+        }
+    }
+
+    public func recoverGameFiles(for gameID: String) async {
+        guard let game = await gameRegistry.getGame(by: gameID), game.state == .gameUpdating,
+              !gameDownloadSubmissions.contains(gameID), !GameDownloadPresentation.isActive(gameDownloadTasks[gameID]) else { return }
+        gameDownloadSubmissions.insert(gameID)
+        defer { gameDownloadSubmissions.remove(gameID) }
+        do {
+            let receipt = try await taskScheduler.enqueueReceipt(type: .gameUpdate, gameId: gameID, context: ["recoveryOnly": "true"])
+            await projectGameDownload(try await taskScheduler.taskSnapshot(id: receipt.taskID))
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    /// Discover future releases without touching the installed game or blocking launch.
+    public func refreshPredownloadAvailability(for type: GameType) async {
+        guard type.definition.contentCapabilities.sophonPredownload else {
+            gamePredownloadVersions.removeValue(forKey: type.rawValue)
+            return
+        }
+        guard let predownloadLookup, !predownloadChecks.contains(type.rawValue) else { return }
+        predownloadChecks.insert(type.rawValue)
+        defer { predownloadChecks.remove(type.rawValue) }
+        do {
+            gamePredownloadVersions[type.rawValue] = try await predownloadLookup(type)
+        } catch {
+            await logWriter.warning("预下载信息检查失败: \(error.localizedDescription)", module: "LibraryViewModel")
+        }
+    }
+
+    public func availablePredownloadVersion(for gameID: String) -> String? {
+        guard let game = games.first(where: { $0.id == gameID }),
+              game.type.definition.contentCapabilities.sophonPredownload,
+              let target = gamePredownloadVersions[gameID], !target.isEmpty else { return nil }
+        if let current = game.version ?? game.lastMetadata?.localEvidence.gameVersion, !current.isEmpty,
+           (try? SophonMetadataClient.compareVersions(target, current)) != .orderedDescending { return nil }
+        return target
+    }
+
+    public func canStartPredownload(for gameID: String) -> Bool {
+        guard let game = games.first(where: { $0.id == gameID }),
+              availablePredownloadVersion(for: gameID) != nil,
+              !gameDownloadSubmissions.contains(gameID),
+              !recoveryRecords.contains(where: { $0.gameID == gameID && $0.resolvedAt == nil }),
+              GameDownloadPresentation.canPredownload(game, task: gameDownloadTasks[gameID]) else { return false }
+        let previous = gameDownloadTasks[gameID]
+        return previous?.type == .gamePredownload || !GameDownloadPresentation.canResume(previous, for: game)
+    }
+
+    public func startPredownload(for gameID: String, confirmedMainland: Bool = false,
+                                 confirmedLocationBookmark: Data? = nil) async {
+        guard canStartPredownload(for: gameID), let version = availablePredownloadVersion(for: gameID),
+              let game = await gameRegistry.getGame(by: gameID),
+              GameDownloadPresentation.canPredownload(game, task: gameDownloadTasks[gameID]) else { return }
+        guard GameDownloadPresentation.mainlandEligibility(for: game) != .requiresConfirmation || confirmedMainland else {
+            errorMessage = "此游戏目录的区服尚未确认，请先确认它属于国服官方客户端。"
+            return
+        }
+        gameDownloadSubmissions.insert(gameID)
+        defer { gameDownloadSubmissions.remove(gameID) }
+        do {
+            guard let bookmark = game.location?.bookmarkData, let path = game.location?.lastKnownPath, !path.isEmpty else {
+                throw GameRegistry.RegistrationError.permissionRequired("预下载需要已授权的游戏目录，请重新定位。")
+            }
+            var context = ["predownloadVersion": version, "predownloadLocationBookmark": bookmark.base64EncodedString(), "predownloadLocationPath": path]
+            if confirmedMainland {
+                context.merge(try GameDownloadPresentation.mainlandConfirmationContext(for: game, bookmark: confirmedLocationBookmark)) { _, fresh in fresh }
+            }
+            let receipt = try await taskScheduler.enqueueReceipt(type: .gamePredownload, gameId: gameID, context: context)
+            gameDownloadProgress.removeValue(forKey: gameID)
+            await projectGameDownload(try await taskScheduler.taskSnapshot(id: receipt.taskID))
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    public func canResumeGameDownload(for gameID: String) -> Bool {
+        guard let game = games.first(where: { $0.id == gameID }), !gameDownloadSubmissions.contains(gameID) else { return false }
+        return GameDownloadPresentation.canResume(gameDownloadTasks[gameID], for: game)
+    }
+
+    /// An installation always starts from an explicitly selected, writable
+    /// directory. Existing installations continue to use the update flow.
+    public func canInstallGame(for gameID: String) -> Bool {
+        guard let type = GameType(rawValue: gameID), type.definition.contentCapabilities.sophonInstall else { return false }
+        return Self.canStartInstall(
+            game: games.first(where: { $0.id == gameID }),
+            task: gameDownloadTasks[gameID],
+            isSubmitting: gameDownloadSubmissions.contains(gameID),
+            hasRecovery: recoveryRecords.contains { $0.gameID == gameID && $0.resolvedAt == nil }
+        )
+    }
+
+    internal static func canStartInstall(game: Game?, task: ScheduledTask?, isSubmitting: Bool, hasRecovery: Bool) -> Bool {
+        (game == nil || (game?.state == .notInstalled && game?.type.definition.contentCapabilities.sophonInstall == true))
+            && !isSubmitting && !hasRecovery && !GameDownloadPresentation.isActive(task)
+    }
+
+    public func installGame(type: GameType, selectedURL: URL) async {
+        let gameID = type.rawValue
+        guard canInstallGame(for: gameID) else { return }
+        gameDownloadSubmissions.insert(gameID)
+        defer { gameDownloadSubmissions.remove(gameID) }
+        guard selectedURL.startAccessingSecurityScopedResource() else {
+            errorMessage = "无法取得所选安装目录的访问权限，请重新选择目录。"
+            return
+        }
+        defer { selectedURL.stopAccessingSecurityScopedResource() }
+        do {
+            let repository = gameRegistry.fileSystemRepository
+            let location = try repository.makeGameLocation(gameID: gameID, for: selectedURL, scope: .readWrite)
+            guard let bookmark = location.bookmarkData else {
+                throw GameRegistry.RegistrationError.permissionRequired("安装目录书签未创建")
+            }
+            let game = try await ensureGameRegistered(type: type)
+            guard game.state == .notInstalled else {
+                throw GameRegistry.RegistrationError.recoveryRequired("游戏状态已变化，请重新选择操作。")
+            }
+            await refreshGames()
+            let receipt = try await taskScheduler.enqueueReceipt(
+                type: .gameInstall, gameId: gameID,
+                context: ["installBookmark": bookmark.base64EncodedString(), "installPath": selectedURL.path]
+            )
+            gameDownloadProgress.removeValue(forKey: gameID)
+            await projectGameDownload(try await taskScheduler.taskSnapshot(id: receipt.taskID))
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func resumeGameDownload(for gameID: String, confirmedMainland: Bool = false, confirmedLocationBookmark: Data? = nil) async {
+        guard canResumeGameDownload(for: gameID),
+              let previous = gameDownloadTasks[gameID], let game = await gameRegistry.getGame(by: gameID),
+              !gameDownloadSubmissions.contains(gameID) else {
+            errorMessage = "当前没有可继续的游戏下载任务。"
+            return
+        }
+        if (previous.type == .gameUpdate || previous.type == .gamePredownload),
+           GameDownloadPresentation.mainlandEligibility(for: game) == .requiresConfirmation, !confirmedMainland {
+            errorMessage = "此游戏目录的区服尚未确认，继续更新前请再次确认国服身份。"
+            return
+        }
+        gameDownloadSubmissions.insert(gameID)
+        defer { gameDownloadSubmissions.remove(gameID) }
+        do {
+            var context = previous.context
+            if previous.type == .gameInstall {
+                let repository = gameRegistry.fileSystemRepository
+                context = try GameDownloadPresentation.refreshedInstallContext(from: previous, game: game, repository: repository)
+            } else {
+                context.removeValue(forKey: "confirmedMainland")
+                context.removeValue(forKey: "confirmedLocationBookmark")
+                if confirmedMainland {
+                    context.merge(try GameDownloadPresentation.mainlandConfirmationContext(for: game, bookmark: confirmedLocationBookmark)) { _, fresh in fresh }
+                }
+                guard GameDownloadPresentation.canResume(previous, for: game) else {
+                    throw GameRegistry.RegistrationError.permissionRequired("当前游戏目录的区服或状态已变化，请重新检查。")
+                }
+            }
+            let receipt = try await taskScheduler.enqueueReceipt(type: previous.type, gameId: gameID, context: context)
+            gameDownloadProgress.removeValue(forKey: gameID)
+            await projectGameDownload(try await taskScheduler.taskSnapshot(id: receipt.taskID))
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// 从主窗口提交真实的游戏内容更新；书签与区服由调度器再次验证。
+    public func updateGame(game selectedGame: Game, confirmedMainland: Bool = false, confirmedLocationBookmark: Data? = nil) async {
+        guard let game = await gameRegistry.getGame(by: selectedGame.id) else {
+            errorMessage = "游戏不存在，请重新选择游戏。"
+            return
+        }
+        guard game.state == .updateAvailable || game.state == .gameUpdating,
+              GameDownloadPresentation.canSubmitUpdate(for: game, task: gameDownloadTasks[game.id]) else {
+            errorMessage = "仅支持已确认版本的国服官方客户端更新。"
+            return
+        }
+        guard GameDownloadPresentation.mainlandEligibility(for: game) != .requiresConfirmation || confirmedMainland else {
+            errorMessage = "此游戏目录的区服尚未确认，请先确认它属于国服官方客户端。"
+            return
+        }
+        guard !gameDownloadSubmissions.contains(game.id), !GameDownloadPresentation.isActive(gameDownloadTasks[game.id]) else { return }
+        gameDownloadSubmissions.insert(game.id)
+        defer { gameDownloadSubmissions.remove(game.id) }
+        do {
+            let context = confirmedMainland
+                ? try GameDownloadPresentation.mainlandConfirmationContext(for: game, bookmark: confirmedLocationBookmark) : [:]
+            let receipt = try await taskScheduler.enqueueReceipt(
+                type: .gameUpdate, gameId: game.id,
+                context: context
+            )
+            gameDownloadProgress.removeValue(forKey: game.id)
+            await projectGameDownload(try await taskScheduler.taskSnapshot(id: receipt.taskID))
+        } catch {
+            errorMessage = error.localizedDescription
+            await refreshGames()
+        }
+    }
+
+    public func cancelGameDownload(for gameID: String) async {
+        guard let task = gameDownloadTasks[gameID], GameDownloadPresentation.isActive(task) else { return }
+        do {
+            try await taskScheduler.cancel(taskId: task.id)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func restoreGameDownloadProjections() async {
+        let tasks = await taskScheduler.allTaskSnapshots().sorted { $0.createdAt < $1.createdAt }
+        for task in tasks where task.type == .gameInstall || task.type == .gameUpdate || task.type == .gamePredownload {
+            guard let gameID = task.gameId,
+                  GameDownloadPresentation.shouldProject(task, replacing: gameDownloadTasks[gameID]) else { continue }
+            gameDownloadTasks[gameID] = task
+        }
+    }
+
+    internal func projectGameDownload(_ task: ScheduledTask) async {
+        guard let gameID = task.gameId else { return }
+        guard GameDownloadPresentation.shouldProject(task, replacing: gameDownloadTasks[gameID]) else { return }
+        gameDownloadTasks[gameID] = task
+        guard !GameDownloadPresentation.isActive(task) else { return }
+        gameDownloadProgress.removeValue(forKey: gameID)
+        await refreshGames()
+        if task.state == .completed {
+            if !GameDownloadPresentation.resultConfirmed(for: task, game: games.first(where: { $0.id == gameID })) {
+                errorMessage = "游戏下载任务已结束，但安装版本与目录尚未确认。"
+            } else if task.type == .gameInstall || task.type == .gameUpdate {
+                // Terminal snapshots can arrive on both event streams. Run
+                // discovery once per completed operation, after registration.
+                if postInstallDiscoveryTaskIDs.insert(task.id).inserted {
+                    Task { [weak self] in
+                        guard let self else { return }
+                        await self.scheduleAutomaticVersionCheck(for: gameID)
+                        if let game = self.games.first(where: { $0.id == gameID }),
+                           game.location?.bookmarkData != nil, game.state != .notInstalled {
+                            await self.refreshPredownloadAvailability(for: game.type)
+                        }
+                        if task.type == .gameInstall { await self.refreshGameIcons() }
+                    }
+                }
+            }
+        } else if task.state == .failed, selectedGameId == gameID {
+            errorMessage = task.error ?? task.recovery ?? "游戏下载未完成"
         }
     }
 
@@ -600,13 +903,34 @@ public final class LibraryViewModel {
     /// Receives the URL selected by NSOpenPanel so Domain can create a scoped bookmark.
     public func locateGame(type: GameType, selectedURL: URL) async {
         do {
+            _ = try await ensureGameRegistered(type: type)
             _ = try await gameRegistry.locateGame(type: type, selectedURL: selectedURL)
             await refreshGames()
             if let game = games.first(where: { $0.type == type }) { selectGame(id: game.id) }
+            Task { await scheduleAutomaticVersionCheck(for: type.rawValue) }
             // 定位后立刻补图标（区服由安装目录的 config.ini 判定），不必等下次启动。
             Task { await refreshGameIcons() }
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Older libraries and a user-removed game may omit one of the fixed
+    /// entries. Recreate only the selected placeholder, after verifying that
+    /// the library loaded successfully, without changing other games.
+    internal func ensureGameRegistered(type: GameType) async throws -> Game {
+        if let game = await gameRegistry.getGame(by: type) { return game }
+        let snapshot = await gameRegistry.currentSnapshot()
+        guard case .loaded = snapshot.state else {
+            throw GameRegistry.RegistrationError.recoveryRequired("游戏库尚未就绪，无法添加游戏。")
+        }
+        do {
+            return try await gameRegistry.addGame(type: type, installPath: nil)
+        } catch GameRegistry.RegistrationError.gameAlreadyExists(_) {
+            guard let game = await gameRegistry.getGame(by: type) else {
+                throw GameRegistry.RegistrationError.gameNotFound(type.rawValue)
+            }
+            return game
         }
     }
 
@@ -745,6 +1069,15 @@ public final class LibraryViewModel {
     /// intentionally carry no UI-specific ownership fields.
     private func consume(_ progress: TaskProgress) async {
         guard let task = try? await taskScheduler.taskSnapshot(id: progress.taskId) else { return }
+        if task.type == .gameInstall || task.type == .gameUpdate || task.type == .gamePredownload {
+            guard let gameID = task.gameId,
+                  GameDownloadPresentation.shouldProject(task, replacing: gameDownloadTasks[gameID]) else { return }
+            if GameDownloadPresentation.isActive(task) {
+                gameDownloadProgress[gameID] = progress.download
+            }
+            await projectGameDownload(task)
+            return
+        }
         if task.type == .wineRuntimeSetup {
             // 启动准备第一阶段：进度事件直达遮罩（无需等待 400ms 轮询）。
             guard startupPhase == .preparingWine, startupFailure == nil else { return }
@@ -769,6 +1102,10 @@ public final class LibraryViewModel {
     }
 
     private func consume(_ event: TaskEvent) async {
+        if event.snapshot.type == .gameInstall || event.snapshot.type == .gameUpdate || event.snapshot.type == .gamePredownload {
+            await projectGameDownload(event.snapshot)
+            return
+        }
         if event.snapshot.type == .versionCheck {
             if let gameID = event.snapshot.gameId {
                 versionCheckTaskIDs[gameID] = event.snapshot.state == .pending || event.snapshot.state == .running

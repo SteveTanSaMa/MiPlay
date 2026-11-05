@@ -19,6 +19,7 @@ public struct WineVersionInfo: Sendable, Identifiable, Hashable {
     public let sourceID: String
     public let policyRevision: String
     public let assetName: String
+    public let expectedSHA256: String?
     public var isDownloaded: Bool
     public var isSelected: Bool
 
@@ -32,6 +33,7 @@ public struct WineVersionInfo: Sendable, Identifiable, Hashable {
         sourceID: String = "officialGitHub",
         policyRevision: String = "2026-08-03",
         assetName: String = "",
+        expectedSHA256: String? = nil,
         isDownloaded: Bool = false,
         isSelected: Bool = false
     ) {
@@ -44,6 +46,7 @@ public struct WineVersionInfo: Sendable, Identifiable, Hashable {
         self.sourceID = sourceID
         self.policyRevision = policyRevision
         self.assetName = assetName
+        self.expectedSHA256 = expectedSHA256
         self.isDownloaded = isDownloaded
         self.isSelected = isSelected
     }

@@ -6,8 +6,6 @@ struct GameNewsPanel: View {
     let imageCache: NewsBannerImageCache
     @State private var model: GameNewsViewModel
     @Environment(\.openURL) private var openURL
-    @Environment(\.colorSchemeContrast) private var contrast
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     init(game: GameType, provider: any GameNewsProviding, imageCache: NewsBannerImageCache) {
         self.game = game
@@ -44,21 +42,10 @@ struct GameNewsPanel: View {
             }
             .padding(12)
         }
-        .background {
-            if reduceTransparency || contrast == .increased {
-                Color(white: 0.08)
-            } else {
-                Rectangle().fill(.regularMaterial)
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(.white.opacity(contrast == .increased ? 0.5 : 0.15), lineWidth: 0.75)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-        }
-        .environment(\.colorScheme, .dark)
+        // Clip the artwork itself while allowing the glass surface to draw its
+        // own edge and refraction outside the panel's content.
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .modifier(DarkGlassSurface(interactive: false))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(game.displayName)游戏新闻")
         .task(id: game) {
@@ -202,7 +189,7 @@ private struct NewsBannerCarousel: View {
                 .font(.body.weight(.semibold))
                 .frame(width: 32, height: 36)
                 .foregroundStyle(.white)
-                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+                .modifier(DarkGlassSurface())
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

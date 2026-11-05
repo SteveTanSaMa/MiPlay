@@ -91,6 +91,7 @@ public actor LaunchOrchestrator {
     private var activeStagedGameFiles: [LaunchCompatibilityEnvironment.StagedGameFile] = []
     private var activeApplication: ActiveApplication?
     private var processMonitorTask: (sessionID: UUID, task: Task<Void, Never>)?
+    private var lsfgPreparationTask: Task<LSFGLaunchEnvironment.Plan?, Error>?
 
     public init(
         preLaunchValidator: PreLaunchValidator,
@@ -223,8 +224,8 @@ public actor LaunchOrchestrator {
                 // Source: Docs/05-implementation/implementation-notes.md
                 // -> Launch Compatibility Environment -> staged before spawn.
                 let environmentSettings = await wineVersionManager.gameEnvironmentSettings()
-                let wantsVendorExtensions = (environmentSettings.dlssCompatibility || game.type == .honkaiStarRail)
-                    && GameEnvironmentSettings.supportsDLSSCompatibility
+                let launchProfile = LaunchCompatibilityEnvironment.profile(for: game.type)
+                let wantsVendorExtensions = environmentSettings.dlssCompatibility || launchProfile.requiresVendorExtensions
                 let staging = LaunchCompatibilityEnvironment.stage(
                     gameType: game.type,
                     gameDirectory: URL(fileURLWithPath: resolvedURL.path, isDirectory: true),
@@ -237,13 +238,13 @@ public actor LaunchOrchestrator {
                 guard missingLaunchAssets.isEmpty else {
                     throw LaunchError.wineEnvironmentError("启动兼容组件缺失或安装失败: \(missingLaunchAssets.joined(separator: ", "))")
                 }
-                if game.type == .honkaiStarRail, wantsVendorExtensions, !staging.vendorExtensionsReady {
+                if launchProfile.requiresVendorExtensions, wantsVendorExtensions, !staging.vendorExtensionsReady {
                     throw LaunchError.wineEnvironmentError("崩铁所需的 NV 扩展组件安装失败")
                 }
-                if game.type != .genshinImpact {
+                if launchProfile.cleansWebviewRegistry {
                     try await GameLaunchPreparation.fixWebview(gameType: game.type, wineBinary: wineBinary, prefix: prefix, processManager: processManager)
                 }
-                if game.type == .honkaiStarRail, staging.vendorExtensionsReady {
+                if launchProfile.usesStarRailVendorRegistry, staging.vendorExtensionsReady {
                     try await GameLaunchPreparation.prepareStarRailVendorRegistry(wineBinary: wineBinary, prefix: prefix, processManager: processManager)
                 }
                 await logWriter.record(.init(
@@ -312,18 +313,16 @@ public actor LaunchOrchestrator {
                     environment[key] = value
                 }
                 var vendorSettings = environmentSettings
-                if game.type == .honkaiStarRail { vendorSettings.dlssCompatibility = true }
+                if launchProfile.requiresVendorExtensions { vendorSettings.dlssCompatibility = true }
                 for (key, value) in vendorSettings.vendorExtensionEnvironment(assetsReady: staging.vendorExtensionsReady) {
                     environment[key] = value
                 }
+                environment = ManagedWineLocale.environment(adding: environment)
 
-                if game.type == .honkaiStarRail {
-                    try await GameLaunchPreparation.beginStarRailNetworkWindow(processManager: processManager)
-                    try Task.checkCancellation()
-                }
                 // Xcode 注入的 `MTL_*` / `METAL_*`（Metal API 校验、帧捕获等）
-                // 会被 ProcessManager 在建子进程时剔除；这里记录一次剔除事实，
-                // 便于从日志判断游戏是否运行在调试环境里。
+                // 会从准备的环境中剔除；NSWorkspace 还会叠加继承环境，由
+                // GameLauncher 执行 Wine 前再次清理。此处仅记录准备工作，
+                // 不把字典过滤误报成实际游戏已经离开 Metal 调试层。
                 let developmentOnlyVariables = ProcessManager.developmentOnlyMetalVariables(
                     in: ProcessInfo.processInfo.environment
                 )
@@ -334,11 +333,11 @@ public actor LaunchOrchestrator {
                         eventName: "launch.environment",
                         operationID: operationID,
                         gameID: game.id,
-                        phase: "sanitized",
+                        phase: "prepared",
                         result: "completed",
-                        messageCode: "launch.environment_sanitized",
+                        messageCode: "launch.environment_sanitization_prepared",
                         fields: [
-                            "reasonCode": "metalDebugVariablesRemoved",
+                            "reasonCode": "metalDebugVariablesExcludedFromPreparedEnvironment",
                             "itemCount": String(developmentOnlyVariables.count)
                         ]
                     ))
@@ -346,15 +345,57 @@ public actor LaunchOrchestrator {
 
                 await logWriter.info("执行 Wine binary 启动游戏进程", module: "LaunchOrchestrator")
                 let supportDirectory = await fileSystemRepository.appSupportDirectory()
+                let lsfgSettings = try await wineVersionManager.lsfgSettings(for: game.id)
+                try Task.checkCancellation()
+                guard !isCancellationRequested() else { throw CancellationError() }
+                let preparation = Task { [processManager] in
+                    try await LSFGLaunchEnvironment.prepare(
+                        settings: lsfgSettings, wine: URL(fileURLWithPath: wineBinary),
+                        support: supportDirectory, session: operationID, processManager: processManager
+                    )
+                }
+                lsfgPreparationTask = preparation
+                let lsfgPlan: LSFGLaunchEnvironment.Plan?
+                do {
+                    lsfgPlan = try await withTaskCancellationHandler {
+                        try await preparation.value
+                    } onCancel: {
+                        preparation.cancel()
+                    }
+                } catch {
+                    lsfgPreparationTask = nil
+                    if isCancellationRequested() { throw CancellationError() }
+                    throw error
+                }
+                lsfgPreparationTask = nil
+                guard !isCancellationRequested() else { throw LaunchError.cancelled }
+                environment = LSFGLaunchEnvironment.removingInjection(from: environment)
+                if let lsfgPlan {
+                    await logWriter.record(.init(
+                        level: .info, module: "LaunchOrchestrator", eventName: "launch.lsfg",
+                        operationID: operationID, gameID: game.id, phase: "preflight",
+                        result: "prepared", messageCode: "launch.lsfg_prepared",
+                        fields: ["component": lsfgPlan.component.identity,
+                                 "multiplier": String(lsfgSettings.multiplier),
+                                 "logPath": lsfgPlan.log.path,
+                                 "status": "requested; actual presentation is recorded by LSFGM_METAL_STATS"]
+                    ))
+                }
                 let appBundle = LaunchCompatibilityEnvironment.prepareAppBundle(
                     gameType: game.type,
                     assetRootURL: supportDirectory.appendingPathComponent("RuntimeAssets", isDirectory: true)
                 )
+                // This short compatibility window must begin after shader
+                // compilation/preflight, immediately before spawning the game.
+                if launchProfile.usesStarRailNetworkWindow {
+                    try await GameLaunchPreparation.beginStarRailNetworkWindow(processManager: processManager)
+                    try Task.checkCancellation()
+                }
                 var applicationLaunch: (bundle: LaunchCompatibilityEnvironment.LaunchAppBundle, pid: pid_t)?
                 if let appBundle, await isManagedRuntimeLayout(runtime.rootURL) {
                     // 与直接子进程路径共用同一个环境边界（剔除开发调试用的
                     // Metal 变量），再补上 GameLauncher 需要的三个路径。
-                    var environmentOverrides = environment
+                    var environmentOverrides = lsfgPlan?.applying(to: environment, entry: .universalLauncher) ?? environment
                     environmentOverrides["MIPLAY_LAUNCH_LOG"] = appBundle.logURL.path
                     environmentOverrides["MIPLAY_LAUNCH_STATUS"] = appBundle.statusURL.path
                     environmentOverrides["MIPLAY_LAUNCH_CWD"] = resolvedURL.path
@@ -368,7 +409,10 @@ public actor LaunchOrchestrator {
                             statusURL: appBundle.statusURL
                         )
                         applicationLaunch = (appBundle, applicationPid)
+                    } catch is CancellationError {
+                        throw CancellationError()
                     } catch {
+                        guard !isCancellationRequested() else { throw CancellationError() }
                         // 具名应用启动不可用（仅影响进程命名）：回退到直接子进程路径。
                         await logWriter.warning(
                             "具名应用启动不可用，回退直接子进程启动: \(error.localizedDescription)",
@@ -408,10 +452,13 @@ public actor LaunchOrchestrator {
                     // lifetime boundary as the named LaunchServices bundle.
                     let helper = Bundle.main.resourceURL?.appendingPathComponent("GameLauncher")
                     let useHelper = environment["MIPLAY_WAIT_WINESERVER"] != nil && helper.map { FileManager.default.isExecutableFile(atPath: $0.path) } == true
+                    let directEnvironment = lsfgPlan?.applying(
+                        to: environment, entry: useHelper ? .universalLauncher : .directWine
+                    ) ?? environment
                     let launchedProcessID = try await processManager.launch(
                         executablePath: useHelper ? helper!.path : wineBinary,
                         arguments: useHelper ? [wineBinary] + arguments : arguments,
-                        environment: environment,
+                        environment: directEnvironment,
                         workingDirectory: resolvedURL.path,
                         captureOutput: true
                     )
@@ -516,6 +563,7 @@ public actor LaunchOrchestrator {
 
     public func cancelLaunch() async {
         cancellationRequested = true
+        lsfgPreparationTask?.cancel()
         guard let processID = currentLaunchProcessID else { return }
         do {
             try await cleanup(processID: processID, gameID: currentGameID)

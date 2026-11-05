@@ -11,8 +11,14 @@ import Foundation
 // Source: Architecture Design -> State Ownership -> Game state owner
 // Source: Architecture Design -> Communication -> bookmark location flow
 
-/// Actor owning the three fixed Game aggregates and their committed facts.
+/// Actor owning the built-in Game aggregates and their committed facts.
 public actor GameRegistry {
+    /// Versions before catalog tracking shipped with exactly these games.
+    /// Keep this baseline fixed when adding future games so users upgrading
+    /// across multiple releases still receive newly introduced entries.
+    private nonisolated static let legacyBuiltInGameTypes = [
+        "GenshinImpact", "HonkaiStarRail", "ZenlessZoneZero"
+    ]
     public enum RegistrationError: Error, LocalizedError {
         case gameAlreadyExists(GameType)
         case gameNotFound(String)
@@ -96,20 +102,62 @@ public actor GameRegistry {
                 return
             }
 
-            if data.games.isEmpty {
+            var catalogMigrationFailure: Error?
+            // Other services can write an otherwise empty AppData before the
+            // registry initializes. Preserve the original first-run behavior
+            // for such legacy snapshots, while a tracked empty library means
+            // the user deliberately removed every built-in game.
+            if loaded.state == .initialData || (data.games.isEmpty && data.knownBuiltInGameTypes == nil) {
+                let previousGames = games
                 games = Self.defaultGames()
-                try await persistLibrary()
-            } else {
-                var needsMigrationWrite = false
-                games = data.games.map { game in
-                    var migrated = game
-                    if game.location?.resolutionState == .migrationRequired {
-                        needsMigrationWrite = true
-                        migrated.state = .notInstalled
-                    }
-                    return migrated
+                do {
+                    try await persistLibrary(knownBuiltInGameTypes: GameType.allCases.map(\.rawValue))
+                } catch {
+                    games = previousGames
+                    throw error
                 }
-                if needsMigrationWrite { try await persistLibrary() }
+            } else {
+                // Existing libraries may intentionally omit a supported game.
+                // Only games introduced since the last recorded catalog are
+                // appended; a deleted older game must stay deleted.
+                let oldCatalog = data.knownBuiltInGameTypes ?? Self.legacyBuiltInGameTypes
+                let seenTypes = Set(oldCatalog)
+                let existingTypes = Set(data.games.map { $0.type.rawValue })
+                let existingIDs = Set(data.games.map(\.id))
+                let newDefaults = Self.defaultGames().filter {
+                    !seenTypes.contains($0.type.rawValue) && !existingTypes.contains($0.type.rawValue)
+                }
+                if let collision = newDefaults.first(where: { existingIDs.contains($0.id) }) {
+                    games = data.games
+                    catalogMigrationFailure = RegistrationError.recoveryRequired("新游戏的标识已被现有记录占用：\(collision.id)")
+                } else {
+                    var needsMigrationWrite = data.knownBuiltInGameTypes == nil || !newDefaults.isEmpty
+                    var updatedCatalog = oldCatalog
+                    for game in Self.defaultGames() where !seenTypes.contains(game.type.rawValue) {
+                        updatedCatalog.append(game.type.rawValue)
+                        needsMigrationWrite = true
+                    }
+                    games = data.games.map { game in
+                        var migrated = game
+                        if game.location?.resolutionState == .migrationRequired {
+                            needsMigrationWrite = true
+                            migrated.state = .notInstalled
+                        }
+                        return migrated
+                    }
+                    games.append(contentsOf: newDefaults)
+                    if needsMigrationWrite {
+                        do { try await persistLibrary(knownBuiltInGameTypes: updatedCatalog) }
+                        catch {
+                            // Recovery of a previously running game is more
+                            // urgent than catalog migration. Use only durable
+                            // original facts while creating recovery guards,
+                            // then surface this failure if recovery is clear.
+                            games = data.games
+                            catalogMigrationFailure = error
+                        }
+                    }
+                }
             }
             let restartRecovery = try await reconcileInterruptedLaunches()
             if let firstRecovery = restartRecovery.first {
@@ -118,10 +166,19 @@ public actor GameRegistry {
                     "发现未完成的游戏进程恢复: \(firstRecovery.detail)",
                     module: "GameRegistry"
                 )
+            } else if let catalogMigrationFailure {
+                throw catalogMigrationFailure
             } else {
                 libraryState = .loaded
             }
             await logWriter.info("游戏库已加载: \(games.count) 款游戏", module: "GameRegistry")
+        } catch let error as RegistrationError {
+            if case .recoveryRequired(let detail) = error {
+                libraryState = .recoveryRequired(detail)
+            } else {
+                libraryState = .loadingFailed(error.localizedDescription)
+            }
+            await logWriter.error("游戏库加载失败: \(error.localizedDescription)", module: "GameRegistry")
         } catch let error as PersistenceStore.StoreError {
             libraryState = .recoveryRequired(error.localizedDescription)
             await logWriter.error("游戏库恢复失败: \(error.localizedDescription)", module: "GameRegistry")
@@ -164,11 +221,14 @@ public actor GameRegistry {
 
     // MARK: - Persistence and events
 
-    internal func persistLibrary() async throws {
+    internal func persistLibrary(knownBuiltInGameTypes: [String]? = nil) async throws {
         do {
             let gamesSnapshot = games
             try await persistenceStore.updateAppData { appData in
                 appData.games = gamesSnapshot
+                if let knownBuiltInGameTypes {
+                    appData.knownBuiltInGameTypes = knownBuiltInGameTypes
+                }
             }
         } catch {
             await logWriter.error("游戏库持久化失败: \(error.localizedDescription)", module: "GameRegistry")

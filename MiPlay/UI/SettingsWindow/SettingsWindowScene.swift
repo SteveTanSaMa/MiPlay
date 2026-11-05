@@ -26,9 +26,9 @@ struct SettingsWindowScene: View {
                     sidebarRow(.wineEnvironment)
                 }
                 Section("游戏") {
-                    sidebarRow(.gameGenshin)
-                    sidebarRow(.gameStarRail)
-                    sidebarRow(.gameZZZ)
+                    ForEach(SettingsSidebarItem.gameItems, id: \.self) { item in
+                        sidebarRow(item)
+                    }
                 }
                 sidebarRow(.about)
             }
@@ -61,40 +61,48 @@ struct SettingsWindowScene: View {
     }
 
     private func sidebarRow(_ item: SettingsSidebarItem) -> some View {
-        Label(item.rawValue, systemImage: item.icon)
+        Label(item.sidebarTitle, systemImage: item.icon)
             .tag(item)
     }
 }
 
 // MARK: - Sidebar
 
-enum SettingsSidebarItem: String, CaseIterable, Hashable {
-    // Source: P2-014 — Settings Sidebar 对齐 ADR 020（6 Pane / 240pt）
-    case general = "通用"
-    case gameGenshin = "原神"
-    case gameStarRail = "星穹铁道"
-    case gameZZZ = "绝区零"
-    case wineEnvironment = "Wine 环境"
-    case about = "关于"
+enum SettingsSidebarItem: Hashable {
+    case general
+    case game(GameType)
+    case wineEnvironment
+    case about
+
+    /// Only games explicitly included in the built-in catalog appear here.
+    static var gameItems: [SettingsSidebarItem] { GameType.allCases.map(Self.game) }
 
     var icon: String {
         switch self {
         case .general: return "gearshape"
-        case .gameGenshin: return "wind"
-        case .gameStarRail: return "star"
-        case .gameZZZ: return "bolt.fill"
+        case .game(let game): return game.definition.symbolName
         case .wineEnvironment: return "wineglass"
         case .about: return "info.circle"
         }
     }
 
-    var title: String { gameType?.displayName ?? rawValue }
+    var title: String {
+        switch self {
+        case .general: return "通用"
+        case .game(let game): return game.displayName
+        case .wineEnvironment: return "Wine 环境"
+        case .about: return "关于"
+        }
+    }
+
+    var sidebarTitle: String {
+        if case .game(let game) = self { return game.definition.settingsSidebarTitle }
+        return title
+    }
 
     var gameType: GameType? {
         switch self {
-        case .gameGenshin: return .genshinImpact
-        case .gameStarRail: return .honkaiStarRail
-        case .gameZZZ: return .zenlessZoneZero
+        case .game(let game): return game
         default: return nil
         }
     }
@@ -126,13 +134,11 @@ struct SettingsDetailView: View {
             switch selectedItem {
             case .general:
                 GeneralSettingsView(settingsViewModel: settingsViewModel)
-            case .gameGenshin, .gameStarRail, .gameZZZ:
-                if let gameType = selectedItem.gameType {
-                    GameSettingsView(
-                        settingsViewModel: settingsViewModel,
-                        gameType: gameType
-                    )
-                }
+            case .game(let gameType):
+                GameSettingsView(
+                    settingsViewModel: settingsViewModel,
+                    gameType: gameType
+                )
             case .wineEnvironment:
                 WineSettingsView(settingsViewModel: settingsViewModel)
             case .about:

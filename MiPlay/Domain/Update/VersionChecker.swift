@@ -18,12 +18,6 @@ public actor VersionChecker {
         string: "https://hyp-api.mihoyo.com/hyp/hyp-connect/api/getGameBranches?launcher_id=jGHBHlcOq1&language=zh-cn"
     )!
 
-    private static let remoteGameIDs: [GameType: String] = [
-        .genshinImpact: "1Z8W5NHUQb",
-        .honkaiStarRail: "64kMb5iAWu",
-        .zenlessZoneZero: "x6znKlJ0xK"
-    ]
-
     private struct RemoteVersionEvidence: Sendable {
         let version: String
         let channel: String?
@@ -58,7 +52,11 @@ public actor VersionChecker {
         self.gameRegistry = gameRegistry
     }
 
-    public func checkVersion(for game: Game, fileVerification: Bool = false) async throws -> VersionCheckResult {
+    public func checkVersion(
+        for game: Game,
+        fileVerification: Bool = false,
+        verificationProgress: (@Sendable (Double) async throws -> Void)? = nil
+    ) async throws -> VersionCheckResult {
         guard let location = game.location, location.bookmarkData != nil else {
             throw VersionError.versionFileMissing("游戏目录尚未获得有效授权")
         }
@@ -79,7 +77,8 @@ public actor VersionChecker {
             installPath: access.url.path,
             gameID: game.id,
             locationRevision: access.resolvedLocation.bookmarkVersion,
-            fileVerification: fileVerification
+            fileVerification: fileVerification,
+            verificationProgress: verificationProgress
         )
     }
 
@@ -92,14 +91,16 @@ public actor VersionChecker {
     internal func checkVersion(
         for gameType: GameType,
         installPath: String,
-        fileVerification: Bool = false
+        fileVerification: Bool = false,
+        verificationProgress: (@Sendable (Double) async throws -> Void)? = nil
     ) async throws -> VersionCheckResult {
         try await checkVersion(
             for: gameType,
             installPath: installPath,
             gameID: nil,
             locationRevision: nil,
-            fileVerification: fileVerification
+            fileVerification: fileVerification,
+            verificationProgress: verificationProgress
         )
     }
 
@@ -108,7 +109,8 @@ public actor VersionChecker {
         installPath: String,
         gameID: String?,
         locationRevision: Int?,
-        fileVerification: Bool
+        fileVerification: Bool,
+        verificationProgress: (@Sendable (Double) async throws -> Void)?
     ) async throws -> VersionCheckResult {
         let operationID = UUID()
         await logWriter.record(.init(
@@ -126,7 +128,8 @@ public actor VersionChecker {
             installPath: installPath,
             gameID: gameID,
             locationRevision: locationRevision,
-            fileVerification: fileVerification
+            fileVerification: fileVerification,
+            verificationProgress: verificationProgress
         )
         let remote = try await fetchLatestVersion(for: gameType)
         var conflicts: [String] = []
@@ -235,7 +238,8 @@ public actor VersionChecker {
         installPath: String,
         gameID: String?,
         locationRevision: Int?,
-        fileVerification: Bool
+        fileVerification: Bool,
+        verificationProgress: (@Sendable (Double) async throws -> Void)?
     ) async throws -> LocalEvidence {
         let url = URL(fileURLWithPath: installPath, isDirectory: true)
             .appendingPathComponent(gameType.versionFileRelativePath)
@@ -288,6 +292,9 @@ public actor VersionChecker {
         let entries = try await parsePkgVersion(
             at: URL(fileURLWithPath: installPath, isDirectory: true)
         )
+        if fileVerification && entries.isEmpty {
+            throw VersionError.versionFileMissing("缺少 pkg_version 文件清单，无法校验游戏文件")
+        }
         // 逐文件 MD5 校验在两种情况下执行：显式请求（用户在设置里点"校验文件
         // 完整性"）或配置了校验清单。常规版本检查只比较声明版本，避免每次
         // 启动都全量扫盘（原神 2743 个条目 ≈ 4.5 分钟 I/O）。
@@ -295,7 +302,8 @@ public actor VersionChecker {
         let pkgValidationErrors = performsFileVerification
             ? try await validatePkgVersionEntries(
                 at: URL(fileURLWithPath: installPath, isDirectory: true),
-                entries: entries
+                entries: entries,
+                progress: verificationProgress
             )
             : []
         let mapping: PkgVersionMappingStatus
@@ -389,30 +397,44 @@ public actor VersionChecker {
     /// lease is still active. This does not replace manifest verification.
     private func validatePkgVersionEntries(
         at installURL: URL,
-        entries: [PkgVersionEntry]
+        entries: [PkgVersionEntry],
+        progress: (@Sendable (Double) async throws -> Void)?
     ) async throws -> [String] {
         var errors: [String] = []
+        guard !entries.isEmpty else { return errors }
+        let reporter = VerificationProgressReporter(
+            total: entries.reduce(0.0) { $0 + max(1, Double($1.fileSize)) },
+            callback: progress
+        )
+        try await reporter.start()
         for entry in entries {
             try Task.checkCancellation()
+            await reporter.beginFile(weight: max(1, Double(entry.fileSize)))
             let fileURL = installURL.appendingPathComponent(entry.remoteName).standardizedFileURL
-            guard fileURL.path.hasPrefix(installURL.standardizedFileURL.path + "/") else {
+            if !fileURL.path.hasPrefix(installURL.standardizedFileURL.path + "/") {
                 errors.append("pkg_version 路径越界: \(entry.remoteName)")
-                continue
-            }
-            do {
-                let actualSize = try await fileSystemRepository.fileSize(at: fileURL.path)
-                guard actualSize == UInt64(entry.fileSize) else {
-                    errors.append("pkg_version 大小不匹配: \(entry.remoteName)")
-                    continue
+            } else {
+                do {
+                    let actualSize = try await fileSystemRepository.fileSize(at: fileURL.path)
+                    if actualSize != UInt64(entry.fileSize) {
+                        errors.append("pkg_version 大小不匹配: \(entry.remoteName)")
+                    } else {
+                        let actualMD5 = try await fileSystemRepository.calculateMD5Streaming(of: fileURL.path) { bytes in
+                            try await reporter.advance(bytes: bytes)
+                        }
+                        if actualMD5.caseInsensitiveCompare(entry.md5) != .orderedSame {
+                            errors.append("pkg_version MD5 不匹配: \(entry.remoteName)")
+                        }
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let error as VerificationProgressError {
+                    throw error.underlying
+                } catch {
+                    errors.append("pkg_version 文件无法验证: \(entry.remoteName): \(error.localizedDescription)")
                 }
-                let actualMD5 = try await fileSystemRepository.calculateMD5(of: fileURL.path)
-                guard actualMD5.caseInsensitiveCompare(entry.md5) == .orderedSame else {
-                    errors.append("pkg_version MD5 不匹配: \(entry.remoteName)")
-                    continue
-                }
-            } catch {
-                errors.append("pkg_version 文件无法验证: \(entry.remoteName): \(error.localizedDescription)")
             }
+            try await reporter.finishFile()
         }
         return errors
     }
@@ -428,8 +450,7 @@ public actor VersionChecker {
         do {
             let data = try await networkProvider.requestData(from: remoteManifestURL)
             if let branchesResponse = try? JSONDecoder().decode(HoyoPlayBranchesResponse.self, from: data),
-               let gameID = Self.remoteGameIDs[gameType],
-               let branch = branchesResponse.data.gameBranches.first(where: { $0.game.id == gameID }) {
+               let branch = branchesResponse.data.gameBranches.first(where: { $0.game.id == gameType.definition.mainlandGameID }) {
                 guard isVersion(branch.main.tag) else {
                     throw VersionError.versionParseFailed(branch.main.tag)
                 }
@@ -497,6 +518,55 @@ public actor VersionChecker {
             if currentValue != latestValue { return latestValue > currentValue }
         }
         return false
+    }
+}
+
+private struct VerificationProgressError: Error {
+    let underlying: any Error
+}
+
+/// Progress describes manifest bytes processed, including missing or mismatched
+/// files after their error has been recorded. Empty files each receive one unit.
+private actor VerificationProgressReporter {
+    let total: Double
+    let callback: (@Sendable (Double) async throws -> Void)?
+    var completed = 0.0
+    var fileRemaining = 0.0
+    var lastPercent = 0
+
+    init(total: Double, callback: (@Sendable (Double) async throws -> Void)?) {
+        self.total = total
+        self.callback = callback
+    }
+
+    func start() async throws { try await report(0) }
+    func beginFile(weight: Double) { fileRemaining = weight }
+
+    func advance(bytes: Int) async throws {
+        let amount = min(fileRemaining, Double(bytes))
+        completed += amount
+        fileRemaining -= amount
+        try await reportIfNeeded()
+    }
+
+    func finishFile() async throws {
+        completed += fileRemaining
+        fileRemaining = 0
+        try await reportIfNeeded()
+    }
+
+    private func reportIfNeeded() async throws {
+        let fraction = min(1, completed / total)
+        let percent = Int(fraction * 100)
+        if percent > lastPercent {
+            try await report(fraction)
+            lastPercent = percent
+        }
+    }
+
+    private func report(_ fraction: Double) async throws {
+        do { try await callback?(fraction) }
+        catch { throw VerificationProgressError(underlying: error) }
     }
 }
 

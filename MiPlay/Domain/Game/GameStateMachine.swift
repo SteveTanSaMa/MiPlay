@@ -38,6 +38,7 @@ public struct GameStateMachine: Sendable {
 
         // Installed → *
         case (.installed, .updateAvailable): return true
+        case (.installed, .gameUpdating): return true
         case (.installed, .launching): return true
         case (.installed, .launchFailed): return true
         case (.installed, .notInstalled): return true
@@ -50,6 +51,8 @@ public struct GameStateMachine: Sendable {
         // GameUpdating → *
         case (.gameUpdating, .installed): return true
         case (.gameUpdating, .updateAvailable): return true
+        // Rolling back a first installation can leave no executable.
+        case (.gameUpdating, .notInstalled): return true
 
         // Launching → *
         case (.launching, .running): return true
@@ -58,11 +61,13 @@ public struct GameStateMachine: Sendable {
 
         // Running → *
         case (.running, .installed): return true  // 正常退出
+        case (.running, .updateAvailable): return true // 运行期间已验证新版本
         case (.running, .launchFailed): return true // 异常崩溃
 
         // LaunchFailed → *
         case (.launchFailed, .installed): return true
         case (.launchFailed, .updateAvailable): return true
+        case (.launchFailed, .gameUpdating): return true
         case (.launchFailed, .notInstalled): return true
         case (.launchFailed, .launching): return true // 修复后重试
 

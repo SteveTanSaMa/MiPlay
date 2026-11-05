@@ -4,6 +4,140 @@ import Darwin
 @testable import MiPlay
 
 @MainActor extension MiPlayCoreTests {
+    func testApplicationLaunchReceiptRequiresCurrentTokenAndHelperProcessGroup() throws {
+        let token = UUID()
+        let text = "v1:\(token.uuidString):4321:4321\n"
+        let receipt = try XCTUnwrap(ApplicationLauncher.LaunchReceipt(contents: text, expectedToken: token))
+        XCTAssertEqual(receipt.pid, 4321)
+        XCTAssertTrue(receipt.matches(observedProcessGroup: 4321, hasTerminalStatus: false))
+        XCTAssertFalse(receipt.matches(observedProcessGroup: 4320, hasTerminalStatus: true))
+        XCTAssertFalse(receipt.matches(observedProcessGroup: nil, hasTerminalStatus: false))
+        XCTAssertTrue(receipt.matches(observedProcessGroup: nil, hasTerminalStatus: true))
+        XCTAssertNil(ApplicationLauncher.LaunchReceipt(contents: text, expectedToken: UUID()))
+        for invalid in [
+            "", "v2:\(token):4321:4321", "v1:\(token):0:0", "v1:\(token):1:1",
+            "v1:\(token):-1:-1", "v1:\(token):4322:4321", "v1:\(token):+4321:+4321",
+            "v1:\(token):999999999999:999999999999", "v1:\(token):4321:4321:extra",
+            "v1:\(token):4321:4321\nv1:\(token):4322:4322"
+        ] {
+            XCTAssertNil(ApplicationLauncher.LaunchReceipt(contents: invalid, expectedToken: token), invalid)
+        }
+    }
+
+    func testApplicationLaunchReceiptRejectsLinksAndAcceptanceFailureNeverPublishes() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let receipt = root.appendingPathComponent("launch.pid")
+        XCTAssertNil(try ApplicationLauncher.readLaunchReceipt(at: receipt))
+        let token = UUID()
+        let text = "v1:\(token):4321:4321\n"
+        try Data(text.utf8).write(to: receipt)
+        XCTAssertEqual(try ApplicationLauncher.readLaunchReceipt(at: receipt), text)
+        let link = root.appendingPathComponent("linked.pid")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: receipt)
+        XCTAssertThrowsError(try ApplicationLauncher.readLaunchReceipt(at: link))
+        XCTAssertThrowsError(try ApplicationLauncher.readLaunchReceipt(at: root))
+        try Data(repeating: 65, count: 257).write(to: receipt)
+        XCTAssertThrowsError(try ApplicationLauncher.readLaunchReceipt(at: receipt))
+
+        let acceptance = root.appendingPathComponent("launch.pid.accepted")
+        let temporary = URL(fileURLWithPath: acceptance.path + ".tmp")
+        try Data("occupied".utf8).write(to: temporary)
+        XCTAssertThrowsError(try ApplicationLauncher.publishLaunchAcceptance(token: token, at: acceptance))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: acceptance.path))
+        XCTAssertEqual(try String(contentsOf: temporary, encoding: .utf8), "occupied")
+        try FileManager.default.removeItem(at: temporary)
+        try ApplicationLauncher.publishLaunchAcceptance(token: token, at: acceptance)
+        XCTAssertEqual(try String(contentsOf: acceptance, encoding: .utf8), token.uuidString + "\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.path))
+    }
+
+    func testGameLauncherHandshakeWaitsForAcceptanceAndTracksFastExit() async throws {
+        let launcherURL = try XCTUnwrap(Bundle.main.url(forResource: "GameLauncher", withExtension: nil))
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let token = UUID()
+        let receiptURL = root.appendingPathComponent("launch.pid")
+        let status = root.appendingPathComponent("launch.status")
+        let log = root.appendingPathComponent("launch.log")
+        let marker = root.appendingPathComponent("child-started")
+        let manager = ProcessManager()
+        let processID = try await manager.launch(
+            executablePath: launcherURL.path,
+            arguments: ["/bin/sh", "-c", "test -z \"$MIPLAY_LAUNCH_TOKEN\" && test -z \"$MIPLAY_LAUNCH_PID_FILE\" && printf started > \"$MIPLAY_TEST_MARKER\""],
+            environment: ["MIPLAY_LAUNCH_PID_FILE": receiptURL.path, "MIPLAY_LAUNCH_TOKEN": token.uuidString,
+                          "MIPLAY_LAUNCH_STATUS": status.path, "MIPLAY_LAUNCH_LOG": log.path,
+                          "MIPLAY_TEST_MARKER": marker.path], captureOutput: true
+        )
+        let deadline = ContinuousClock.now + .seconds(3)
+        while !FileManager.default.fileExists(atPath: receiptURL.path), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let receipt = try XCTUnwrap(ApplicationLauncher.LaunchReceipt(
+            contents: try XCTUnwrap(ApplicationLauncher.readLaunchReceipt(at: receiptURL)), expectedToken: token
+        ))
+        guard case .running(let ownedPID) = await manager.status(processID: processID) else {
+            return XCTFail("Helper exited before receiving launch acceptance")
+        }
+        XCTAssertEqual(receipt.pid, ownedPID)
+        XCTAssertEqual(getpgid(receipt.pid), ownedPID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: status.path))
+        let acceptance = URL(fileURLWithPath: receiptURL.path + ".accepted")
+        try ApplicationLauncher.publishLaunchAcceptance(token: token, at: acceptance)
+        let result = try await manager.waitForTermination(processID: processID, timeout: 5)
+        XCTAssertEqual(result.statusCode, 0, result.output)
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "started")
+        XCTAssertEqual(ApplicationLauncher().exitResult(logURL: log, statusURL: status).statusCode, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: receiptURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: acceptance.path))
+    }
+
+    func testGameLauncherWithoutValidAcceptanceNeverStartsChildOrOverwritesNewSessionStatus() async throws {
+        let launcherURL = try XCTUnwrap(Bundle.main.url(forResource: "GameLauncher", withExtension: nil))
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = ProcessManager()
+        for sendWrongAcceptance in [true, false] {
+            let token = UUID()
+            let receipt = root.appendingPathComponent("\(token).pid")
+            let acceptance = URL(fileURLWithPath: receipt.path + ".accepted")
+            let marker = root.appendingPathComponent("child-started")
+            let status = root.appendingPathComponent("launch.status")
+            try Data("new-session-status".utf8).write(to: status)
+            if sendWrongAcceptance {
+                try Data((UUID().uuidString + "\n").utf8).write(to: acceptance)
+            }
+            let processID = try await manager.launch(
+                executablePath: launcherURL.path,
+                arguments: ["/bin/sh", "-c", "printf started > \"$MIPLAY_TEST_MARKER\""],
+                environment: ["MIPLAY_LAUNCH_PID_FILE": receipt.path, "MIPLAY_LAUNCH_TOKEN": token.uuidString,
+                              "MIPLAY_LAUNCH_STATUS": status.path, "MIPLAY_TEST_MARKER": marker.path], captureOutput: true
+            )
+            let result = try await manager.waitForTermination(processID: processID, timeout: 15)
+            XCTAssertEqual(result.statusCode, 78, result.output)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: receipt.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: acceptance.path))
+            XCTAssertEqual(try String(contentsOf: status, encoding: .utf8), "new-session-status")
+        }
+    }
+
+    func testApplicationLaunchOfMissingBundleDoesNotPublishAcceptance() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            _ = try await ApplicationLauncher().launch(
+                bundleURL: root.appendingPathComponent("missing.app"), arguments: [], environment: [:],
+                logURL: root.appendingPathComponent("launch.log"), statusURL: root.appendingPathComponent("launch.status")
+            )
+            XCTFail("A missing application must not launch")
+        } catch {
+            let files = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            XCTAssertFalse(files.contains { $0.hasSuffix(".accepted") || $0.hasSuffix(".pid") })
+        }
+    }
+
     func testApplicationMissingOrInvalidExitStatusRemainsUnknown() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

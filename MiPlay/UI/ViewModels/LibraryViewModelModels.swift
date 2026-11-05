@@ -19,6 +19,8 @@ extension LibraryViewModel {
         case locate
         case launch
         case update
+        case resumeDownload
+        case recoverGame
     }
 
     /// 主按钮状态

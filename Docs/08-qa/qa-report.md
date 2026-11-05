@@ -45,12 +45,12 @@ Release 的第一次命令因未启用 `ENABLE_TESTABILITY` 导致测试 module 
 
 ## 证据
 
-- [Debug result bundle](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/QAArtifacts/Debug-20260802-final.xcresult)
-- [Debug log](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/QAArtifacts/Debug-20260802-final.log)
-- [Release arm64 result bundle](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/QAArtifacts/Release-20260802-arm64.xcresult)
-- [Release arm64 log](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/QAArtifacts/Release-20260802-arm64.log)
-- [Release initial build-failure bundle](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/QAArtifacts/Release-20260802-final.xcresult)
-- [Test source](/Users/stevetan/SteveTan/Document/Xcode/MiPlay/MiPlayTests/MiPlayCoreTests.swift)
+- [Debug result bundle](../../QAArtifacts/Debug-20260802-final.xcresult)
+- [Debug log](../../QAArtifacts/Debug-20260802-final.log)
+- [Release arm64 result bundle](../../QAArtifacts/Release-20260802-arm64.xcresult)
+- [Release arm64 log](../../QAArtifacts/Release-20260802-arm64.log)
+- [Release initial build-failure bundle](../../QAArtifacts/Release-20260802-final.xcresult)
+- [Test source](../../MiPlayTests/MiPlayCoreTests.swift)
 
 ## 门禁判定
 

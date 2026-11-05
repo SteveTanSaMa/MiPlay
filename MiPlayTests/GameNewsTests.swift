@@ -2,6 +2,47 @@ import XCTest
 @testable import MiPlay
 
 @MainActor extension MiPlayCoreTests {
+    func testBuiltInGameDefinitionsPreserveOfficialIdentitiesAndExecutableLocations() {
+        let cases: [(GameType, String, String, String, String, String)] = [
+            (.genshinImpact, "GenshinImpact", "1Z8W5NHUQb", "hk4e_cn", "hk4e_global", "YuanShen.exe"),
+            (.honkaiStarRail, "HonkaiStarRail", "64kMb5iAWu", "hkrpg_cn", "hkrpg_global", "StarRail.exe"),
+            (.zenlessZoneZero, "ZenlessZoneZero", "x6znKlJ0xK", "nap_cn", "nap_global", "ZenlessZoneZero.exe")
+        ]
+        for (game, persistedID, gameID, mainlandBiz, globalBiz, executable) in cases {
+            XCTAssertEqual(game.rawValue, persistedID)
+            XCTAssertEqual(game.definition.mainlandGameID, gameID)
+            XCTAssertEqual(game.definition.mainlandBiz, mainlandBiz)
+            XCTAssertEqual(game.definition.globalBiz, globalBiz)
+            XCTAssertEqual(game.definition.mainlandExecutableName, executable)
+            XCTAssertTrue(game.executableNames.contains(executable))
+            XCTAssertTrue(game.executableRelativePaths.contains(executable))
+            XCTAssertEqual(HoYoPlayNewsProvider.identity(for: game).id, gameID)
+            XCTAssertEqual(HoYoPlayNewsProvider.identity(for: game).biz, mainlandBiz)
+            XCTAssertEqual(GameIconProvider.candidateBizIDs(for: game), [mainlandBiz, globalBiz])
+        }
+        XCTAssertEqual(Set(GameType.allCases.map { $0.definition.mainlandGameID }).count, GameType.allCases.count)
+        XCTAssertEqual(Set(GameType.allCases.map { $0.definition.mainlandBiz }).count, GameType.allCases.count)
+        XCTAssertFalse(GameType.genshinImpact.definition.requiresMainlandIdentityConfirmation)
+        XCTAssertTrue(GameType.honkaiStarRail.definition.requiresMainlandIdentityConfirmation)
+        XCTAssertFalse(GameType.zenlessZoneZero.definition.requiresMainlandIdentityConfirmation)
+    }
+
+    func testIconIdentityCandidatesAllowMainlandOnlyGames() {
+        func definition(globalBiz: String?) -> BuiltInGameDefinition {
+            BuiltInGameDefinition(
+                displayName: "test", englishName: "test", settingsSidebarTitle: "test", symbolName: "gamecontroller",
+                mainlandGameID: "test-cn", mainlandBiz: "test_cn", globalBiz: globalBiz,
+                requiresMainlandIdentityConfirmation: false,
+                contentCapabilities: .init(sophonInstall: false, sophonUpdate: false, sophonPredownload: false),
+                officialDownloadURL: nil, mainlandExecutableName: "test.exe",
+                executableNames: ["test.exe"], executableRelativePaths: ["test.exe"],
+                versionFileRelativePath: "config.ini", minimumDiskSpaceRequired: 0
+            )
+        }
+        XCTAssertEqual(GameIconProvider.candidateBizIDs(for: definition(globalBiz: nil)), ["test_cn"])
+        XCTAssertEqual(GameIconProvider.candidateBizIDs(for: definition(globalBiz: "")), ["test_cn"])
+    }
+
     func testNewsDatesSortNewestFirstAcrossNewYear() throws {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!

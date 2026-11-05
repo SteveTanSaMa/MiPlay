@@ -26,6 +26,7 @@ struct WineSettingsView: View {
     private var runtimeSection: some View {
         Section("Wine 运行时") {
             LabeledContent("版本", value: settingsViewModel.fixedRuntimeTag)
+                .settingsRowLayout()
             // 用户指令：来源显示为 GitHub 上该仓库的地址（可点击打开）。
             LabeledContent("来源") {
                 Link(destination: settingsViewModel.wineSourceRepositoryURL) {
@@ -33,7 +34,9 @@ struct WineSettingsView: View {
                 }
                 .help("在浏览器中打开 Wine 运行时仓库")
             }
+            .settingsRowLayout()
             LabeledContent("运行状态", value: settingsViewModel.wineStatus.label)
+                .settingsRowLayout()
                 .accessibilityRepresentation {
                     Text("运行状态：\(settingsViewModel.wineStatus.label)")
                 }
@@ -41,6 +44,7 @@ struct WineSettingsView: View {
                 "共享游戏环境",
                 value: settingsViewModel.sharedPrefixReady ? "已就绪" : "未就绪"
             )
+            .settingsRowLayout()
             .accessibilityRepresentation {
                 Text("共享游戏环境：\(settingsViewModel.sharedPrefixReady ? "已就绪" : "未就绪")")
             }
@@ -55,11 +59,18 @@ struct WineSettingsView: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Button("重试环境准备") {
-                    Task { await settingsViewModel.setupWineRuntime() }
+                HStack {
+                    Spacer()
+                    Button {
+                        Task { await settingsViewModel.setupWineRuntime() }
+                    } label: {
+                        Text("重试环境准备").frame(minWidth: 96)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+                    .disabled(settingsViewModel.activeWineDownloadTag != nil)
                 }
-                .controlSize(.small)
-                .disabled(settingsViewModel.activeWineDownloadTag != nil)
+                .settingsRowLayout()
             }
         }
     }

@@ -115,6 +115,7 @@ public actor MediaCacheManager {
         let contents = try fileManager.contentsOfDirectory(atPath: dir.path)
         var groups: [String] = []
         for item in contents {
+            guard item != ".archive" else { continue }
             let itemURL = dir.appendingPathComponent(item, isDirectory: true)
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: itemURL.path, isDirectory: &isDirectory),
@@ -166,6 +167,30 @@ public actor MediaCacheManager {
         let dir = cacheDirectory().appendingPathComponent("\(gameId)/\(backgroundId)", isDirectory: true)
         if fileManager.fileExists(atPath: dir.path) {
             try fileManager.removeItem(at: dir)
+        }
+    }
+
+    /// 同一组资源更新时整体移入历史目录，保留图片、视频、质量标记与资源身份。
+    @discardableResult
+    public func archiveCache(forGameId gameId: String, backgroundId: String) throws -> URL? {
+        let gameDirectory = cacheDirectory().appendingPathComponent(gameId, isDirectory: true)
+        let source = gameDirectory.appendingPathComponent(backgroundId, isDirectory: true)
+        guard fileManager.fileExists(atPath: source.path) else { return nil }
+        let archiveDirectory = gameDirectory
+            .appendingPathComponent(".archive", isDirectory: true)
+            .appendingPathComponent(backgroundId, isDirectory: true)
+        try fileManager.createDirectory(at: archiveDirectory, withIntermediateDirectories: true)
+        let destination = archiveDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.moveItem(at: source, to: destination)
+        return destination
+    }
+
+    public func clearArchivedCache(forGameId gameId: String) throws {
+        let directory = cacheDirectory()
+            .appendingPathComponent(gameId, isDirectory: true)
+            .appendingPathComponent(".archive", isDirectory: true)
+        if fileManager.fileExists(atPath: directory.path) {
+            try fileManager.removeItem(at: directory)
         }
     }
 

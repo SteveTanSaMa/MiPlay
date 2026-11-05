@@ -5,6 +5,21 @@
 
 import Foundation
 
+/// All supported game clients are mainland builds. Give managed Wine an
+/// explicit locale instead of inheriting the developer shell's C/en locale.
+/// This selects Wine's default language; existing in-game preferences remain
+/// owned by the game and are never rewritten here.
+enum ManagedWineLocale {
+    nonisolated static func environment(adding values: [String: String] = [:]) -> [String: String] {
+        var environment = values
+        for key in ["LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES"] {
+            environment[key] = "zh_CN.UTF-8"
+        }
+        environment["LANGUAGE"] = "zh_CN:zh"
+        return environment
+    }
+}
+
 // Source: Architecture Design -> Service Contract -> WineRuntimeProvider
 // Source: Architecture Design -> ADR 006 -> fixed Wine executable and prefix
 
@@ -115,6 +130,7 @@ public actor WineRuntimeProvider {
             let output = try await processManager.launchAndWait(
                 executablePath: wineBinaryURL.path,
                 arguments: ["--version"],
+                environment: ManagedWineLocale.environment(),
                 timeout: 10
             ).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !output.isEmpty else { throw WineError.environmentNotReady("Wine 版本检测无输出") }
@@ -197,7 +213,7 @@ public actor WineRuntimeProvider {
                         "reg", "add", "HKCU\\Software\\Wine\\Mac Driver",
                         "/v", key, "/t", "REG_SZ", "/d", value, "/f"
                     ],
-                    environment: ["WINEPREFIX": prefixPath],
+                    environment: ManagedWineLocale.environment(adding: ["WINEPREFIX": prefixPath]),
                     workingDirectory: prefixPath,
                     timeout: 15
                 )
@@ -291,7 +307,7 @@ public actor WineRuntimeProvider {
         let processID = try await processManager.launch(
             executablePath: serverURL.path,
             arguments: ["-k"],
-            environment: ["WINEPREFIX": lease.prefix.url.path],
+            environment: ManagedWineLocale.environment(adding: ["WINEPREFIX": lease.prefix.url.path]),
             workingDirectory: lease.prefix.url.path
         )
         let result = try await processManager.waitForTermination(processID: processID, timeout: 10)
@@ -360,10 +376,10 @@ public actor WineRuntimeProvider {
         let prefixExistedBefore = FileManager.default.fileExists(atPath: prefixPath)
         do {
             try FileManager.default.createDirectory(at: prefixURL, withIntermediateDirectories: true)
-            let environment = [
+            let environment = ManagedWineLocale.environment(adding: [
                 "WINEPREFIX": prefixPath,
                 "WINEDLLOVERRIDES": "winemenubuilder.exe=d"
-            ]
+            ])
             _ = try await processManager.launchAndWait(
                 executablePath: wineBinary,
                 arguments: ["wineboot", "-u"],

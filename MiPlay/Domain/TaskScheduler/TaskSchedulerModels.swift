@@ -10,6 +10,9 @@ import Foundation
 
 public enum ScheduledTaskType: String, Codable, Sendable, CaseIterable {
     case gameLaunch = "GameLaunch"
+    case gameInstall = "GameInstall"
+    case gameUpdate = "GameUpdate"
+    case gamePredownload = "GamePredownload"
     case solutionApply = "SolutionApply"
     case solutionRevert = "SolutionRevert"
     case versionCheck = "VersionCheck"
@@ -24,6 +27,9 @@ public enum ScheduledTaskType: String, Codable, Sendable, CaseIterable {
 
     nonisolated public static let allCases: [ScheduledTaskType] = [
         .gameLaunch,
+        .gameInstall,
+        .gameUpdate,
+        .gamePredownload,
         .solutionApply,
         .solutionRevert,
         .versionCheck,
@@ -34,7 +40,7 @@ public enum ScheduledTaskType: String, Codable, Sendable, CaseIterable {
     ]
 
     nonisolated var isBackground: Bool {
-        self == .versionCheck || self == .integrityVerification || self == .backgroundMediaLoad || self == .wineCatalogQuery
+        self == .gamePredownload || self == .versionCheck || self == .integrityVerification || self == .backgroundMediaLoad || self == .wineCatalogQuery
     }
 
     nonisolated var isCancellable: Bool { self != .solutionRevert }
@@ -42,7 +48,7 @@ public enum ScheduledTaskType: String, Codable, Sendable, CaseIterable {
     nonisolated var priority: ScheduledPriority {
         switch self {
         case .gameLaunch: return .userBlocking
-        case .solutionApply, .solutionRevert, .wineVersionDownload, .wineRuntimeSetup, .logExport: return .userInitiated
+        case .gameInstall, .gameUpdate, .gamePredownload, .solutionApply, .solutionRevert, .wineVersionDownload, .wineRuntimeSetup, .logExport: return .userInitiated
         case .versionCheck, .integrityVerification, .backgroundMediaLoad, .wineCatalogQuery: return .background
         }
     }
@@ -78,6 +84,9 @@ public enum TaskCancellationPolicy: String, Codable, Sendable {
 }
 
 public struct ScheduledTask: Codable, Sendable, Identifiable, Equatable {
+    /// Once the installer enters this phase, it must finish committing or
+    /// roll back. Cancellation is no longer an actionable user request.
+    nonisolated public static let sophonCommitPhaseDescription = "正在安装游戏文件（此阶段无法取消）"
     public let id: ScheduledTaskID
     public let intentID: UUID
     public let type: ScheduledTaskType
@@ -96,9 +105,12 @@ public struct ScheduledTask: Codable, Sendable, Identifiable, Equatable {
     public var revision: UInt64
 
     nonisolated public var cancellationPolicy: TaskCancellationPolicy {
+        if (type == .gameInstall || type == .gameUpdate), phaseDescription == Self.sophonCommitPhaseDescription {
+            return .notCancellable
+        }
         switch type {
         case .solutionRevert: return .notCancellable
-        case .gameLaunch, .solutionApply, .wineVersionDownload, .wineRuntimeSetup: return .cleanupAfterSideEffect
+        case .gameLaunch, .gameInstall, .gameUpdate, .gamePredownload, .solutionApply, .wineVersionDownload, .wineRuntimeSetup: return .cleanupAfterSideEffect
         case .versionCheck, .integrityVerification, .backgroundMediaLoad, .wineCatalogQuery, .logExport: return .beforeSideEffect
         }
     }

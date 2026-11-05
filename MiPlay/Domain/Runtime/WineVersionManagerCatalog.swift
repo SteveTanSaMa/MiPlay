@@ -92,6 +92,35 @@ extension WineVersionManager {
         } catch let error as VersionManagerError {
             throw error
         } catch let error as NetworkDownloadProvider.NetworkError {
+            if case .httpError(let statusCode, let message) = error,
+               statusCode == 429 || (statusCode == 403 && Self.isGitHubRateLimit(message)) {
+                // GitHub release assets are served separately from its rate-limited
+                // REST API. This immutable fallback is pinned to the upstream
+                // release's size and SHA-256, which is checked before extraction.
+                let versionsDir = await wineVersionsDirectory()
+                let version = WineVersionInfo(
+                    id: Self.fixedRuntimeTag,
+                    tagName: Self.fixedRuntimeTag,
+                    name: BuiltInWineVersions.source(for: Self.fixedRuntimeTag)?.displayName ?? Self.fixedRuntimeTag,
+                    downloadURL: BuiltInWineVersions.fixedAssetURL,
+                    fileSize: BuiltInWineVersions.fixedAssetSize,
+                    publishedAt: Date(timeIntervalSince1970: 0),
+                    sourceID: source.sourceID,
+                    policyRevision: source.policyRevision,
+                    assetName: BuiltInWineVersions.fixedAssetName,
+                    expectedSHA256: BuiltInWineVersions.fixedAssetSHA256,
+                    isDownloaded: FileManager.default.fileExists(atPath: versionsDir.appendingPathComponent(Self.fixedRuntimeTag).path),
+                    isSelected: runtimeRecord?.identity == Self.fixedRuntimeTag
+                )
+                cachedVersions = [version]
+                cacheTimestamp = Date()
+                await logWriter.record(.init(
+                    level: .warning, module: "WineVersionManager", eventName: "wine.catalog.response",
+                    operationID: operationID, phase: "response", result: "completed",
+                    messageCode: "wine.catalog.pinned_fallback", fields: ["sourceID": source.sourceID, "statusCode": String(statusCode)]
+                ))
+                return [version]
+            }
             if case .httpError(let statusCode, let message) = error, statusCode == 403 {
                 await logWriter.record(.init(
                     level: .error,
@@ -105,20 +134,6 @@ extension WineVersionManager {
                     fields: ["sourceID": source.sourceID, "statusCode": "403"]
                 ))
                 throw VersionManagerError.apiForbidden(sourceID: source.sourceID, detail: message)
-            }
-            if case .httpError(let statusCode, _) = error, statusCode == 429 {
-                await logWriter.record(.init(
-                    level: .warning,
-                    module: "WineVersionManager",
-                    eventName: "wine.catalog.response",
-                    operationID: operationID,
-                    phase: "response",
-                    result: "failed",
-                    errorCategory: "rateLimited",
-                    messageCode: "wine.catalog.rate_limited",
-                    fields: ["sourceID": source.sourceID, "statusCode": "429"]
-                ))
-                throw VersionManagerError.rateLimited(retryAfter: 60)
             }
             await logWriter.record(.init(
                 level: .error,
@@ -146,6 +161,11 @@ extension WineVersionManager {
             ))
             throw VersionManagerError.apiUnavailable(error.localizedDescription)
         }
+    }
+
+    private nonisolated static func isGitHubRateLimit(_ detail: String) -> Bool {
+        let lower = detail.lowercased()
+        return lower.contains("ratelimitremaining=0") || lower.contains("api rate limit exceeded")
     }
 
     /// 获取可用版本列表（优先缓存，不抛出错误）

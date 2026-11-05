@@ -58,6 +58,8 @@ public final class BackgroundMediaService {
         case background = "background"   // .webp → .png
         case video = "video"             // .webm → .mp4
         case theme = "theme"             // .webp → .png
+        case icon = "icon"
+        case iconHover = "icon-hover"
     }
 
     // MARK: - Published State（按游戏）
@@ -75,6 +77,13 @@ public final class BackgroundMediaService {
     /// HoyoPlay metadata cache is actor state and must remain stored on the type.
     internal var cachedEntries: [HoyoPlayGameEntry]?
     internal var cacheTimestamp: Date?
+    /// An older asynchronous load must not publish retained assets after a
+    /// newer load has selected a different collection for the same game.
+    internal var backgroundLoadGenerations: [String: UUID] = [:]
+    /// Retention runs independently of presentation but is owned by the
+    /// service, so reloads, settings changes and cache clearing can cancel it.
+    @ObservationIgnored internal var backgroundRetentionTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var backgroundRetentionTokens: [String: UUID] = [:]
 
     // MARK: - Constants
 
@@ -84,12 +93,33 @@ public final class BackgroundMediaService {
     /// Source identity used by the API collection fingerprint.
     internal let backgroundSourceID = "hoyoPlay"
 
+    nonisolated public static let retainOutdatedBackgroundsKey = "retainOutdatedBackgrounds"
+    nonisolated public static let retainOutdatedBackgroundsDefault = false
+    /// Existing users who enabled the global option retain their previous
+    /// behavior until they explicitly disable an individual game.
+    nonisolated public static let retainOutdatedBackgroundsForGameDefault = true
+
+    nonisolated public static func retentionPreferenceKey(forGameID gameID: String) -> String {
+        "\(retainOutdatedBackgroundsKey).\(gameID)"
+    }
+
+    /// 默认不保留旧素材；每次维护缓存时读取，设置切换无需重启应用。
+    public var retainOutdatedBackgrounds: Bool {
+        userDefaults.object(forKey: Self.retainOutdatedBackgroundsKey) as? Bool ?? Self.retainOutdatedBackgroundsDefault
+    }
+
+    /// The global option remains the master switch; each game's setting is
+    /// persisted independently and defaults on for existing installations.
+    public func retainsOutdatedBackgrounds(for gameID: String) -> Bool {
+        retainOutdatedBackgrounds &&
+            (userDefaults.object(forKey: Self.retentionPreferenceKey(forGameID: gameID)) as? Bool
+                ?? Self.retainOutdatedBackgroundsForGameDefault)
+    }
+
     /// GameType → HoyoPlay game.biz 映射（国服版本）
-    internal let gameKeyMap: [String: String] = [
-        GameType.genshinImpact.rawValue: "hk4e_cn",
-        GameType.honkaiStarRail.rawValue: "hkrpg_cn",
-        GameType.zenlessZoneZero.rawValue: "nap_cn",
-    ]
+    internal let gameKeyMap: [String: String] = Dictionary(
+        uniqueKeysWithValues: GameType.allCases.map { ($0.rawValue, $0.definition.mainlandBiz) }
+    )
 
     // MARK: - Dependencies
 
@@ -98,19 +128,22 @@ public final class BackgroundMediaService {
     internal let networkProvider: NetworkDownloadProvider
     internal let persistenceStore: PersistenceStore
     internal let logWriter: LogWriter
+    internal let userDefaults: UserDefaults
 
     public init(
         mediaTranscoder: MediaTranscoder,
         mediaCacheManager: MediaCacheManager,
         networkProvider: NetworkDownloadProvider,
         persistenceStore: PersistenceStore,
-        logWriter: LogWriter
+        logWriter: LogWriter,
+        userDefaults: UserDefaults = .standard
     ) {
         self.mediaTranscoder = mediaTranscoder
         self.mediaCacheManager = mediaCacheManager
         self.networkProvider = networkProvider
         self.persistenceStore = persistenceStore
         self.logWriter = logWriter
+        self.userDefaults = userDefaults
     }
 
     // MARK: - Initialization
@@ -168,6 +201,10 @@ public final class BackgroundMediaService {
     }
 
     public func clearAllCache() async {
+        backgroundLoadGenerations.removeAll()
+        let tasks = Array(backgroundRetentionTasks.values)
+        cancelRetainedBackgrounds()
+        for task in tasks { await task.value }
         _ = try? await mediaCacheManager.clearCache()
         mediaStates.removeAll()
     }

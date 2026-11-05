@@ -5,6 +5,34 @@
 
 import SwiftUI
 
+/// A shared minimum row height keeps controls aligned while allowing longer
+/// labels to grow naturally instead of being clipped.
+extension View {
+    func settingsRowLayout() -> some View {
+        frame(minHeight: 44, alignment: .center)
+    }
+}
+
+/// The system switch style aligns with a multiline label's first baseline in a
+/// Form. Lay out the label and native switch explicitly so their centers match.
+struct CenteredSettingsToggleStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            configuration.label
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Toggle("", isOn: configuration.$isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+        }
+        .frame(minHeight: 44)
+        .accessibilityRepresentation {
+            Toggle(isOn: configuration.$isOn) { configuration.label }
+                .toggleStyle(.switch)
+        }
+    }
+}
+
 // Source: UI Design -> Settings panels
 // 用户指令：设置界面尽可能精简；诊断信息移入「关于」。
 
@@ -12,6 +40,7 @@ import SwiftUI
 struct GeneralSettingsView: View {
     let settingsViewModel: SettingsViewModel
     @AppStorage("showGameNews") private var showGameNews = true
+    @AppStorage(BackgroundMediaService.retainOutdatedBackgroundsKey) private var retainOutdatedBackgrounds = BackgroundMediaService.retainOutdatedBackgroundsDefault
 
     var body: some View {
         Form {
@@ -30,8 +59,9 @@ struct GeneralSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                .toggleStyle(.switch)
+                .toggleStyle(CenteredSettingsToggleStyle())
                 .controlSize(.small)
+                .settingsRowLayout()
                 .accessibilityLabel("Metal HUD")
                 .accessibilityHint("显示帧率、GPU 时间与渲染分辨率。")
 
@@ -48,8 +78,9 @@ struct GeneralSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                .toggleStyle(.switch)
+                .toggleStyle(CenteredSettingsToggleStyle())
                 .controlSize(.small)
+                .settingsRowLayout()
                 .accessibilityLabel("解锁帧率上限")
                 .accessibilityHint("适用于原神和崩坏：星穹铁道。")
 
@@ -59,15 +90,17 @@ struct GeneralSettingsView: View {
                 )) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("DLSS 兼容（实验性）")
-                        Text("支持的 DirectX 11 游戏可使用 MetalFX 时间缩放。开启后，在游戏内选择 DLSS 质量档位；不支持帧生成。可能影响兼容性，建议仅在需要时开启。")
+                        Text("支持的 DirectX 11 游戏可使用 MetalFX 时间缩放；不支持帧生成。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
-                .toggleStyle(.switch)
+                .toggleStyle(CenteredSettingsToggleStyle())
                 .controlSize(.small)
-                .disabled(!GameEnvironmentSettings.supportsDLSSCompatibility)
-                .accessibilityHint("需要 Apple Silicon 和游戏原生 DLSS 支持。下次启动生效。")
+                .settingsRowLayout()
+                .help("需要游戏原生支持 DLSS。在游戏内选择 DLSS 质量档位；可能影响兼容性，建议仅在需要时开启。")
+                .accessibilityLabel("DLSS 兼容（实验性）")
+                .accessibilityHint("需要游戏原生支持 DLSS。在游戏内选择质量档位，可能影响兼容性。下次启动生效。")
 
                 Toggle(isOn: Binding(
                     get: { settingsViewModel.gameEnvironmentSettings.retinaMode },
@@ -83,8 +116,9 @@ struct GeneralSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                .toggleStyle(.switch)
+                .toggleStyle(CenteredSettingsToggleStyle())
                 .controlSize(.small)
+                .settingsRowLayout()
                 .accessibilityLabel("Retina 模式")
                 .accessibilityHint("使用 Retina 分辨率渲染。")
 
@@ -99,8 +133,9 @@ struct GeneralSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                .toggleStyle(.switch)
+                .toggleStyle(CenteredSettingsToggleStyle())
                 .controlSize(.small)
+                .settingsRowLayout()
                 .accessibilityLabel("左 Command 键用作 Control")
                 .accessibilityHint("使用左 Command 执行游戏内 Control 快捷键。")
 
@@ -111,9 +146,45 @@ struct GeneralSettingsView: View {
             }
 
             Section("主窗口") {
-                Toggle("在主窗口显示游戏新闻", isOn: $showGameNews)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
+                Toggle(isOn: $showGameNews) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("游戏新闻")
+                        Text("在主窗口显示当前游戏的新闻。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(CenteredSettingsToggleStyle())
+                .controlSize(.small)
+                .settingsRowLayout()
+                .accessibilityLabel("游戏新闻")
+            }
+
+            Section("背景缓存") {
+                Toggle(isOn: $retainOutdatedBackgrounds) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("保留过时背景素材")
+                        Text("开启后可为每款游戏选择是否缓存全部背景并保留过时素材。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(CenteredSettingsToggleStyle())
+                .controlSize(.small)
+                .settingsRowLayout()
+                .accessibilityLabel("保留过时背景素材")
+                .accessibilityHint("关闭后将在下次加载背景时自动清理旧背景。")
+                .onChange(of: retainOutdatedBackgrounds) { _, _ in
+                    settingsViewModel.backgroundRetentionSettingDidChange()
+                }
+
+                ForEach(GameType.allCases, id: \.rawValue) { game in
+                    GameBackgroundRetentionToggle(
+                        game: game,
+                        isAvailable: retainOutdatedBackgrounds,
+                        settingsViewModel: settingsViewModel
+                    )
+                }
             }
 
             Section("语言") {
@@ -125,25 +196,72 @@ struct GeneralSettingsView: View {
                         Text(lang.name).tag(lang.code)
                     }
                 }
-            }
-
-            Section("更新") {
-                Toggle("游戏客户端更新可用通知", isOn: Binding(
-                    get: { settingsViewModel.isGameUpdateNotificationEnabled },
-                    set: { settingsViewModel.setGameUpdateNotificationEnabled($0) }
-                ))
+                .settingsRowLayout()
             }
 
             Section("目录") {
-                Button("打开应用数据目录") {
-                    Task { await settingsViewModel.openDataDirectory() }
+                HStack {
+                    Text("应用数据目录")
+                    Spacer()
+                    Button {
+                        Task { await settingsViewModel.openDataDirectory() }
+                    } label: {
+                        Text("打开").frame(width: 54)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+                    .accessibilityLabel("打开应用数据目录")
                 }
-                Button("打开日志目录") {
-                    Task { await settingsViewModel.openLogsDirectory() }
+                .settingsRowLayout()
+                HStack {
+                    Text("日志目录")
+                    Spacer()
+                    Button {
+                        Task { await settingsViewModel.openLogsDirectory() }
+                    } label: {
+                        Text("打开").frame(width: 54)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+                    .accessibilityLabel("打开日志目录")
                 }
+                .settingsRowLayout()
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+/// Each game keeps its own preference even while the shared switch is off.
+private struct GameBackgroundRetentionToggle: View {
+    let game: GameType
+    let isAvailable: Bool
+    let settingsViewModel: SettingsViewModel
+    @AppStorage private var retainForGame: Bool
+
+    init(game: GameType, isAvailable: Bool, settingsViewModel: SettingsViewModel) {
+        self.game = game
+        self.isAvailable = isAvailable
+        self.settingsViewModel = settingsViewModel
+        self._retainForGame = AppStorage(
+            wrappedValue: BackgroundMediaService.retainOutdatedBackgroundsForGameDefault,
+            BackgroundMediaService.retentionPreferenceKey(forGameID: game.rawValue)
+        )
+    }
+
+    var body: some View {
+        Toggle(isOn: $retainForGame) {
+            Text(game.displayName)
+        }
+        .toggleStyle(CenteredSettingsToggleStyle())
+        .controlSize(.small)
+        .settingsRowLayout()
+        .disabled(!isAvailable)
+        .accessibilityLabel("保留\(game.displayName)的过时背景素材")
+        .accessibilityHint("关闭后将在下次加载此游戏背景时清理过时素材。")
+        .onChange(of: retainForGame) { _, _ in
+            settingsViewModel.backgroundRetentionSettingDidChange(forGameID: game.rawValue)
+        }
     }
 }
 
@@ -175,11 +293,11 @@ struct AboutView: View {
             }
 
             Section("此 Mac") {
-                LabeledContent("机型", value: deviceValue(settingsViewModel.machineName))
-                LabeledContent("芯片", value: deviceValue(settingsViewModel.chipName))
-                LabeledContent("内存", value: deviceValue(settingsViewModel.physicalMemoryText))
-                LabeledContent("macOS 版本", value: deviceValue(settingsViewModel.systemVersion))
-                LabeledContent("Wine 目标磁盘空间", value: diskSpaceValue(settingsViewModel.diskSpaceText))
+                LabeledContent("机型", value: deviceValue(settingsViewModel.machineName)).settingsRowLayout()
+                LabeledContent("芯片", value: deviceValue(settingsViewModel.chipName)).settingsRowLayout()
+                LabeledContent("内存", value: deviceValue(settingsViewModel.physicalMemoryText)).settingsRowLayout()
+                LabeledContent("macOS 版本", value: deviceValue(settingsViewModel.systemVersion)).settingsRowLayout()
+                LabeledContent("Wine 目标磁盘空间", value: diskSpaceValue(settingsViewModel.diskSpaceText)).settingsRowLayout()
             }
         }
         .formStyle(.grouped)

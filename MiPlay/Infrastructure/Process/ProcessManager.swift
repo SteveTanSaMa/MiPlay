@@ -161,6 +161,8 @@ public actor ProcessManager {
     ///
     /// 过滤只作用于继承来的键；调用方显式传入的覆盖值在过滤之后合并，
     /// 因此我们自己的 `MTL_HUD_*`（性能选项）不受影响。
+    /// Process 使用这份完整环境；NSWorkspace 会再次叠加继承环境，必须由
+    /// ApplicationLauncher 的允许列表和 GameLauncher 的执行前清理保证边界。
     public nonisolated static func childEnvironment(overrides: [String: String]? = nil) -> [String: String] {
         filteredChildEnvironment(base: ProcessInfo.processInfo.environment, overrides: overrides)
     }
@@ -171,7 +173,12 @@ public actor ProcessManager {
         base: [String: String],
         overrides: [String: String]? = nil
     ) -> [String: String] {
-        var environment = base
+        // An inherited LSFG or dyld injection belongs to the parent developer
+        // environment. Only an explicit, validated launch plan may inject Wine.
+        var environment = LSFGLaunchEnvironment.removingInjection(from: base)
+        // A previous LaunchServices allowlist must never authorize a new
+        // direct launch. Only the current caller may supply this relay.
+        environment.removeValue(forKey: ApplicationLauncher.runtimeVariableAllowlistKey)
         for key in developmentOnlyMetalVariables(in: environment) {
             environment.removeValue(forKey: key)
         }

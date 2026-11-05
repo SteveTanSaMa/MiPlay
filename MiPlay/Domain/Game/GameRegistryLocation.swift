@@ -2,6 +2,7 @@
 // MiPlay
 
 import Foundation
+import Darwin
 
 // Source: Architecture Design -> GameRegistry -> authorized location commands
 extension GameRegistry {
@@ -29,10 +30,14 @@ extension GameRegistry {
 
     /// Commits a user-selected URL only after bookmark creation and scoped validation.
     @discardableResult
-    public func locateGame(type gameType: GameType, selectedURL: URL) async throws -> Game {
+    public func locateGame(type gameType: GameType, selectedURL: URL, installedVersion: String? = nil) async throws -> Game {
         let gameID = gameType.rawValue
         guard let index = games.firstIndex(where: { $0.type == gameType }) else {
             throw RegistrationError.gameNotFound(gameID)
+        }
+        let initialGame = games[index]
+        guard ![GameBusinessState.running, .launching, .gameUpdating].contains(initialGame.state) else {
+            throw RegistrationError.recoveryRequired("游戏正在运行或更新，请先完成当前操作；中断更新可在设置中重新授权或恢复")
         }
 
         var isDirectory: ObjCBool = false
@@ -65,13 +70,47 @@ extension GameRegistry {
             throw RegistrationError.permissionRequired(error.localizedDescription)
         }
 
-        let validation: (PathValidationResult, GameLocation)
+        let validation: (PathValidationResult, GameLocation, Bool)
         do {
             validation = try await fileSystemRepository.withSecurityScopedAccess(selectionLocation) { resolvedSelectionURL, _ in
-                guard let directoryURL = gameType.resolvedInstallationDirectory(at: resolvedSelectionURL) else {
+                let executableDirectory = gameType.resolvedInstallationDirectory(at: resolvedSelectionURL)
+                // A transaction can have temporarily moved the executable into
+                // its backup. Search only within the selected scope and the
+                // same depth supported by normal game discovery.
+                var candidates = [resolvedSelectionURL.standardizedFileURL]
+                if let executableDirectory, executableDirectory != candidates[0] {
+                    candidates.append(executableDirectory)
+                }
+                let selectedCandidates = Set(candidates)
+                if executableDirectory == nil {
+                    candidates.append(contentsOf: Self.transactionCandidateDirectories(in: resolvedSelectionURL))
+                }
+                let installer = SophonInstaller()
+                var recoveringDirectory: URL?
+                for candidate in candidates where FileManager.default.fileExists(
+                    atPath: candidate.appendingPathComponent(SophonInstaller.transactionDirectoryName).path
+                ) {
+                    do {
+                        if try await installer.hasRecoverableTransaction(destination: candidate, game: gameType) {
+                            guard recoveringDirectory == nil else {
+                                throw RegistrationError.recoveryRequired("所选目录包含多个下载事务，请直接选择需要恢复的游戏目录")
+                            }
+                            recoveringDirectory = candidate
+                        }
+                    } catch let error as RegistrationError { throw error }
+                    catch {
+                        if selectedCandidates.contains(candidate) {
+                            throw RegistrationError.recoveryRequired("无法验证下载事务：\(error.localizedDescription)")
+                        }
+                        // A sibling may belong to a different game. It is not
+                        // a candidate unless its journal validates for this one.
+                        continue
+                    }
+                }
+                guard let directoryURL = recoveringDirectory ?? executableDirectory else {
                     let baseURL = resolvedSelectionURL
                     let first = baseURL.appendingPathComponent(gameType.executableRelativePaths[0]).path
-                    return (.executableNotFound(first), selectionLocation)
+                    return (.executableNotFound(first), selectionLocation, false)
                 }
 
                 // The selected scope is still active here, so the final
@@ -81,13 +120,17 @@ extension GameRegistry {
                     for: directoryURL,
                     scope: .readWrite
                 )
+                let isRecovering = recoveringDirectory != nil
                 return try await fileSystemRepository.withSecurityScopedAccess(location) { resolvedURL, resolvedLocation in
+                    if isRecovering { return (.valid, resolvedLocation, true) }
                     let found = gameType.firstExistingExecutable(at: resolvedURL.path) != nil
-                    if found { return (.valid, resolvedLocation) }
+                    if found { return (.valid, resolvedLocation, false) }
                     let first = resolvedURL.appendingPathComponent(gameType.executableRelativePaths[0]).path
-                    return (.executableNotFound(first), resolvedLocation)
+                    return (.executableNotFound(first), resolvedLocation, false)
                 }
             }
+        } catch let error as RegistrationError {
+            throw error
         } catch {
             throw RegistrationError.permissionRequired(error.localizedDescription)
         }
@@ -96,10 +139,15 @@ extension GameRegistry {
             throw RegistrationError.invalidPath(validation.0.description)
         }
 
+        guard let index = games.firstIndex(where: { $0.type == gameType }),
+              games[index].state == initialGame.state, games[index].location == initialGame.location else {
+            throw RegistrationError.recoveryRequired("选择目录期间游戏状态或授权发生变化，请重试")
+        }
         let previous = games[index]
         var updated = previous
         updated.location = validation.1
-        updated.state = .installed
+        updated.state = validation.2 ? .gameUpdating : .installed
+        if let installedVersion { updated.version = installedVersion }
         games[index] = updated
         do {
             try await persistLibrary()
@@ -110,6 +158,49 @@ extension GameRegistry {
         emit(updated)
         await logWriter.info("游戏路径和授权已保存: \(gameType.displayName)", module: "GameRegistry")
         return updated
+    }
+
+    /// Enumerators are synchronous and not Sendable. Confine them to this
+    /// helper so no enumerator survives across the transaction actor calls.
+    private nonisolated static func transactionCandidateDirectories(in root: URL) -> [URL] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return [] }
+        var candidates: [URL] = []
+        let baseDepth = root.pathComponents.count
+        for case let candidate as URL in enumerator {
+            let depth = candidate.pathComponents.count - baseDepth
+            if depth > 3 { enumerator.skipDescendants(); continue }
+            let values = try? candidate.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            if values?.isSymbolicLink == true { enumerator.skipDescendants(); continue }
+            if values?.isDirectory == true { candidates.append(candidate.standardizedFileURL) }
+        }
+        return candidates
+    }
+
+    /// Renew access to the same interrupted update directory without marking
+    /// its partially committed contents as installed or launchable.
+    public func reauthorizePendingGame(id: String, selectedURL: URL) async throws {
+        guard let game = games.first(where: { $0.id == id }), game.state == .gameUpdating,
+              let previousPath = game.location?.lastKnownPath else {
+            throw RegistrationError.recoveryRequired("此游戏没有需要重新授权的中断更新")
+        }
+        guard selectedURL.startAccessingSecurityScopedResource() else {
+            throw RegistrationError.permissionRequired("无法取得所选游戏目录的安全访问权限")
+        }
+        defer { selectedURL.stopAccessingSecurityScopedResource() }
+        let selected = selectedURL.standardizedFileURL.resolvingSymlinksInPath()
+        let previous = URL(fileURLWithPath: previousPath, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard selected.path == previous.path,
+              FileManager.default.fileExists(atPath: selected.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw RegistrationError.invalidPath("请选择此前中断更新的同一个游戏目录")
+        }
+        let location = try fileSystemRepository.makeGameLocation(gameID: id, for: selectedURL, scope: .readWrite)
+        let access = try fileSystemRepository.acquireSecurityScopedAccess(location)
+        defer { access.stop() }
+        try await updateResolvedLocation(id: id, location: access.resolvedLocation)
     }
 
     /// Persists the bookmark and path returned by a scoped resolution. This is
@@ -179,9 +270,16 @@ extension GameRegistry {
         guard let index = games.firstIndex(where: { $0.id == gameID }) else {
             throw RegistrationError.gameNotFound(gameID)
         }
-        // 进程已经退出即可重新启动；退出码和信号只用于诊断，不改变可启动状态。
-        let target: GameBusinessState = .installed
         let old = games[index]
+        // A version check may complete while the game is running. Do not
+        // discard that fact, but only promote fresh evidence that still
+        // matches the authorized on-disk config at the time of exit.
+        let target: GameBusinessState
+        if old.state == .updateAvailable || (old.state == .running && hasFreshUpdateEvidenceAtExit(for: old)) {
+            target = .updateAvailable
+        } else {
+            target = .installed
+        }
         if old.state != target {
             games[index].state = try stateMachine.transition(from: old.state, to: target)
         }
@@ -201,6 +299,72 @@ extension GameRegistry {
             throw RegistrationError.persistenceFailed(error.localizedDescription)
         }
         emit(games[index])
+    }
+
+    /// Fail closed: old, conflicting, relocated or unreadable evidence never
+    /// makes a just-exited game appear to have an actionable update.
+    private func hasFreshUpdateEvidenceAtExit(for game: Game) -> Bool {
+        guard let launched = game.lastLaunchDate,
+              let metadata = game.lastMetadata,
+              metadata.gameID == game.id,
+              metadata.outcome == .updateAvailable,
+              metadata.conflictDetails.isEmpty,
+              game.metadataFailure == nil,
+              let location = game.location, location.gameID == game.id,
+              location.bookmarkData != nil,
+              metadata.locationRevision == location.bookmarkVersion,
+              metadata.localEvidence.gameID == game.id,
+              metadata.localEvidence.locationRevision == location.bookmarkVersion,
+              metadata.readAt == metadata.localEvidence.readAt,
+              metadata.readAt > launched, metadata.readAt <= Date(),
+              metadata.localEvidence.pkgVersionValidationErrors.isEmpty,
+              let current = game.version, !current.isEmpty,
+              current == metadata.localEvidence.gameVersion,
+              let latest = metadata.latestVersion,
+              (try? SophonMetadataClient.compareVersions(latest, current)) == .orderedDescending,
+              metadata.localEvidence.channel != nil else { return false }
+        if let resolvedAt = location.lastResolvedAt, metadata.readAt <= resolvedAt { return false }
+
+        guard let access = try? fileSystemRepository.acquireSecurityScopedAccess(location) else { return false }
+        defer { access.stop() }
+        // A changed or refreshed scope must be persisted and checked again;
+        // previous evidence is not bound to the newly resolved location.
+        guard !access.resolvedLocation.requiresPersistenceUpdate(from: location) else { return false }
+        let configURL = access.url.appendingPathComponent(game.type.versionFileRelativePath)
+        let fd = Darwin.open(configURL.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        guard fd >= 0 else { return false }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_size > 0, info.st_size <= 1_048_576,
+              let data = try? handle.readToEnd(), let text = String(data: data, encoding: .utf8) else { return false }
+
+        var section = ""
+        var fields: [String: String] = [:]
+        let keys = Set(["game_version", "channel", "sub_channel", "cps", "uapc"])
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix(";") || line.hasPrefix("#") { continue }
+            if line.hasPrefix("[") && line.hasSuffix("]") {
+                section = String(line.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                continue
+            }
+            guard section == "General", let separator = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<separator]).trimmingCharacters(in: .whitespaces)
+            guard keys.contains(key) else { continue }
+            guard fields[key] == nil else { return false }
+            let value = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespaces)
+            fields[key] = key == "uapc" ? value : value.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        }
+        let evidence = metadata.localEvidence
+        guard fields["game_version"] == evidence.gameVersion,
+              fields["channel"] == evidence.channel,
+              fields["sub_channel"] == evidence.subChannel,
+              fields["cps"] == evidence.cps else { return false }
+        let identities = evidence.configFields.filter { $0.section == "General" && $0.key == "uapc" }
+        guard identities.count <= 1, fields["uapc"] == identities.first?.value else { return false }
+        return true
     }
 
     /// Stores a durable process-exit recovery fact without changing the

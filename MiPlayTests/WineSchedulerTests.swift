@@ -363,6 +363,19 @@ import XCTest
             return XCTFail("Expected Wine binary launch, got \(result)")
         }
         if cancelAndRelaunch {
+            // The supervising helper is acknowledged before its Wine child
+            // executes. Exercise cancellation of a started child here; an
+            // immediate cancellation may correctly prevent this marker write.
+            let prefixPath = await wine.getPrefixPath(for: game.id)
+            let marker = "\(prefixPath)/launch-arg"
+            let childDeadline = ContinuousClock.now + .seconds(3)
+            while !FileManager.default.fileExists(atPath: marker), ContinuousClock.now < childDeadline {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            guard FileManager.default.fileExists(atPath: marker) else {
+                await launch.cancelLaunch()
+                return XCTFail("Synthetic Wine child did not reach its readiness marker")
+            }
             async let firstStop: Void = launch.cancelLaunch()
             async let duplicateStop: Void = launch.cancelLaunch()
             _ = await (firstStop, duplicateStop)

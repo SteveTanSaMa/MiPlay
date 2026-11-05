@@ -183,17 +183,21 @@ public actor GameIconProvider {
 
     /// 官方接口使用的 biz 标识（同一款游戏的国服/国际服条目）。
     nonisolated static func candidateBizIDs(for gameType: GameType) -> [String] {
-        switch gameType {
-        case .genshinImpact: return ["hk4e_cn", "hk4e_global"]
-        case .honkaiStarRail: return ["hkrpg_cn", "hkrpg_global"]
-        case .zenlessZoneZero: return ["nap_cn", "nap_global"]
+        candidateBizIDs(for: gameType.definition)
+    }
+
+    /// International identity is optional for games only published in China.
+    nonisolated static func candidateBizIDs(for definition: BuiltInGameDefinition) -> [String] {
+        [definition.mainlandBiz, definition.globalBiz].compactMap { value in
+            guard let value, !value.isEmpty else { return nil }
+            return value
         }
     }
 
     nonisolated private static func biz(for gameType: GameType, region: Region) -> String {
         let candidates = candidateBizIDs(for: gameType)
         let suffix = region == .china ? "_cn" : "_global"
-        return candidates.first { $0.hasSuffix(suffix) } ?? candidates[0]
+        return candidates.first { $0.hasSuffix(suffix) } ?? gameType.definition.mainlandBiz
     }
 
     private func iconURL(for biz: String, region: Region) async throws -> URL? {

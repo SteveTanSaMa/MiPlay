@@ -147,11 +147,21 @@ public actor TaskScheduler {
                 )
                 let wasInterrupted = record.status == ScheduledTaskState.pending.rawValue || record.status == ScheduledTaskState.running.rawValue
                 task.state = wasInterrupted ? .failed : (ScheduledTaskState(rawValue: record.status) ?? .failed)
-                task.phaseDescription = wasInterrupted ? "应用退出时任务被中断" : record.phase
+                let isGameDownload = type == .gameInstall || type == .gameUpdate || type == .gamePredownload
+                let isGameRecovery = type == .gameUpdate && record.context["recoveryOnly"] == "true"
+                let isPredownload = type == .gamePredownload
+                let interruptedPhase: String
+                if isGameRecovery { interruptedPhase = "更新恢复中断，可继续更新" }
+                else if isPredownload { interruptedPhase = "预下载中断，可继续下载" }
+                else if type == .gameUpdate { interruptedPhase = "更新中断，可继续更新" }
+                else if type == .gameInstall { interruptedPhase = "安装中断，可继续安装" }
+                else { interruptedPhase = "应用退出时任务被中断" }
+                let resumeDescription = type == .gameUpdate ? "继续更新" : (type == .gameInstall ? "继续安装" : "继续下载")
+                task.phaseDescription = wasInterrupted ? interruptedPhase : record.phase
                 task.progress = wasInterrupted ? nil : record.progress
                 task.outcome = wasInterrupted ? nil : record.outcome
                 task.error = wasInterrupted ? (record.error ?? "应用退出时任务被中断") : record.error
-                task.recovery = wasInterrupted ? (record.recovery ?? "请检查状态后手动重试") : record.recovery
+                task.recovery = wasInterrupted ? (record.recovery ?? (isGameDownload ? resumeDescription : "请检查状态后手动重试")) : record.recovery
                 task.startedAt = record.startedAt
                 task.endedAt = wasInterrupted ? (record.endedAt ?? Date()) : record.endedAt
                 tasks[task.id] = task
@@ -217,8 +227,13 @@ public actor TaskScheduler {
         intentID: UUID = UUID()
     ) async throws -> TaskReceipt {
         await initialize()
-        guard type == .gameLaunch || type == .solutionApply || type == .solutionRevert || type == .versionCheck || type == .integrityVerification || type == .wineRuntimeSetup || type == .backgroundMediaLoad || type == .logExport else {
+        guard type == .gameLaunch || type == .gameInstall || type == .gameUpdate || type == .gamePredownload || type == .solutionApply || type == .solutionRevert || type == .versionCheck || type == .integrityVerification || type == .wineRuntimeSetup || type == .backgroundMediaLoad || type == .logExport else {
             throw SchedulerError.unsupported(type)
+        }
+        if type == .gameInstall {
+            guard let encoded = context["installBookmark"], Data(base64Encoded: encoded) != nil else {
+                throw SchedulerError.invalidRequest("安装目录缺少授权")
+            }
         }
         if type == .wineRuntimeSetup || type == .logExport {
             guard gameId == nil else {
@@ -227,6 +242,14 @@ public actor TaskScheduler {
         } else {
             guard gameId != nil else {
                 throw SchedulerError.invalidRequest("任务缺少 Game ID")
+            }
+        }
+        if type == .gameInstall || type == .gameUpdate || type == .gamePredownload {
+            guard let gameId, let game = await gameRegistry.getGame(by: gameId) else {
+                throw SchedulerError.invalidRequest("游戏不存在")
+            }
+            guard Self.allowsContentTask(type, context: context, capabilities: game.type.definition.contentCapabilities) else {
+                throw SchedulerError.invalidRequest("此游戏暂不支持该下载操作")
             }
         }
         if type == .gameLaunch, let gameId {
@@ -320,6 +343,21 @@ public actor TaskScheduler {
         return makeReceipt(task)
     }
 
+    /// A recovery-only update is intentionally independent of current
+    /// download capabilities: an older transaction must remain recoverable.
+    nonisolated internal static func allowsContentTask(
+        _ type: ScheduledTaskType,
+        context: [String: String],
+        capabilities: GameContentCapabilities
+    ) -> Bool {
+        switch type {
+        case .gameInstall: return capabilities.sophonInstall
+        case .gameUpdate: return context["recoveryOnly"] == "true" || capabilities.sophonUpdate
+        case .gamePredownload: return capabilities.sophonPredownload
+        default: return true
+        }
+    }
+
     public func logExportResult(for taskID: ScheduledTaskID) -> String? {
         logExportResults[taskID]
     }
@@ -364,7 +402,7 @@ public actor TaskScheduler {
         } else {
             executionTasks[taskId]?.cancel()
         }
-        task.phaseDescription = "正在清理"
+        task.phaseDescription = task.type == .gameInstall || task.type == .gameUpdate ? "正在暂停…" : "正在清理"
         task.revision += 1
         tasks[taskId] = task
         emit(task, persistence: .memoryOnly)

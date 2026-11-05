@@ -17,7 +17,6 @@ struct GameSelectionRailView: View {
     let games: [Game]
     @Binding var selectedId: String?
     @Binding var selectedPlaceholderType: GameType?
-    let onLocateGame: ((GameType) -> Void)?
     let onPreload: ((GameType) -> Void)?
     /// 官方游戏图标缓存路径（由 `LibraryViewModel.gameIconURLs` 提供）。
     let iconURLs: [GameType: URL]
@@ -26,14 +25,12 @@ struct GameSelectionRailView: View {
         games: [Game],
         selectedId: Binding<String?>,
         selectedPlaceholderType: Binding<GameType?> = .constant(nil),
-        onLocateGame: ((GameType) -> Void)? = nil,
         onPreload: ((GameType) -> Void)? = nil,
         iconURLs: [GameType: URL] = [:]
     ) {
         self.games = games
         self._selectedId = selectedId
         self._selectedPlaceholderType = selectedPlaceholderType
-        self.onLocateGame = onLocateGame
         self.onPreload = onPreload
         self.iconURLs = iconURLs
     }
@@ -50,7 +47,7 @@ struct GameSelectionRailView: View {
 
     private func isSelected(_ type: GameType) -> Bool {
         if let game = game(for: type) { return selectedId == game.id }
-        return selectedPlaceholderType == type
+        return selectedId == type.rawValue || (selectedId == nil && selectedPlaceholderType == type)
     }
 
     @Environment(\.openSettings) private var openSettings
@@ -165,20 +162,18 @@ struct GameSelectionRailView: View {
 
     private func handleTap(type: GameType) {
         if let g = game(for: type) {
+            selectedPlaceholderType = nil
             selectedId = g.id
         } else {
+            // Missing library entries are still selectable. The main window
+            // offers both location and installation for the selected game.
+            selectedId = type.rawValue
             selectedPlaceholderType = type
-            onLocateGame?(type)
         }
     }
 
     private func accessibilityValue(for type: GameType) -> String {
-        let selected: String
-        if let game = game(for: type) {
-            selected = selectedId == game.id ? "当前选中" : "未选中"
-        } else {
-            selected = selectedPlaceholderType == type ? "当前选中" : "未选中"
-        }
+        let selected = isSelected(type) ? "当前选中" : "未选中"
         let businessState = state(for: type).map(businessStateLabel) ?? "未定位"
         return "\(selected)，\(businessState)"
     }
@@ -197,11 +192,7 @@ struct GameSelectionRailView: View {
 
     /// 单游戏图标：优先官方 icon，缺失时回退到 SF Symbol + 玻璃面板。
     private func gameIconFallback(for type: GameType) -> Image {
-        switch type {
-        case .genshinImpact:  return Image(systemName: "wind")
-        case .honkaiStarRail: return Image(systemName: "star")
-        case .zenlessZoneZero: return Image(systemName: "bolt.fill")
-        }
+        Image(systemName: type.definition.symbolName)
     }
 
     private var settingsIconView: some View {

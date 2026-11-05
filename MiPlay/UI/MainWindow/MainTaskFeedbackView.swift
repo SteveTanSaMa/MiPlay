@@ -7,9 +7,6 @@ struct MainTaskFeedbackView: View {
     let recovery: RecoveryRecord?
     let retry: (String) -> Void
 
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.colorSchemeContrast) private var contrast
-
     private var hasUnresolvedRecovery: Bool {
         guard let recovery else { return false }
         return recovery.resolvedAt == nil
@@ -68,15 +65,7 @@ struct MainTaskFeedbackView: View {
             .padding(12)
             .frame(width: 280, alignment: .leading)
             .foregroundStyle(.primary)
-            .background {
-                let shape = RoundedRectangle(cornerRadius: 16)
-                if reduceTransparency || contrast == .increased {
-                    shape.fill(Color(white: 0.08))
-                } else {
-                    shape.fill(.regularMaterial)
-                }
-            }
-            .environment(\.colorScheme, .dark)
+            .modifier(DarkGlassSurface(interactive: false))
             .accessibilityElement(children: .contain)
         }
     }

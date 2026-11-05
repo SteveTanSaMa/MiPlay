@@ -11,6 +11,13 @@ extension TaskScheduler {
         var keys = Set<String>()
         if let gameID = task.gameId {
             switch task.type {
+            case .gameInstall, .gameUpdate:
+                keys.formUnion(["game:\(gameID):files", "game:\(gameID):lifecycle", "game:\(gameID):evidence"])
+            case .gamePredownload:
+                // Predownload only reads installed files and writes its own
+                // cache. Allow launching/playing while preventing concurrent
+                // installs, updates, verification, or another predownload.
+                keys.formUnion(["game:\(gameID):files", "game:\(gameID):evidence"])
             case .solutionApply, .solutionRevert: keys.insert("game:\(gameID):files")
             // Read-only evidence scans (version/integrity) keep their own
             // domain: they must not hold the game's lifecycle key while a

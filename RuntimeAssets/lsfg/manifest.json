@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "upstream": "https://github.com/namo-2938/lsfg-metal",
+  "upstream_baseline": "07647495e85fea78ac30a8499867c51306fee150",
+  "component": {
+    "schema": 1,
+    "component": "lsfg-metal",
+    "version": "1eeafad-dirty",
+    "target": "x86_64-apple-darwin",
+    "toolchain": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "fork": "https://github.com/SteveTanSaMa/LSFG",
+    "upstream": "https://github.com/namo-2938/lsfg-metal",
+    "upstream_baseline": "07647495e85fea78ac30a8499867c51306fee150",
+    "commit": "1eeafad68ed4962f5003bc5fc791e4311c621198",
+    "dirty": true,
+    "minimum_moltenvk": "1.4.2",
+    "configuration": "LSFGM environment profile",
+    "commercial_shaders_included": false,
+    "driver_included": false,
+    "fault_injection": false,
+    "sha256": {
+      "liblsfg_metal.dylib": "cc864d84bee7c8774e9d57e14ec56a78bf1f5e2412d4bc2a355e2b76d737d884",
+      "preflight": "314cec096f005fcb1169b029d2b3bb3b1382a8a9b3565b93de1bf93a5ab6f282",
+      "shader-check": "46ba44fbacdbb2eba7908af09a0b0113b3f20de59d086911fad269991e00dea5"
+    }
+  },
+  "generator_version": "1.4.2",
+  "generator_source": "https://github.com/KhronosGroup/MoltenVK/releases/tag/v1.4.2",
+  "commercial_shaders_included": false,
+  "sha256": {
+    "liblsfg_metal.dylib": "cc864d84bee7c8774e9d57e14ec56a78bf1f5e2412d4bc2a355e2b76d737d884",
+    "preflight": "314cec096f005fcb1169b029d2b3bb3b1382a8a9b3565b93de1bf93a5ab6f282",
+    "shader-check": "46ba44fbacdbb2eba7908af09a0b0113b3f20de59d086911fad269991e00dea5",
+    "libMoltenVK.generator.dylib": "aef00b13bcc808adf15b85bef9ae67393d92be7ed5dfe41cad16fa809e4a4c5f"
+  }
+}

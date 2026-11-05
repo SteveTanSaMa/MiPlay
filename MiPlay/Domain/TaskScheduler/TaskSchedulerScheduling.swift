@@ -29,9 +29,21 @@ extension TaskScheduler {
             return id
         }
         for id in backgroundIDs {
+            // Earlier tasks in this batch may have acquired an overlapping
+            // game lock since the initial queue scan.
+            guard let task = tasks[id], resourcesAvailable(for: task) else { continue }
+            // Do not let a long background download take resources needed by
+            // a waiting foreground task while another foreground task runs.
+            // Unrelated background work remains free to proceed.
+            let keys = resourceKeys(for: task)
+            let conflictsWithWaitingForeground = queue.contains { queuedID in
+                guard let queued = tasks[queuedID], !queued.type.isBackground else { return false }
+                return !keys.isDisjoint(with: resourceKeys(for: queued))
+            }
+            guard !conflictsWithWaitingForeground else { continue }
             queue.removeAll { $0 == id }
             activeBackground.insert(id)
-            lockResources(for: tasks[id]!)
+            lockResources(for: task)
             let execution = Task { [weak self] in
                 guard let self else { return }
                 await self.run(taskID: id)
@@ -57,6 +69,10 @@ extension TaskScheduler {
             )
 
             switch task.type {
+            case .gameInstall, .gameUpdate:
+                try await runSophon(taskID: taskID, task: task)
+            case .gamePredownload:
+                try await runSophonPredownload(taskID: taskID, task: task)
             case .gameLaunch:
                 try await phase(taskID, "正在检查游戏文件和权限", progress: nil)
                 guard let gameID = task.gameId, let game = await gameRegistry.getGame(by: gameID) else { throw SchedulerError.invalidRequest("游戏不存在") }
@@ -81,7 +97,21 @@ extension TaskScheduler {
                 let deepVerification = task.context["fileVerification"] == "true"
                 try await phase(taskID, deepVerification ? "正在校验游戏文件" : "正在检测版本", progress: nil)
                 guard let gameID = task.gameId, let game = await gameRegistry.getGame(by: gameID), let versionChecker else { throw SchedulerError.invalidRequest("版本检查器未配置") }
-                let result = try await versionChecker.checkVersion(for: game, fileVerification: deepVerification)
+                let verificationProgress: (@Sendable (Double) async throws -> Void)?
+                if deepVerification {
+                    verificationProgress = { @Sendable [weak self] progress in
+                        guard let self else { throw CancellationError() }
+                        try await self.phase(taskID, "正在校验游戏文件", progress: progress)
+                    }
+                } else {
+                    verificationProgress = nil
+                }
+                let result = try await versionChecker.checkVersion(
+                    for: game, fileVerification: deepVerification, verificationProgress: verificationProgress
+                )
+                if deepVerification {
+                    try await phase(taskID, "正在确认版本信息", progress: nil)
+                }
                 if result.outcome == .versionEvidenceConflict {
                     try await gameRegistry.recordMetadataFailure(
                         id: gameID,
@@ -247,13 +277,27 @@ extension TaskScheduler {
             }
         } catch is CancellationError {
             do {
-                try await finish(taskID, state: .cancelled, outcome: "cleanupVerified", error: nil, recovery: nil, phase: "已取消，清理已确认")
+                let isGameDownload = task.type == .gameInstall || task.type == .gameUpdate || task.type == .gamePredownload
+                let isGameRecovery = task.type == .gameUpdate && task.context["recoveryOnly"] == "true"
+                let isPredownload = task.type == .gamePredownload
+                let resumeDescription = task.type == .gameUpdate ? "可继续更新" : (task.type == .gameInstall ? "可继续安装" : "可继续下载")
+                let cancelledPhase: String
+                if task.type == .gameUpdate { cancelledPhase = "更新已暂停，可继续更新" }
+                else if task.type == .gameInstall { cancelledPhase = "安装已暂停，可继续安装" }
+                else if isPredownload { cancelledPhase = "预下载已取消，可继续下载" }
+                else { cancelledPhase = "已取消，清理已确认" }
+                try await finish(taskID, state: .cancelled,
+                                 outcome: isGameRecovery ? "recoveryInterrupted" : (isGameDownload ? "downloadInterrupted" : "cleanupVerified"),
+                                 error: nil, recovery: isGameDownload ? resumeDescription : nil,
+                                 phase: cancelledPhase)
             } catch {
                 await publishPersistenceFailure(taskID: taskID, detail: error.localizedDescription)
             }
         } catch {
             do {
-                try await finish(taskID, state: .failed, outcome: nil, error: error.localizedDescription, recovery: "检查失败事实后手动重试", phase: "任务未完成")
+                let recovery = task.type == .gameUpdate ? "排除错误后可继续更新；更新完成前无法启动游戏。"
+                    : (task.type == .gameInstall ? "排除错误后可继续安装。" : "检查失败事实后手动重试")
+                try await finish(taskID, state: .failed, outcome: nil, error: error.localizedDescription, recovery: recovery, phase: "任务未完成")
             } catch {
                 await publishPersistenceFailure(taskID: taskID, detail: "原始错误: \(error.localizedDescription); 结果持久化失败")
             }
@@ -277,6 +321,7 @@ extension TaskScheduler {
     ) async throws {
         guard var task = tasks[id] else { throw SchedulerError.taskNotFound(id) }
         let previousDescription = task.phaseDescription
+        let previousProgress = task.progress
         task.phaseDescription = description
         task.progress = progress
         if let downloadProgress {
@@ -296,19 +341,26 @@ extension TaskScheduler {
         // 进度 tick 的落盘节流：下载/解压每秒会产出大量 tick，若每个 tick 都
         // `commit`（= 全量写一次 AppData），事件与进度会排在写盘后面，界面看起来
         // 卡住（用户实测：下载进度停在 5%，解压阶段完全不动）。
-        // 内存状态与事件流每次 tick 都更新（界面即时），磁盘按 300ms 节流；
-        // 阶段说明变化、无进度的阶段切换、以及进度到达 0/1 时照常立即落盘。
+        // 内存状态与事件流每次 tick 都更新（界面即时）；预下载按 5 秒节流，
+        // 其他任务保持 300ms。阶段切换和首次到达 0/1 时照常立即落盘。
+        let isPredownload = task.type == .gamePredownload
+        let interval: Duration = isPredownload ? .seconds(5) : .milliseconds(300)
         let progressPersistedRecently: Bool
         if let last = lastProgressPersistAt[id] {
-            progressPersistedRecently = ContinuousClock.now - last < .milliseconds(300)
+            progressPersistedRecently = ContinuousClock.now - last < interval
         } else {
             progressPersistedRecently = false
         }
-        let shouldPersist = previousDescription != description
-            || progress == nil
-            || progress == 0
-            || progress == 1
-            || !progressPersistedRecently
+        let shouldPersist: Bool
+        if isPredownload {
+            shouldPersist = previousDescription != description
+                || (previousProgress == nil) != (progress == nil)
+                || (previousProgress != progress && (progress == 0 || progress == 1))
+                || !progressPersistedRecently
+        } else {
+            shouldPersist = previousDescription != description
+                || progress == nil || progress == 0 || progress == 1 || !progressPersistedRecently
+        }
         if shouldPersist {
             try await commit(task)
             lastProgressPersistAt[id] = ContinuousClock.now

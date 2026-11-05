@@ -2,6 +2,7 @@
 // MiPlay
 
 import Foundation
+import CryptoKit
 
 // Source: Architecture Design -> Wine download -> download and extract lifecycle
 extension WineVersionDownloader {
@@ -89,6 +90,11 @@ extension WineVersionDownloader {
                         throw DownloaderError.downloadFailed("下载未完成")
                     }
 
+                    if let expectedSHA256 = asset.expectedSHA256 {
+                        continuation.yield(.verifying)
+                        try Self.verifyArchiveSHA256(at: URL(fileURLWithPath: archivePath), expected: expectedSHA256)
+                    }
+
                     // 3. 解压
                     continuation.yield(.extracting(progress: 0))
                     let versionPath = try await self.extractArchive(
@@ -148,6 +154,23 @@ extension WineVersionDownloader {
                 Task { await self.cancel(sessionID: sessionID) }
             }
             activeSessions[sessionID, default: [:]][operationID] = producer
+        }
+    }
+
+    /// Verify the pinned archive before passing it to the extractor; use a
+    /// bounded buffer rather than mapping a several-hundred-megabyte archive.
+    internal nonisolated static func verifyArchiveSHA256(at url: URL, expected: String) throws {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hash = SHA256()
+        while true {
+            try Task.checkCancellation()
+            guard let bytes = try handle.read(upToCount: 1024 * 1024), !bytes.isEmpty else { break }
+            hash.update(data: bytes)
+        }
+        let actual = hash.finalize().map { String(format: "%02x", $0) }.joined()
+        guard actual.caseInsensitiveCompare(expected) == .orderedSame else {
+            throw DownloaderError.integrityCheckFailed("Wine 归档 SHA-256 不匹配")
         }
     }
 

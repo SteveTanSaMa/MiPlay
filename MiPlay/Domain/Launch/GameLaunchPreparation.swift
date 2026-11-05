@@ -21,7 +21,7 @@ enum GameLaunchPreparation {
     }
 
     nonisolated static func fixWebview(gameType: GameType, wineBinary: String, prefix: String, processManager: ProcessManager) async throws {
-        let environment = ["WINEPREFIX": prefix, "WINEDLLOVERRIDES": "winemenubuilder.exe=d", "WINEDEBUG": "fixme-all,err-unwind"]
+        let environment = ManagedWineLocale.environment(adding: ["WINEPREFIX": prefix, "WINEDLLOVERRIDES": "winemenubuilder.exe=d", "WINEDEBUG": "fixme-all,err-unwind"])
         for key in webviewRegistryKeys(for: gameType) {
             try Task.checkCancellation()
             let output: String
@@ -48,7 +48,7 @@ enum GameLaunchPreparation {
         ]
         for arguments in operations {
             try Task.checkCancellation()
-            _ = try await processManager.launchAndWait(executablePath: wineBinary, arguments: arguments, environment: ["WINEPREFIX": prefix, "WINEDLLOVERRIDES": "winemenubuilder.exe=d"], timeout: 15)
+            _ = try await processManager.launchAndWait(executablePath: wineBinary, arguments: arguments, environment: ManagedWineLocale.environment(adding: ["WINEPREFIX": prefix, "WINEDLLOVERRIDES": "winemenubuilder.exe=d"]), timeout: 15)
         }
     }
 

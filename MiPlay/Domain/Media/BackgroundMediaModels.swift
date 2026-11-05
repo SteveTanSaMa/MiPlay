@@ -63,12 +63,28 @@ struct HoyoPlayBackground: Codable, @unchecked Sendable {
 
     nonisolated init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.id = try container.decode(String.self, forKey: .id)
+        self.id = try container.decodeIfPresent(String.self, forKey: .id) ?? ""
         self.background = try container.decodeIfPresent(HoyoPlayMediaURL.self, forKey: .background)
         self.icon = try container.decodeIfPresent(HoyoPlayIcon.self, forKey: .icon)
         self.video = try container.decodeIfPresent(HoyoPlayMediaURL.self, forKey: .video)
         self.theme = try container.decodeIfPresent(HoyoPlayMediaURL.self, forKey: .theme)
         self.type = try container.decodeIfPresent(String.self, forKey: .type)
+    }
+
+    /// Preserve the response order and resources while assigning a safe cache key.
+    internal func withCacheID(_ cacheID: String) -> HoyoPlayBackground {
+        HoyoPlayBackground(id: cacheID, background: background, icon: icon,
+                           video: video, theme: theme, type: type)
+    }
+
+    private init(id: String, background: HoyoPlayMediaURL?, icon: HoyoPlayIcon?,
+                 video: HoyoPlayMediaURL?, theme: HoyoPlayMediaURL?, type: String?) {
+        self.id = id
+        self.background = background
+        self.icon = icon
+        self.video = video
+        self.theme = theme
+        self.type = type
     }
 }
 

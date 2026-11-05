@@ -355,8 +355,9 @@ public actor GameFileSystemRepository {
         guard validatePath(filePath) else {
             throw FileError.fileNotFound(filePath)
         }
-        let data = try readFile(at: filePath)
-        return calculateSHA256(of: data)
+        let reader = try StreamingFileHasher<SHA256>(path: filePath, followSymlinks: true)
+        defer { reader.close() }
+        return try reader.hash().digest
     }
 
     /// 计算数据的 SHA-256 哈希值
@@ -375,7 +376,26 @@ public actor GameFileSystemRepository {
         guard validatePath(filePath) else {
             throw FileError.fileNotFound(filePath)
         }
-        return calculateMD5(of: try readFile(at: filePath))
+        let reader = try StreamingFileHasher<Insecure.MD5>(path: filePath, followSymlinks: true)
+        defer { reader.close() }
+        return try reader.hash().digest
+    }
+
+    /// Stream large game files so verification does not hold a whole file in memory.
+    internal func calculateMD5Streaming(
+        of filePath: String,
+        progress: @Sendable (Int) async throws -> Void
+    ) async throws -> String {
+        guard validatePath(filePath) else { throw FileError.fileNotFound(filePath) }
+        let reader = try StreamingFileHasher<Insecure.MD5>(path: filePath, followSymlinks: true)
+        defer { reader.close() }
+        while true {
+            try Task.checkCancellation()
+            let count = try reader.readNext()
+            guard count > 0 else { break }
+            try await progress(count)
+        }
+        return reader.digest()
     }
 
     internal func calculateMD5(of data: Data) -> String {

@@ -13,6 +13,13 @@ import Foundation
 /// The single Wine release approved by the current product boundary.
 public struct BuiltInWineVersions {
     nonisolated public static let fixedTag = "wine-crossover-11.0-1-signed"
+    // Upstream release asset identity and digest, published on the GitHub release page.
+    // Pinning these values permits recovery from GitHub API rate limiting without
+    // weakening archive integrity or allowing arbitrary fallback URLs.
+    nonisolated public static let fixedAssetName = "wine-crossover-11.0-1-osx64-signed.tar.xz"
+    nonisolated public static let fixedAssetSize: Int64 = 456_021_524
+    nonisolated public static let fixedAssetSHA256 = "89fa7e90fb626523a90d5867a03c6be785d017176739c6320a3b86c7838c3a35"
+    nonisolated public static let fixedAssetURL = URL(string: "https://github.com/yaagl/anime-game-wine/releases/download/\(fixedTag)/\(fixedAssetName)")!
     // Source: Architecture Design -> Revision 2026-08-03 -> WineSourceSelection
     public struct SourceDescriptor: Sendable, Equatable {
         public let sourceID: String

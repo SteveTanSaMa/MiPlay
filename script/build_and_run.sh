@@ -4,8 +4,15 @@ MODE="${1:-run}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 case "$MODE" in run|--debug|--logs|--telemetry|--verify) ;; *) echo "usage: $0 [--debug|--logs|--telemetry|--verify]" >&2; exit 2 ;; esac
-pkill -x MiPlay >/dev/null 2>&1 || true
-xcodebuild -project MiPlay.xcodeproj -scheme MiPlay -configuration Debug -derivedDataPath build/GameNews CODE_SIGNING_ALLOWED=NO build
+if pgrep -x MiPlay >/dev/null; then
+  echo "MiPlay 正在运行，请等待当前操作完成并正常退出后再运行此脚本。" >&2
+  exit 1
+fi
+xcodebuild -project MiPlay.xcodeproj -scheme MiPlay -configuration Debug -derivedDataPath build/GameNews build
+if pgrep -x MiPlay >/dev/null; then
+  echo "构建期间 MiPlay 已启动；请先正常退出，再运行此脚本。" >&2
+  exit 1
+fi
 APP_BUNDLE="$ROOT_DIR/build/GameNews/Build/Products/Debug/MiPlay.app"
 case "$MODE" in
   --debug) lldb -- "$APP_BUNDLE/Contents/MacOS/MiPlay" ;;

@@ -363,24 +363,26 @@ import XCTest
     }
 
     /// hk4e_cn response whose first entry is a still-image group followed by a
-    /// playable video group, used to verify first-parsed-resource resolution.
+    /// playable video group, used to verify video-group priority.
     static func mixedBackgroundResponseJSON() -> Data {
-        Data("""
-        {"retcode":0,"message":"OK","data":{"game_info_list":[{"game":{"id":"hk4e","biz":"hk4e_cn"},"backgrounds":[
-        {"id":"bg-still","background":{"url":"https://example.com/bg-still.webp"},"video":null,"theme":null,"type":"BACKGROUND_TYPE_STATIC"},
-        {"id":"bg-video","background":{"url":"https://example.com/bg-video.webp"},"video":{"url":"https://example.com/bg-video.webm"},"theme":null,"type":"BACKGROUND_TYPE_VIDEO"}
-        ]}]}}
-        """.utf8)
+        backgroundResponseJSON(
+            groupIDs: ["bg-still", "bg-video"],
+            videoURLs: ["bg-video": "https://example.com/bg-video.webm"]
+        )
     }
 
     static func backgroundResponseJSON(
         groupIDs: [String],
-        resourceURLs: [String: String] = [:]
+        resourceURLs: [String: String] = [:],
+        videoURLs: [String: String] = [:],
+        types: [String: String] = [:]
     ) -> Data {
         let groups = groupIDs.map { id -> String in
             let backgroundURL = resourceURLs[id] ?? "https://example.com/\(id).webp"
+            let video = videoURLs[id].map { "{\"url\":\"\($0)\"}" } ?? "null"
+            let type = types[id] ?? (videoURLs[id] == nil ? "BACKGROUND_TYPE_STATIC" : "BACKGROUND_TYPE_VIDEO")
             return """
-            {"id":"\(id)","background":{"url":"\(backgroundURL)"},"video":null,"theme":null,"type":"BACKGROUND_TYPE_STATIC"}
+            {"id":"\(id)","background":{"url":"\(backgroundURL)"},"video":\(video),"theme":null,"type":"\(type)"}
             """
         }.joined(separator: ",")
         return Data("""

@@ -67,7 +67,8 @@ extension WineVersionManager {
                         tagName: version.tagName,
                         url: version.downloadURL,
                         assetName: version.assetName.isEmpty ? version.downloadURL.lastPathComponent : version.assetName,
-                        fileSize: version.fileSize
+                        fileSize: version.fileSize,
+                        expectedSHA256: version.expectedSHA256
                     )
                     let downloadStream = await self.wineVersionDownloader.downloadAndExtract(
                         asset: approvedAsset,
@@ -405,6 +406,13 @@ extension WineVersionManager {
         if !version.assetName.isEmpty,
            version.assetName != url.lastPathComponent {
             throw VersionManagerError.sourceInvalid("Wine asset 身份与 URL 不一致")
+        }
+        if let sha256 = version.expectedSHA256 {
+            guard sha256 == BuiltInWineVersions.fixedAssetSHA256,
+                  url == BuiltInWineVersions.fixedAssetURL,
+                  version.fileSize == BuiltInWineVersions.fixedAssetSize else {
+                throw VersionManagerError.sourceInvalid("固定 Wine 资源身份未通过验证")
+            }
         }
     }
 

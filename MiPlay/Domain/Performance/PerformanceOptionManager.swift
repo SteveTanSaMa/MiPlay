@@ -314,13 +314,17 @@ public final class PerformanceOptionManager {
     ///   启动环境与注册表由 `LaunchOrchestrator` / `WineRuntimeProvider` 下发；
     /// - MetalFX 空间缩放（`metalfx_spatial_upscale`）因实现搁置（见其定义处注释）。
     /// 选项定义与装配代码保留，供将来恢复"每游戏独立选项"或在域层复用。
+    // These suspended options were reviewed for the existing games only.
+    // New games must be added explicitly after their behavior is verified.
+    private static let reviewedDefaultGames: [GameType] = [.genshinImpact, .honkaiStarRail, .zenlessZoneZero]
+
     static let defaultOptions: [PerformanceOption] = [
         PerformanceOption(
             id: "metal_hud",
             type: .metalHUD,
             displayName: "Metal HUD",
             optionDescription: "显示 Metal 性能面板（默认 Lite 布局）",
-            applicableGames: GameType.allCases,
+            applicableGames: reviewedDefaultGames,
             isSuspended: true,
             launchArguments: nil,
             // 与 `GameEnvironmentSettings.environmentVariables` 保持一致：只开 HUD，
@@ -357,7 +361,7 @@ public final class PerformanceOptionManager {
             type: .metalFXUpscale,
             displayName: "MetalFX 空间缩放",
             optionDescription: "游戏按较低分辨率渲染，再由 MetalFX 放大到屏幕",
-            applicableGames: GameType.allCases,
+            applicableGames: reviewedDefaultGames,
             value: PerformanceOption.defaultValue,
             isSuspended: true,
             launchArguments: nil,
